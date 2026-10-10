@@ -1,0 +1,11 @@
+{
+  "id": "002-ordinary-text",
+  "description": "Ordinary instruction text with a task and a constraint that must both survive.",
+  "category": "ordinary-text",
+  "expectExactPreservation": true,
+  "requiredContent": [
+    { "label": "primary-request", "text": "summarize the failing build" },
+    { "label": "constraint", "text": "Do not modify unrelated files." }
+  ],
+  "context": "Please summarize the failing build, then propose the smallest safe change.\nDo not modify unrelated files.\n"
+}

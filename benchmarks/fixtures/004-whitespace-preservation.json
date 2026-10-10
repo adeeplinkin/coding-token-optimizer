@@ -1,0 +1,13 @@
+{
+  "id": "004-whitespace-preservation",
+  "description": "Mixed tabs, CRLF line endings, trailing spaces and blank lines that must be preserved byte-for-byte.",
+  "category": "whitespace",
+  "expectExactPreservation": true,
+  "requiredContent": [
+    { "label": "crlf-line-endings", "text": "\r\n" },
+    { "label": "tab-indent", "text": "\tindented with a tab" },
+    { "label": "trailing-spaces", "text": "spaces   \r\n" },
+    { "label": "trailing-blank-line", "text": "\r\n\r\n" }
+  ],
+  "context": "line one\r\n\tindented with a tab\r\n   trailing spaces   \r\n\r\n"
+}

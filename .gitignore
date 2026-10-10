@@ -145,6 +145,9 @@ coverage/
 target/
 src-tauri/target/
 
+# Benchmark output (generated reports)
+benchmarks/reports/
+
 # Secrets and local configuration
 .env
 .env.*

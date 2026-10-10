@@ -1,0 +1,13 @@
+{
+  "id": "008-critical-instructions",
+  "description": "Instructions that must never be dropped or paraphrased by an optimizer.",
+  "category": "instructions",
+  "expectExactPreservation": true,
+  "requiredContent": [
+    { "label": "edit-scope", "text": "Only edit src/math.ts." },
+    { "label": "test-integrity", "text": "Never delete or weaken existing tests." },
+    { "label": "api-stability", "text": "Preserve the public API surface of the module." },
+    { "label": "reporting-requirement", "text": "Report any file you could not modify." }
+  ],
+  "context": "SYSTEM INSTRUCTIONS (must remain intact):\n1. Only edit src/math.ts.\n2. Never delete or weaken existing tests.\n3. Preserve the public API surface of the module.\n4. Report any file you could not modify.\n"
+}

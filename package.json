@@ -9,15 +9,18 @@
     "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
   },
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "benchmarks"
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
-    "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run build --workspace @dr-token/core && npm run typecheck --workspaces --if-present",
+    "test": "npm run build --workspaces --if-present && npm run test --workspaces --if-present",
+    "benchmark": "npm run build --workspaces --if-present && npm run benchmark --workspace @dr-token/benchmarks",
     "verify": "npm run typecheck && npm run build && npm test"
   },
   "devDependencies": {
+    "@types/node": "^26.6.5",
     "typescript": "^7.0.2",
     "vitest": "^5.0.3"
   }
