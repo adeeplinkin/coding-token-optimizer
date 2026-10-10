@@ -5,11 +5,12 @@
 **Target APIs:** `@opencode-ai/plugin` **1.18.35** (V1 `Hooks` contract) **and** `@opencode/plugin`
 **2.0.24** (V2 `Plugin.define({ id, setup })` contract — see §18)
 **Runtime validation:** **live-validated** — the installed OpenCode Desktop **2.0.24** implements the
-**V2** plugin API, and the **V2** adapter (§18) was loaded and validated there in Stages 1G–1I: live
-hooks, live usage snapshots, one-shot persistence, and — since Stage 1I — live session-lifecycle
-mapping and project isolation (see
-[docs/OPENCODE_DESKTOP_VALIDATION.md](OPENCODE_DESKTOP_VALIDATION.md) §15–§17). The V1 adapter remains
-valid and unchanged for a V1-line OpenCode (`1.18.x`), where the V2 event vocabulary does not apply.
+**V2** plugin API, and the **V2** adapter (§18) was loaded and validated there in Stages 1G–1J: live
+hooks, live usage snapshots, one-shot persistence, live session-lifecycle mapping and project
+isolation (Stage 1I), and — in Stage 1J — live `session.deleted` plus a matched cross-directory
+`session.moved` (see [docs/OPENCODE_DESKTOP_VALIDATION.md](OPENCODE_DESKTOP_VALIDATION.md) §15–§18).
+The V1 adapter remains valid and unchanged for a V1-line OpenCode (`1.18.x`), where the V2 event
+vocabulary does not apply.
 
 > Dr. Token must prove it can observe agent activity correctly before attempting to
 > optimize it. This stage does the proving; it does not optimize.
@@ -554,6 +555,16 @@ nothing written); a disabled observer processed nothing although the event was d
 procedures and limitations:
 [§17](OPENCODE_DESKTOP_VALIDATION.md#17-stage-1i--live-lifecycle-project-isolation-and-harness-validation-runtime-tested).
 
+**Stage 1J update (2026-10-10): deletion and move are live-validated too.** A private isolated server
+drove the real API (`session.create` / `session.delete` / `session.move`; the model was pinned to an
+unresolvable one, so no provider was ever contacted). Observed live: `session.deleted` closed only the
+deletion's own session (final summary written, state released) while a concurrent session continued
+untouched; a deletion of a session the observer never tracked was safely ignored; `session.moved` was
+delivered to three live instances and, for a move between two directories of one git-repo project
+(shared project id `global`), **processed with `verification: "matched"` and an updated directory
+hash**, appended to the sink. Cross-project sessions were refused on creation and their move events
+ignored. Full record: [§18](OPENCODE_DESKTOP_VALIDATION.md#18-stage-1j--live-lifecycle-transitions-isolation-and-cleanup-runtime-tested).
+
 What was listed as unverified here is now partly settled, and partly superseded:
 
 - **Plugin loading and order** — observed: OpenCode loads it per process (one `setup`, one
@@ -747,8 +758,9 @@ Bypass is unchanged: `{ "enabled": false }` or `DR_TOKEN_OPENCODE_OBSERVER=off`.
 
 ### 18.5 V2 compatibility status
 
-Updated by Stage 1G (live hooks), Stage 1H (live usage + one-shot persistence) and Stage 1I (live
-lifecycle mapping + project isolation) against the real OpenCode Desktop 2.0.24 bundled CLI
+Updated by Stage 1G (live hooks), Stage 1H (live usage + one-shot persistence), Stage 1I (live
+lifecycle mapping + project isolation) and Stage 1J (live deletion + matched cross-directory move)
+against the real OpenCode Desktop 2.0.24 bundled CLI
 ([Stage 1G record](OPENCODE_DESKTOP_VALIDATION.md#15-stage-1g--live-v2-validation-runtime-tested),
 [Stage 1H record](OPENCODE_DESKTOP_VALIDATION.md#16-stage-1h--v2-usage-events-and-reliable-summary-persistence-runtime-tested)).
 
@@ -763,7 +775,7 @@ lifecycle mapping + project isolation) against the real OpenCode Desktop 2.0.24 
 | `ctx.event.subscribe` item shape (payload under `data`) | ✅ | ✅ | ✅ (55 events delivered in one run) |
 | **V2 usage snapshots (`session.usage.updated`)** | ✅ | ✅ | ✅ (2 events, exact values, correct session) |
 | **One-shot summary persistence** (no unload required) | ✅ | ✅ | ✅ (final snapshot on disk, cleanup never ran) |
-| V2 session **lifecycle** mapping (`session.created`/`session.deleted`/`session.moved`) | ✅ (`@opencode/schema@2.0.24`) | ✅ | ✅ `session.created` mapped live; `deleted`/`moved` harness-tested (§18.7, §17) |
+| V2 session **lifecycle** mapping (`session.created`/`session.deleted`/`session.moved`) | ✅ (`@opencode/schema@2.0.24`) | ✅ | ✅ all three mapped live (Stage 1J): created, deleted, and a matched cross-directory move (§18.7, §17–§18) |
 | **Project scope gate** (instance `ctx.location` vs session facts) | ✅ | ✅ | ✅ matched and refused live (§18.7, §17) |
 | Bypass (`enabled:false` / env) | ✅ | ✅ | ✅ live: disabled observer processed nothing (§17) |
 
@@ -843,8 +855,14 @@ by Stage 1I's isolated runtime runs:
 - `session.step.ended` carries per-step `cost`/`tokens` and `session.tool.called`/`session.tool.success`
   carry V2-native tool data. Neither is consumed: pooling per-step usage beside the session snapshot
   would double count, and the tool hooks already provide the same observations.
-- `session.execution.succeeded` is registered as a flush trigger, but it was **not delivered** in the
-  live one-shot runs, so no durability guarantee depends on it.
+- `session.execution.succeeded` is registered as a flush trigger. It was **not delivered** in the
+  live one-shot runs (and so no durability guarantee depends on it), but Stage 1J's long-lived server
+  **did** deliver it for an API-driven move, and the flush happened as designed.
+- Stage 1J validated all three transitions against a private isolated server: `session.deleted` flushed
+  and released exactly its own session, and `session.moved` was processed with `verification:
+  "matched"` and a new directory hash when the move stayed inside one project (git-repo directories
+  share the project id `global`) — while a move across projects is refused. Reproducible steps are in
+  §18 of [docs/OPENCODE_DESKTOP_VALIDATION.md](OPENCODE_DESKTOP_VALIDATION.md).
 
 ### 18.8 Summary persistence (implemented in Stage 1H)
 

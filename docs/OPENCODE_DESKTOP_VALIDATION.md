@@ -1,13 +1,17 @@
-# OpenCode Desktop validation (Stage 1E → Stage 1I)
+# OpenCode Desktop validation (Stage 1E → Stage 1J)
 
-**Status (Stage 1I, 2026-10-10): LIVE LIFECYCLE AND PROJECT-ISOLATION VALIDATION COMPLETED.** The
+**Status (Stage 1J, 2026-10-10): ALL THREE V2 LIFECYCLE TRANSITIONS RUNTIME-VALIDATED; TEST HARNESS RETIRED.** The
 V2 adapter was loaded by the real OpenCode Desktop 2.0.24 runtime; its tool hooks fired on real tool
 executions, it **records the runtime's own token/cost snapshots**, **persists a summary during a
-one-shot session**, and since Stage 1I it **maps `session.created` into a project-verified summary**
-and **refuses sessions that declare another project**. §1–§14 are the Stage 1E record, kept as written
+one-shot session**, it **maps `session.created` into a project-verified summary**, **refuses sessions
+that declare another project**, and as of Stage 1J it **closes `session.deleted` correctly (final
+summary, state release, concurrent sessions untouched)** and **applies a matched `session.moved` with
+an updated directory hash**. The disposable harnesses are retired (see §18.6). §1–§14 are the Stage 1E record, kept as written
 (they remain accurate for the V1 adapter that stage could not load); **§15 is the Stage 1G live
-result**, **§16 is the Stage 1H live result**, and **§17 is the Stage 1I live result**, which also
-documents the zero-cost isolated-run method used to obtain it.
+result**, **§16 is the Stage 1H live result**, **§17 is the Stage 1I live result**, and **§18 is the
+Stage 1J live result** (API-driven `session.created`/`session.deleted`/`session.moved`, concurrent
+sessions in one server, a persistence audit and the test-environment cleanup). Both document the
+zero-cost methods used to obtain them.
 
 **Date:** 2026-10-10 · **Platform:** Windows 11 · **Stage 1D base commit:** `3bb0943` · **Stage 1F commit:** `e7e0f89`
 
@@ -729,3 +733,108 @@ created; no user conversation, prompt or file content was recorded (the harness 
 payload *key names* and the observer's own snapshot only); the user's global configuration and the
 Desktop service's own settings were not modified; all writes stayed inside `%TEMP%`. **No token saving
 is claimed, and none was measured.**
+
+---
+
+## 18. Stage 1J — live lifecycle transitions, isolation and cleanup (runtime-tested)
+
+### 18.1 Method
+
+A **private, isolated server** instead of a one-shot run, so lifecycle operations can be driven
+directly through the real API:
+
+```sh
+CLI="$APPDATA/ai.opencode.desktop/cli/2.0.24/opencode-cli.exe"
+BASE="$TMPDIR/dr-token-stage1i-run2"          # fresh project + isolated XDG dirs
+cd "$BASE/project"
+XDG_CONFIG_HOME="$BASE/iso/config" XDG_DATA_HOME="$BASE/iso/data" \
+  "$CLI" serve --hostname 127.0.0.1 --port 8899 --print-logs
+```
+
+The server prints its **own ephemeral password** (stdout); requests use it as HTTP basic auth with user
+`opencode`. That password belongs to the disposable server this stage started — the user's service
+password was never read, reused or recorded. A session is created with `POST /api/session` (optionally
+with an explicit `location.directory`), its model pinned with `POST /api/session/{id}/model` to
+`nonexistent/nonexistent-model`, and one synthetic prompt is sent so the real prompt pipeline loads the
+project plugin. The prompt fails at model resolution (`ModelUnavailableError`) **before any provider is
+contacted** — zero-cost, as in §17. Deletion and move use `DELETE /api/session/{id}` and
+`POST /api/session/{id}/move`.
+
+The staged plugin is the Stage 1J harness (per-instance tag, per-instance evidence files, event *names*
+and payload *key names* only). Every session created, moved and deleted was synthetic and belonged to
+this disposable server; no user session or credential was touched. `session.created`,
+`session.deleted` and `session.moved` were produced by the real runtime in response.
+
+### 18.2 Live transitions observed
+
+- **`session.created`** — an API-created session was mapped (`lifecycle.createdEvents: 1`) with
+  `project.verification: "matched"` against the instance's own `ctx.location`, and its sink record was
+  appended immediately.
+- **Two concurrent sessions in one server** — both tracked independently (`sessionCount: 2`); deleting
+  one closed only that one (`sessionsClosed: 1`, `sessionCount: 1`) and left the other's summary
+  unchanged; the deleted session's final summary was appended before its state was released.
+- **`session.deleted` of an untracked session** (created before the plugin had loaded) was ignored
+  (`eventsIgnored` +1) with no state created and nothing written — a deletion cannot synthesise a
+  session.
+- **`session.moved`** — (a) delivery confirmed: three live instances each received the event with the
+  verified `data` keys `location, projectID, sessionID, subpath`; (b) a **matched move was processed**: a
+  session in a git-repo tree was moved from `gitproj` to `gitproj/sub` (both resolve to project id
+  `global`) — it stayed tracked, `verification: "matched"`, the directory hash changed
+  (`4cee5416…` → `b74dc7c8…`), and the new state was appended to the sink; (c) a session belonging to a
+  different project is refused when created, and its later move event is ignored.
+
+### 18.3 Project-identity behaviour observed live
+
+- With no project marker, each directory receives its own opaque project id (`a`, `b` and `subdir` all
+  differed), while the `.opencode`-rooted project root has its own id.
+- Directories inside a git repository all resolved to the project id **`global`** — the same id for
+  `gitproj` and `gitproj/sub`, which is what made a live matched move possible.
+- A move across directories can therefore change a session's project id; because the scope gate compares
+  ids exactly whenever both sides declare one, such a move is refused rather than attributed, while a
+  move inside one project is applied.
+
+### 18.4 Hot-reload behaviour (host-level finding)
+
+Changing the plugin file — and, in some cases, moving a session — re-bootstraps the plugin runtime.
+Observed live: the host calls the previous instance's cleanup (`cleanup:start`/`cleanup:done`, which
+runs the adapter's `dispose()`; after that the observer ignores events and its counters freeze) and
+creates new instance(s); one reload left an older instance undisposed alongside a newer one for a
+while. Each instance keeps the project it captured at its own `setup` and gates independently — two
+instances with different expected projects each tracked only their own project's sessions and refused
+the other's. No duplicate summary for a single session state was observed: byte-identical repeated
+records occurred only at legitimate flush points (a dispose flush of an unchanged session, or a move
+flush followed by the `session.execution.succeeded` flush trigger, which this API-driven runtime *did*
+deliver).
+
+### 18.5 Persistence and privacy audit
+
+The 13-record sink produced by the live runs was audited programmatically: every line was valid JSON;
+no line contained an absolute path (`C:\`, `C:/`, `AppData`, `Temp` or the user name — all absent);
+every record was `basis: "runtime-declared"`, `verification: "matched"` with a 16-hex directory hash;
+no derived totals (`totalTokens` stayed `unavailable`); adapter line `v2`. Tool and usage fields stayed
+zero because the prompts never executed — nothing was measured and nothing was invented.
+
+### 18.6 Cleanup state
+
+- The Stage 1J server was stopped (port 8899 closed).
+- The run2 harness plugin is retired (`.opencode/plugins/dr-token-observer.ts.stage1j-retired`); its
+  evidence files, sink and audit scripts are kept under `%TEMP%\dr-token-stage1i-run2\`.
+- With the user's explicit permission, the staged plugin and vendored bundle were removed from the
+  Stage 1H disposable project (`%TEMP%\dr-token-opencode-e2e\.opencode\`). The user's Desktop
+  background service hot-reloaded and **unloaded the observer**: its marker recorded
+  `cleanup:start`/`cleanup:done`, and its evidence snapshot now shows `disposed: true` with frozen
+  counters (41 events observed over its life, 0 sessions, 0 internal errors). The service was not
+  stopped or restarted and remains alive. A dormant harness interval inside that process still rewrites
+  the old evidence file with the frozen, disposed snapshot — it observes nothing; a normal Desktop
+  restart clears it.
+- The inactive `plugins-disabled/` archive in that disposable project is not loaded by OpenCode and was
+  left in place as evidence.
+
+### 18.7 Still not runtime-verified after Stage 1J
+
+- A move between two directories sharing a project id was validated only for the `global` (git-repo)
+  case; for other ids the observed behaviour is refusal, which is the safe direction.
+- Live **tool/read/usage** interleaving across two concurrent sessions would need real prompts (model
+  calls), which this stage deliberately did not make; that isolation remains integration-tested through
+  `tests/v2-host.ts` + `tests/v2-lifecycle.test.ts`.
+- GUI-driven sessions and `session.step.ended` usage mapping remain as in §17.
