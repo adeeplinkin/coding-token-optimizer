@@ -31,6 +31,7 @@ import type {
   ObserverAdapterIdentity,
   ObserverDiagnostic,
   ObserverDiagnosticCode,
+  ObserverExpectedProject,
   ObserverOptions,
   ObserverPluginApiIdentity,
   ObserverSnapshot,
@@ -40,11 +41,13 @@ import type {
   OpenCodeToolExecuteBeforeInput,
   OpenCodeToolExecuteBeforeOutput,
   ReadObservationSummary,
+  ProjectScopeVerification,
   SessionLifecycleSummary,
   SourceReportedUsageSummary,
   SessionObservationCounts,
   SessionObservationMeasurements,
   SessionObservationSummary,
+  SessionProjectScope,
   ToolFrequencyEntry,
   UsageField,
   UsageObservationSummary,
@@ -73,6 +76,22 @@ const NOTE_COST_NOT_REPORTED =
   'No assistant message in this session reported a cost; Dr. Token never estimates cost.';
 const NOTE_TOTAL_TOKENS_NOT_DERIVED =
   'Total tokens are deliberately not derived: OpenCode publishes no session total and the input, output, reasoning and cache fields overlap, so summing them could double count.';
+
+/**
+ * Attached when a session could not be attributed to a verified project.
+ *
+ * The contract is explicit here: an unattributable session is reported as
+ * unattributed rather than silently assigned to whatever project happened to be
+ * convenient. It also repairs a Stage 1H finding: a session created through the
+ * Desktop service resolved to a different directory than the project the plugin
+ * was loaded for, and nothing in the summary said so.
+ */
+const NOTE_PROJECT_SCOPE_UNVERIFIED =
+  'Project scope was not verified: the plugin instance and this session did not both declare a project, so this summary is not attributed to a confirmed project. No absolute project path is recorded.';
+
+/** Attached when the session matched the project this plugin instance declared. */
+const NOTE_PROJECT_SCOPE_MATCHED =
+  'The session was attributed to the project this plugin instance declared (compared by project id when both sides provided one, otherwise by directory containment). The project directory is recorded only as a one-way hash, never as a path.';
 
 /** Values of the disable switch that turn observation off. */
 const DISABLE_VALUES: readonly string[] = ['off', 'false', '0', 'no', 'disabled'];
@@ -110,6 +129,101 @@ function readIdentifier(value: unknown): string | undefined {
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
+ * Canonicalise an absolute directory so two spellings of one location compare
+ * equal.
+ *
+ * Folds exactly the Windows forms that appear in practice — backslashes, a drive
+ * letter in either case, doubled separators, a trailing separator — and is a
+ * no-op for POSIX paths apart from separator and trailing-slash cleanup. It does
+ * **not** resolve symlinks, `..` segments or short names: that is what the
+ * runtime's own `canonical` field is for, and guessing a resolution here could
+ * attribute a session to the wrong project, which is the one outcome the project
+ * gate exists to prevent.
+ *
+ * Exported because the exact folding is part of the project-scope contract and is
+ * covered directly by tests.
+ */
+export function normalizeProjectDirectory(value: string): string {
+  let normalized = value.trim().replace(/\\/g, '/');
+  if (/^[a-zA-Z]:\//.test(normalized)) {
+    // Windows paths are case-insensitive; compare and hash them lower-cased so a
+    // drive letter's case can never split one project into two identities.
+    normalized = normalized.toLowerCase();
+  }
+  normalized = normalized.replace(/(?<!^)\/{2,}/g, '/');
+  while (normalized.length > 1 && normalized.endsWith('/')) {
+    normalized = normalized.slice(0, -1);
+  }
+  return normalized;
+}
+
+/**
+ * True when `candidate` is `parent` itself or lies inside it, after folding.
+ *
+ * Containment rather than equality on purpose: a session working in a
+ * subdirectory of the project still belongs to the project. The check is
+ * segment-aware (a `${parent}/` prefix), so `C:/work/project-x` is never treated
+ * as inside `C:/work/project`.
+ */
+function isInsideProjectDirectory(candidate: string, parent: string): boolean {
+  if (candidate === parent) {
+    return true;
+  }
+  if (parent === '') {
+    return false;
+  }
+  if (parent === '/') {
+    return candidate.startsWith('/');
+  }
+  return candidate.startsWith(`${parent}/`);
+}
+
+/** Project facts a lifecycle event declared for its session. */
+interface SessionProjectFacts {
+  readonly projectId?: string;
+  readonly workspaceId?: string;
+  readonly directory?: string;
+}
+
+/**
+ * Read the project facts a lifecycle event declares for its session.
+ *
+ * Verified against `@opencode/schema@2.0.24` (see `types-v2.ts` for the verbatim
+ * declarations): V2 `session.created` and `session.moved` carry
+ * `data.projectID` and `data.location = { directory, workspaceID? }`. V1
+ * `session.created` carries `properties.info.id` only, so it yields no facts —
+ * the session is retained and reported as unattributed rather than guessed into
+ * a project.
+ */
+function readSessionProjectFacts(
+  carrier: Record<string, unknown> | undefined,
+): SessionProjectFacts {
+  const location = asRecord(carrier?.['location']);
+  const projectId = readIdentifier(carrier?.['projectID']);
+  const workspaceId = readIdentifier(location?.['workspaceID']);
+  const directory = readIdentifier(location?.['directory']);
+  return {
+    ...(projectId === undefined ? {} : { projectId }),
+    ...(workspaceId === undefined ? {} : { workspaceId }),
+    ...(directory === undefined ? {} : { directory }),
+  };
+}
+
+/**
+ * The session id an event refers to, from either API line.
+ *
+ * V2 carries `data.sessionID` — the shape Stage 1H saw arrive and could not map.
+ * V1 carries `properties.sessionID` for most events and `properties.info.id` for
+ * the session lifecycle ones. Both are read defensively, and an unusable value is
+ * never turned into an identifier.
+ */
+function readEventSessionId(carrier: Record<string, unknown> | undefined): string | undefined {
+  return (
+    readIdentifier(carrier?.['sessionID']) ?? readIdentifier(asRecord(carrier?.['info'])?.['id'])
+  );
 }
 
 function bump(map: Map<string, number>, key: string): void {
@@ -214,6 +328,20 @@ interface PendingCall {
   readonly tool: string;
 }
 
+/** Project attribution learned for one session. Memory only. */
+interface SessionProjectState {
+  projectId: string | undefined;
+  workspaceId: string | undefined;
+  /**
+   * The declared directory, kept in memory only so a later comparison is
+   * possible. It is never written to a summary; the hash is.
+   */
+  directory: string | undefined;
+  /** One-way hash of the normalized directory; this is what a summary may carry. */
+  directoryHash: string | undefined;
+  verification: ProjectScopeVerification;
+}
+
 /** Everything the observer retains for one OpenCode session. */
 interface SessionState {
   readonly sessionId: string;
@@ -249,6 +377,8 @@ interface SessionState {
    * attribution the source did not provide.
    */
   readonly sourceUsage: SourceUsageState;
+  /** What the runtime declared about this session's project, if anything. */
+  readonly project: SessionProjectState;
   createdEvents: number;
   idleEvents: number;
   compactedEvents: number;
@@ -301,6 +431,13 @@ function createSessionState(sessionId: string, at: number): SessionState {
       monotonicNonDecreasing: true,
       decreasesObserved: 0,
     },
+    project: {
+      projectId: undefined,
+      workspaceId: undefined,
+      directory: undefined,
+      directoryHash: undefined,
+      verification: 'unverifiable',
+    },
     createdEvents: 0,
     idleEvents: 0,
     compactedEvents: 0,
@@ -327,6 +464,18 @@ export class OpenCodeObserver {
   readonly #pluginApi: ObserverPluginApiIdentity;
   readonly #checkpointIntervalMs: number;
   readonly #sessions = new Map<string, SessionState>();
+  /**
+   * Session ids whose deletion was observed, and sessions refused as out of
+   * scope because they declared a different project.
+   *
+   * Both are consulted before any state is created, so a late event can never
+   * resurrect a deleted session and an unrelated project's session can never be
+   * recorded. Both are bounded (a session id is remembered for as many ids as the
+   * pending-call bound allows), so a long-lived server process cannot grow them
+   * without limit.
+   */
+  readonly #closedSessions = new Set<string>();
+  readonly #outOfScopeSessions = new Set<string>();
   readonly #recentDiagnostics: ObserverDiagnostic[] = [];
   /** Sessions changed since their last write, awaiting a checkpoint. */
   readonly #dirtySessions = new Set<string>();
@@ -334,6 +483,8 @@ export class OpenCodeObserver {
   /** Serializes sink writes so append order matches schedule order. */
   #writeChain: Promise<void> = Promise.resolve();
   #sink: ObservationSink | undefined;
+  /** The project this instance belongs to, when the host declared one. */
+  #expectedProject: ObserverExpectedProject | undefined;
   #enabled: boolean;
   #disposed = false;
   #internalErrors = 0;
@@ -342,6 +493,8 @@ export class OpenCodeObserver {
   #sessionsCreated = 0;
   #sessionsEvicted = 0;
   #sessionsClosed = 0;
+  #sessionsOutOfScope = 0;
+  #lateEventsIgnored = 0;
 
   constructor(options: ObserverOptions = {}) {
     this.#onDiagnostic = options.onDiagnostic;
@@ -386,6 +539,40 @@ export class OpenCodeObserver {
   /** Replace the summary sink. Passing `undefined` removes it (the default). */
   setSink(sink: ObservationSink | undefined): void {
     this.#sink = sink;
+  }
+
+  /**
+   * Declare the project this observer instance belongs to.
+   *
+   * The V2 adapter supplies this from `ctx.location` — the host's own location,
+   * which is the only source that can say which project this plugin instance was
+   * loaded for. A session whose lifecycle event declares a different project is
+   * then recognised and refused instead of being recorded as if it belonged here.
+   *
+   * A project id comparison is preferred (opaque and exact); a directory
+   * comparison is used only when an id is missing on either side, and only for
+   * containment, so a session working in a subdirectory of the project still
+   * matches.
+   *
+   * Safe to call more than once, and safe to call after sessions have been
+   * observed: retained sessions are re-evaluated, and one that turns out to be
+   * out of scope is dropped before anything further is written for it. Never
+   * throws.
+   */
+  setExpectedProject(project: ObserverExpectedProject | undefined): void {
+    try {
+      this.#expectedProject = project === undefined ? undefined : { ...project };
+      for (const state of [...this.#sessions.values()]) {
+        const verdict = this.#scopeVerdict(state);
+        if (verdict === 'mismatched') {
+          this.#dropOutOfScopeSession(state);
+        } else if (verdict === 'matched') {
+          state.project.verification = 'matched';
+        }
+      }
+    } catch {
+      this.noteInternalFailure();
+    }
   }
 
   /**
@@ -470,6 +657,8 @@ export class OpenCodeObserver {
       sessionsCreated: this.#sessionsCreated,
       sessionsEvicted: this.#sessionsEvicted,
       sessionsClosed: this.#sessionsClosed,
+      sessionsOutOfScope: this.#sessionsOutOfScope,
+      lateEventsIgnored: this.#lateEventsIgnored,
       limits: this.getLimits(),
       recentDiagnostics: [...this.#recentDiagnostics],
     };
@@ -479,6 +668,8 @@ export class OpenCodeObserver {
   clear(): void {
     this.#sessions.clear();
     this.#dirtySessions.clear();
+    this.#closedSessions.clear();
+    this.#outOfScopeSessions.clear();
     this.#clearCheckpointTimer();
   }
 
@@ -667,6 +858,133 @@ export class OpenCodeObserver {
     }
   }
 
+  /**
+   * True when an event for this session must be dropped before any state exists.
+   *
+   * Two cases: the session's deletion was already observed (a late or duplicated
+   * event must not recreate state), or the runtime declared a project this
+   * instance does not belong to (an unrelated project must not be recorded). The
+   * id sets are bounded; if an id is ever evicted by its bound the session behaves
+   * like an unknown session again, which is why the set bound is far larger than
+   * the session bound.
+   */
+  #dropIfInactive(sessionId: string): boolean {
+    if (this.#closedSessions.has(sessionId)) {
+      this.#lateEventsIgnored += 1;
+      this.#diagnose('session-closed');
+      return true;
+    }
+    if (this.#outOfScopeSessions.has(sessionId)) {
+      this.#eventsIgnored += 1;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Close a deleted session: remember the id, then flush and release the state.
+   *
+   * The id is closed *first*, so an event arriving while the final summary is
+   * being written cannot change what is written. The flush is awaited, so a
+   * caller (and a test) can rely on the deleted session's last summary having
+   * reached the sink before the state is gone; a pending checkpoint for the same
+   * session is superseded by this write rather than lost.
+   */
+  async #closeSession(state: SessionState): Promise<void> {
+    rememberBounded(this.#closedSessions, state.sessionId, this.#limits.maxPendingCalls);
+    this.#sessions.delete(state.sessionId);
+    this.#dirtySessions.delete(state.sessionId);
+    this.#sessionsClosed += 1;
+    await this.#flush(state);
+  }
+
+  /**
+   * Drop a session the runtime attributed to a different project.
+   *
+   * Nothing is written for it and nothing is retained. A summary already written
+   * earlier (while the project was still unknown) is left alone: it is marked
+   * `verification: 'unverifiable'`, so a consumer can tell it was never confirmed,
+   * and rewriting history in the append-only sink is not this observer's job.
+   */
+  #dropOutOfScopeSession(state: SessionState): void {
+    rememberBounded(this.#outOfScopeSessions, state.sessionId, this.#limits.maxPendingCalls);
+    this.#sessions.delete(state.sessionId);
+    this.#dirtySessions.delete(state.sessionId);
+    this.#sessionsOutOfScope += 1;
+    this.#diagnose('project-mismatch');
+  }
+
+  /**
+   * The scope verdict for a session, from what this instance and the runtime
+   * declared.
+   *
+   * A project id comparison wins whenever both sides provide one, because ids are
+   * opaque and exact; directories are compared only when an id is missing on
+   * either side.
+   */
+  #scopeVerdict(state: SessionState): 'matched' | 'mismatched' | 'unknown' {
+    const expected = this.#expectedProject;
+    const declared = state.project;
+    if (expected === undefined) {
+      return 'unknown';
+    }
+    if (expected.projectId !== undefined && declared.projectId !== undefined) {
+      return expected.projectId === declared.projectId ? 'matched' : 'mismatched';
+    }
+    if (expected.directory !== undefined && declared.directory !== undefined) {
+      return isInsideProjectDirectory(
+        normalizeProjectDirectory(declared.directory),
+        normalizeProjectDirectory(expected.directory),
+      )
+        ? 'matched'
+        : 'mismatched';
+    }
+    return 'unknown';
+  }
+
+  /**
+   * Apply the project facts a lifecycle event declared, then re-check the scope.
+   *
+   * Returns `false` when the session was dropped as out of scope. Facts that
+   * arrive late still count: a session observed before its `session.created` was
+   * delivered is re-evaluated when the event arrives.
+   */
+  #applySessionProjectFacts(state: SessionState, facts: SessionProjectFacts): boolean {
+    let changed = false;
+    if (facts.projectId !== undefined && facts.projectId !== state.project.projectId) {
+      state.project.projectId = facts.projectId;
+      changed = true;
+    }
+    if (facts.workspaceId !== undefined && facts.workspaceId !== state.project.workspaceId) {
+      state.project.workspaceId = facts.workspaceId;
+      changed = true;
+    }
+    if (facts.directory !== undefined && facts.directory !== state.project.directory) {
+      state.project.directory = facts.directory;
+      state.project.directoryHash = this.#hash(normalizeProjectDirectory(facts.directory));
+      changed = true;
+    }
+    const verdict = this.#scopeVerdict(state);
+    if (verdict === 'mismatched') {
+      this.#dropOutOfScopeSession(state);
+      return false;
+    }
+    if (verdict === 'matched') {
+      state.project.verification = 'matched';
+    }
+    if (changed) {
+      this.#markDirty(state);
+      // Persist attribution promptly for the same reason a usage snapshot is
+      // written on arrival: it is rare, high-value, and arrives at the very
+      // start of a session — precisely when a one-shot host is most likely to be
+      // terminated before the next checkpoint.
+      if (this.#sink !== undefined && !this.#disposed) {
+        void this.#flush(state);
+      }
+    }
+    return true;
+  }
+
   #touch(state: SessionState): void {
     state.lastObservedAt = this.#timestamp();
   }
@@ -682,6 +1000,9 @@ export class OpenCodeObserver {
     }
     this.#eventsObserved += 1;
 
+    if (this.#dropIfInactive(sessionId)) {
+      return;
+    }
     const state = this.#session(sessionId);
     this.#touch(state);
 
@@ -732,6 +1053,9 @@ export class OpenCodeObserver {
     }
     this.#eventsObserved += 1;
 
+    if (this.#dropIfInactive(sessionId)) {
+      return;
+    }
     const state = this.#session(sessionId);
     this.#touch(state);
 
@@ -844,6 +1168,9 @@ export class OpenCodeObserver {
         const info = properties?.['info'];
         const extraction = extractAssistantUsage(info);
         if (extraction.kind === 'recorded') {
+          if (this.#dropIfInactive(extraction.snapshot.sessionId)) {
+            return;
+          }
           const state = this.#session(extraction.snapshot.sessionId);
           this.#touch(state);
           this.#recordUsage(state, extraction.snapshot);
@@ -851,6 +1178,9 @@ export class OpenCodeObserver {
         }
         const sessionId = readIdentifier(asRecord(info)?.['sessionID']);
         if (extraction.reason === 'no-usage-fields' && sessionId !== undefined) {
+          if (this.#dropIfInactive(sessionId)) {
+            return;
+          }
           const state = this.#session(sessionId);
           this.#touch(state);
           state.messagesWithoutUsage += 1;
@@ -865,6 +1195,9 @@ export class OpenCodeObserver {
         const extraction = extractSessionUsage(properties);
         if (extraction.kind === 'ignored') {
           const sessionId = readIdentifier(properties?.['sessionID']);
+          if (sessionId !== undefined && this.#dropIfInactive(sessionId)) {
+            return;
+          }
           const state = sessionId === undefined ? undefined : this.#session(sessionId);
           if (state !== undefined && extraction.reason === 'no-usage-fields') {
             this.#touch(state);
@@ -877,6 +1210,9 @@ export class OpenCodeObserver {
           this.#eventsIgnored += 1;
           return;
         }
+        if (this.#dropIfInactive(extraction.snapshot.sessionId)) {
+          return;
+        }
         const state = this.#session(extraction.snapshot.sessionId);
         this.#touch(state);
         this.#recordSourceUsage(state, extraction.snapshot);
@@ -885,7 +1221,10 @@ export class OpenCodeObserver {
       case OPENCODE_V2_EXECUTION_SUCCEEDED_EVENT_TYPE: {
         // A flush trigger only: writing a summary makes no behavioural claim, and
         // this event is deliberately not counted as a V1 `session.idle`.
-        const sessionId = readIdentifier(properties?.['sessionID']);
+        const sessionId = readEventSessionId(properties);
+        if (sessionId !== undefined && this.#dropIfInactive(sessionId)) {
+          return;
+        }
         const state = sessionId === undefined ? undefined : this.#sessions.get(sessionId);
         if (state === undefined) {
           this.#eventsIgnored += 1;
@@ -906,6 +1245,9 @@ export class OpenCodeObserver {
           this.#diagnose('hook-input-unusable');
           return;
         }
+        if (this.#dropIfInactive(sessionId)) {
+          return;
+        }
         const state = this.#session(sessionId);
         this.#touch(state);
         // Counted only. Step usage overlaps with the parent assistant message, so
@@ -920,30 +1262,69 @@ export class OpenCodeObserver {
           this.#diagnose('hook-input-unusable');
           return;
         }
+        if (this.#dropIfInactive(sessionId)) {
+          return;
+        }
         this.#sessions.get(sessionId)?.usage.delete(messageId);
         return;
       }
       case 'session.created': {
-        const sessionId = readIdentifier(asRecord(properties?.['info'])?.['id']);
+        // Verified V2 shape: the id is `data.sessionID`, and the project facts
+        // are `data.projectID` / `data.location`. V1's `properties.info.id`
+        // resolves through the same reader, so both lines keep working.
+        const sessionId = readEventSessionId(properties);
         if (sessionId === undefined) {
           this.#diagnose('hook-input-unusable');
+          return;
+        }
+        if (this.#dropIfInactive(sessionId)) {
           return;
         }
         const state = this.#session(sessionId);
         this.#touch(state);
         state.createdEvents += 1;
+        // Applying the facts also runs the scope gate: a session that declares a
+        // different project than this instance belongs to is dropped here.
+        this.#applySessionProjectFacts(state, readSessionProjectFacts(properties));
         return;
       }
       case 'session.updated': {
-        const sessionId = readIdentifier(asRecord(properties?.['info'])?.['id']);
+        const sessionId = readEventSessionId(properties);
+        if (sessionId !== undefined && this.#dropIfInactive(sessionId)) {
+          return;
+        }
         const state = sessionId === undefined ? undefined : this.#sessions.get(sessionId);
         if (state !== undefined) {
           this.#touch(state);
         }
         return;
       }
+      case 'session.moved': {
+        // A moved session's project can change. Re-reading the declared facts
+        // re-runs the scope gate, so a session that moved out of this instance's
+        // project stops being recorded instead of being misattributed.
+        const sessionId = readEventSessionId(properties);
+        if (sessionId === undefined) {
+          this.#eventsIgnored += 1;
+          return;
+        }
+        if (this.#dropIfInactive(sessionId)) {
+          return;
+        }
+        const state = this.#sessions.get(sessionId);
+        if (state === undefined) {
+          this.#eventsIgnored += 1;
+          return;
+        }
+        this.#touch(state);
+        this.#applySessionProjectFacts(state, readSessionProjectFacts(properties));
+        return;
+      }
       case 'session.idle': {
-        const sessionId = readIdentifier(properties?.['sessionID']);
+        const sessionId = readEventSessionId(properties);
+        if (sessionId !== undefined && this.#dropIfInactive(sessionId)) {
+          return;
+        }
         const state = sessionId === undefined ? undefined : this.#sessions.get(sessionId);
         if (state === undefined) {
           this.#eventsIgnored += 1;
@@ -955,7 +1336,10 @@ export class OpenCodeObserver {
         return;
       }
       case 'session.compacted': {
-        const sessionId = readIdentifier(properties?.['sessionID']);
+        const sessionId = readEventSessionId(properties);
+        if (sessionId !== undefined && this.#dropIfInactive(sessionId)) {
+          return;
+        }
         const state = sessionId === undefined ? undefined : this.#sessions.get(sessionId);
         if (state === undefined) {
           this.#eventsIgnored += 1;
@@ -967,9 +1351,13 @@ export class OpenCodeObserver {
         return;
       }
       case 'session.deleted': {
-        const sessionId = readIdentifier(asRecord(properties?.['info'])?.['id']);
+        const sessionId = readEventSessionId(properties);
         if (sessionId === undefined) {
           this.#eventsIgnored += 1;
+          return;
+        }
+        if (this.#dropIfInactive(sessionId)) {
+          // A duplicate or late deletion: the transition already happened.
           return;
         }
         const state = this.#sessions.get(sessionId);
@@ -977,9 +1365,8 @@ export class OpenCodeObserver {
           this.#eventsIgnored += 1;
           return;
         }
-        this.#sessions.delete(sessionId);
-        this.#sessionsClosed += 1;
-        await this.#flush(state);
+        this.#touch(state);
+        await this.#closeSession(state);
         return;
       }
       default: {
@@ -1218,6 +1605,21 @@ export class OpenCodeObserver {
       compactedEvents: state.compactedEvents,
     };
 
+    // Project attribution is reported from what the runtime actually declared.
+    // The directory itself never leaves memory: only its one-way hash does.
+    const project: SessionProjectScope = {
+      basis:
+        state.project.projectId !== undefined ||
+        state.project.workspaceId !== undefined ||
+        state.project.directoryHash !== undefined
+          ? 'runtime-declared'
+          : 'unavailable',
+      verification: state.project.verification,
+      projectId: state.project.projectId,
+      workspaceId: state.project.workspaceId,
+      directoryHash: state.project.directoryHash,
+    };
+
     const measurements: SessionObservationMeasurements = {
       toolStartsObserved: measured(counts.toolStartsObserved),
       toolCompletionsObserved: measured(counts.toolCompletionsObserved),
@@ -1272,11 +1674,15 @@ export class OpenCodeObserver {
       reads,
       usage,
       lifecycle,
+      project,
       measurements,
       notes: [
         ...OBSERVATION_NOTES,
         ...(counts.toolStartsObserved === 0 ? [NOTE_NO_TOOL_ACTIVITY] : []),
         ...(reads.requests === 0 ? [NOTE_NO_READS] : []),
+        ...(project.verification === 'matched'
+          ? [NOTE_PROJECT_SCOPE_MATCHED]
+          : [NOTE_PROJECT_SCOPE_UNVERIFIED]),
       ],
     };
   }

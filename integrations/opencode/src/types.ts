@@ -461,6 +461,61 @@ export interface SessionLifecycleSummary {
 }
 
 /**
+ * A project a plugin host declared for **itself** — the scope this observer
+ * instance belongs to.
+ *
+ * The V2 adapter fills this from `ctx.location` (`Location.Info` in
+ * `@opencode/schema@2.0.24`): `project.id`, `project.directory` and
+ * `project.canonical`. Both fields are optional because a host may expose a
+ * location with only one of them, or with none at all; when neither is usable the
+ * adapter reports nothing and every session is simply unverified rather than
+ * guessed into a project.
+ */
+export interface ObserverExpectedProject {
+  /** Opaque runtime project id (`Project.ID`). Never a path. */
+  readonly projectId?: string;
+  /** Project root directory. Held in memory only; never persisted. */
+  readonly directory?: string;
+}
+
+/** Where a session's project attribution came from. */
+export type ProjectAttributionBasis = 'runtime-declared' | 'unavailable';
+
+/**
+ * Whether a session's project was checked against this plugin instance's own
+ * project.
+ *
+ * `matched` means both sides declared a project and they agreed — by project id
+ * when both declared one, otherwise by directory containment. `unverifiable`
+ * means at least one side declared nothing usable, so the summary is deliberately
+ * **not** attributed to a confirmed project and says so in `notes`.
+ *
+ * A session that was checked and *rejected* never reaches a summary at all: it is
+ * dropped and counted as out of scope instead, so no value of this field ever
+ * means "known to be a different project".
+ */
+export type ProjectScopeVerification = 'matched' | 'unverifiable';
+
+/**
+ * Content-free project attribution for one session.
+ *
+ * No absolute path is ever persisted: `directoryHash` is a one-way hash of the
+ * normalized declared directory, produced by the same hasher as read identities.
+ * The raw directory is kept in memory only, and only long enough to compare it
+ * with the instance's own project.
+ */
+export interface SessionProjectScope {
+  readonly basis: ProjectAttributionBasis;
+  readonly verification: ProjectScopeVerification;
+  /** Opaque runtime project id, when the runtime declared one. */
+  readonly projectId: string | undefined;
+  /** Opaque runtime workspace id, when the runtime declared one. */
+  readonly workspaceId: string | undefined;
+  /** One-way hash of the normalized declared directory, or `undefined`. */
+  readonly directoryHash: string | undefined;
+}
+
+/**
  * Measurements derived for one session.
  *
  * `totalTokens` is deliberately always `unavailable`: OpenCode publishes no
@@ -506,6 +561,8 @@ export interface SessionObservationSummary {
   readonly reads: ReadObservationSummary;
   readonly usage: UsageObservationSummary;
   readonly lifecycle: SessionLifecycleSummary;
+  /** Project attribution learned from the runtime, or an explicit absence. */
+  readonly project: SessionProjectScope;
   readonly measurements: SessionObservationMeasurements;
   /** Static, content-free caveats that apply to this summary. */
   readonly notes: readonly string[];
@@ -525,6 +582,10 @@ export interface ObserverSnapshot {
   readonly sessionsCreated: number;
   readonly sessionsEvicted: number;
   readonly sessionsClosed: number;
+  /** Sessions refused because they declared a different project. */
+  readonly sessionsOutOfScope: number;
+  /** Events dropped because they arrived after their session was deleted. */
+  readonly lateEventsIgnored: number;
   readonly limits: ObservationLimits;
   readonly recentDiagnostics: readonly ObserverDiagnostic[];
 }
@@ -572,6 +633,8 @@ export type ObserverDiagnosticCode =
   | 'usage-update-regression'
   | 'usage-update-ignored'
   | 'event-ignored'
+  | 'session-closed'
+  | 'project-mismatch'
   | 'plugin-options-ignored'
   | 'sink-failed'
   | 'unsupported-plugin-capability'
@@ -593,6 +656,10 @@ export const OBSERVER_DIAGNOSTIC_MESSAGES: Readonly<Record<ObserverDiagnosticCod
   'usage-update-regression': 'A usage update reported a lower value than already recorded; the higher value was kept.',
   'usage-update-ignored': 'A usage update carried no usable field and was ignored.',
   'event-ignored': 'The event type is not observed by this adapter.',
+  'session-closed':
+    'An event arrived for a session whose deletion was already observed; no state was recreated and the event was not recorded.',
+  'project-mismatch':
+    'The session declared a different project than this plugin instance; its observations were dropped rather than attributed to the wrong project.',
   'plugin-options-ignored': 'A plugin option was not usable and was ignored.',
   'sink-failed': 'The configured summary sink failed; the failure was contained.',
   'unsupported-plugin-capability':
@@ -629,6 +696,8 @@ export const OBSERVER_DIAGNOSTIC_LEVELS: Readonly<Record<ObserverDiagnosticCode,
     'usage-update-regression': 'info',
     'usage-update-ignored': 'debug',
     'event-ignored': 'debug',
+    'session-closed': 'debug',
+    'project-mismatch': 'warn',
     'plugin-options-ignored': 'warn',
     'sink-failed': 'warn',
     'unsupported-plugin-capability': 'warn',

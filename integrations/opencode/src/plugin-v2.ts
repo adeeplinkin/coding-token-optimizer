@@ -1,5 +1,6 @@
 import { OpenCodeObserver } from './observer.js';
 import type {
+  ObserverExpectedProject,
   ObserverOptions,
   OpenCodeToolExecuteAfterInput,
   OpenCodeToolExecuteBeforeInput,
@@ -73,6 +74,57 @@ function noteMissing(observer: OpenCodeObserver): void {
   } catch {
     // Reporting the problem must never become the problem.
   }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function readIdentifier(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
+ * Read the project a V2 host declared for **itself** from `ctx.location`.
+ *
+ * Source: `Location.Info` in `@opencode/schema@2.0.24` —
+ * `{ directory, workspaceID?, project: { id, directory, canonical } }` (the
+ * verbatim declaration is recorded in `types-v2.ts`). The opaque project id is
+ * preferred for comparison; `project.directory` is the fallback, then
+ * `project.canonical`, then the location's own directory.
+ *
+ * Returns `undefined` when the host declared nothing usable. That is deliberate:
+ * the observer then reports every session as project-unverified instead of
+ * assigning one to a guessed project, and the limitation stays visible in the
+ * summary rather than being silently smoothed over.
+ *
+ * Exported because the mapping is part of the isolation contract and is covered
+ * by tests that drive a real `setup` context.
+ */
+export function readExpectedProject(location: unknown): ObserverExpectedProject | undefined {
+  const record = asRecord(location);
+  if (record === undefined) {
+    return undefined;
+  }
+  const project = asRecord(record['project']);
+  const projectId = readIdentifier(project?.['id']);
+  const directory =
+    readIdentifier(project?.['directory']) ??
+    readIdentifier(project?.['canonical']) ??
+    readIdentifier(record['directory']);
+  if (projectId === undefined && directory === undefined) {
+    return undefined;
+  }
+  return {
+    ...(projectId === undefined ? {} : { projectId }),
+    ...(directory === undefined ? {} : { directory }),
+  };
 }
 
 /**
@@ -171,6 +223,18 @@ export function createOpenCodeObserverV2(
         initialised = true;
         try {
           observer.applyPluginOptions(context?.options);
+        } catch {
+          observer.noteInternalFailure();
+        }
+
+        // The host's own location is the only trustworthy statement of which
+        // project this instance belongs to; a session that declares a different
+        // one is refused rather than recorded as if it belonged here.
+        try {
+          const expectedProject = readExpectedProject(context?.location);
+          if (expectedProject !== undefined) {
+            observer.setExpectedProject(expectedProject);
+          }
         } catch {
           observer.noteInternalFailure();
         }

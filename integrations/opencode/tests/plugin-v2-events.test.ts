@@ -7,7 +7,12 @@ import {
 } from '../src/index.js';
 import type { ObserverDiagnostic, SessionObservationSummary } from '../src/index.js';
 import { deepFreeze, snapshotValue } from './helpers.js';
-import { createV2Host } from './v2-host.js';
+import {
+  createV2Host,
+  sessionCreatedData,
+  v2Envelope,
+  v2UsageData as usageData,
+} from './v2-host.js';
 
 /**
  * The V2 adapter seen from the **host** side.
@@ -22,20 +27,6 @@ import { createV2Host } from './v2-host.js';
  * that: both handed events to the observer's V1-shaped hook and skipped the
  * normaliser. These tests drive the real plugin through a V2 host instead.
  */
-
-/** A runtime-shaped V2 envelope, exactly as the 2.0.24 server delivers it. */
-function v2Envelope(type: string, data: unknown): Record<string, unknown> {
-  return { id: 'evt_1', created: 1_700_000_000_000, type, data };
-}
-
-function usageData(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
-    sessionID: 'ses_host',
-    cost: 0.02,
-    tokens: { input: 368, output: 75, reasoning: 91, cache: { read: 10496, write: 0 } },
-    ...overrides,
-  };
-}
 
 function sourceReported(summary: SessionObservationSummary) {
   const block = summary.usage.sourceReported;
@@ -112,12 +103,18 @@ describe('V2 events through the real plugin', () => {
   it('records a lifecycle event whose payload is under `data`', async () => {
     const host = await createV2Host();
 
-    host.push(v2Envelope('session.created', { info: { id: 'ses_life' } }));
-    host.push(v2Envelope('session.updated', { info: { id: 'ses_life' } }));
+    // Verified `session.created` shape: the id is `data.sessionID`. The Stage 1H
+    // fixture used a `{ info: { id } }` body — V1's shape — which resolved through
+    // the same reader and so proved less than it appeared to.
+    host.push(v2Envelope('session.created', sessionCreatedData({ sessionID: 'ses_life' })));
     await host.settle();
 
-    const summary = host.observer.getSummary('ses_life');
-    expect(summary?.lifecycle.createdEvents).toBe(1);
+    const summary = host.observer.getSummary('ses_life') as SessionObservationSummary;
+    expect(summary.lifecycle.createdEvents).toBe(1);
+    // The verified payload also carries project facts; the summary records them.
+    expect(summary.project.basis).toBe('runtime-declared');
+    expect(summary.project.projectId).toBe('prj_created');
+    expect(summary.project.directoryHash).toMatch(/^[0-9a-f]{8}$/);
 
     await host.close();
   });

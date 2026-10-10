@@ -70,11 +70,67 @@
  * `tests/fixtures/opencode-plugin-v2.contract.ts`, and `npm run typecheck` fails if the
  * adapter in `plugin-v2.ts` stops being assignable to them.
  *
+ * ---------------------------------------------------------------------------
+ * VERIFIED V2 SESSION-EVENT CONTRACTS (Stage 1I)
+ * ---------------------------------------------------------------------------
+ *
+ * Source package: `@opencode/schema`, verified version **2.0.24** — the exact
+ * version `@opencode/plugin@2.0.24` declares as a dependency. Method: download the
+ * published tarball and read the shipped declarations.
+ *
+ *   npm pack @opencode/schema@2.0.24
+ *   sha256(dist/session-event.d.ts)        = 3e2fbc287a3faf6d421eab5adf5daef4315b79b4696e2196766c16c8eaf15eea
+ *   sha256(dist/location.d.ts)             = fe2d71d77933331fb8d95fcc131f4cbc4d68ea879d15d80d13805b2483ce9fe9
+ *   sha256(dist/session-status-event.d.ts) = 96d920746648203c1cd88b2ecf61e96bde1dee77a4187d3e39d6f9e22a26a7f5
+ *
+ * From `dist/session-event.d.ts`, `Created` (verbatim, effect wrappers collapsed):
+ *
+ *   type: "session.created"; durability: "durable";
+ *   data: {
+ *     projectID: Project.ID;
+ *     location: { directory: AbsolutePath; workspaceID?: Workspace.ID };
+ *     subpath?: RelativePath; parentID?: SessionID; slug: string; title?: string;
+ *     agent?: Agent.ID; model?: { id; providerID; variant? }; metadata?: Record;
+ *     permissions?: readonly { action; resource; effect: "allow"|"deny"|"ask" }[];
+ *     version: string;
+ *     sessionID: SessionID;
+ *   }
+ *
+ * From the same file, `Deleted` (verbatim):
+ *
+ *   type: "session.deleted"; durability: "durable";
+ *   data: { sessionID: SessionID }
+ *
+ * From the same file, `Moved` (verbatim, collapsed):
+ *
+ *   type: "session.moved";
+ *   data: { location: { directory; workspaceID? }; projectID: Project.ID;
+ *           subpath?; sessionID }
+ *
+ * From the same file, `UsageUpdated` (verbatim, collapsed) — already consumed here:
+ *
+ *   type: "session.usage.updated"; durability: "ephemeral";
+ *   data: { cost: Money.USD; tokens: { input; output; reasoning; cache: { read; write } };
+ *           sessionID }
+ *
+ * From `dist/session-status-event.d.ts` (verbatim, collapsed):
+ *
+ *   session.idle    data: { sessionID }
+ *   session.status  data: { sessionID; status: { type: "idle" | "busy" | "retry"; ... } }
+ *
+ * From `dist/location.d.ts` — `Location.Info`, the declared type of `ctx.location`:
+ *
+ *   { directory: AbsolutePath; workspaceID?: Workspace.ID;
+ *     project: { id: Project.ID; directory: AbsolutePath; canonical: AbsolutePath } }
+ *
  * NOT verified here: the runtime payload contents (which fields are populated on a real
  * `execute.before`/`execute.after` call), the concrete `OpenCodeEvent` union members
  * delivered to `ctx.event.subscribe`, and whether token/usage fields are reachable at
  * all in V2. Those are documented as unverified in `docs/OPENCODE_OBSERVER.md`; the
- * adapter treats every field defensively and never invents a value.
+ * adapter treats every field defensively and never invents a value. What Stage 1H
+ * observed live — `session.created`/`session.deleted` arriving with their payload under
+ * `data` — is consistent with these declarations; the key names themselves came from the
+ * declarations, not from that run.
  */
 
 /** OpenCode V2 plugin API package this adapter targets. */
@@ -82,6 +138,17 @@ export const OPENCODE_V2_PLUGIN_PACKAGE = '@opencode/plugin';
 
 /** OpenCode V2 plugin API version this adapter was verified against. */
 export const OPENCODE_V2_PLUGIN_VERIFIED_VERSION = '2.0.24';
+
+/**
+ * Schema package carrying the V2 event contracts this adapter maps.
+ *
+ * `@opencode/plugin@2.0.24` depends on `@opencode/schema@2.0.24`, which is where
+ * the concrete event payload shapes (and `ctx.location`'s type) live.
+ */
+export const OPENCODE_V2_SCHEMA_PACKAGE = '@opencode/schema';
+
+/** Schema package version whose declarations were read and recorded (2026-10-10). */
+export const OPENCODE_V2_SCHEMA_VERIFIED_VERSION = '2.0.24';
 
 /**
  * Plugin id used in `Plugin.define({ id, setup })`.
@@ -194,6 +261,73 @@ export interface OpenCodeV2EventDomain {
   subscribe(options?: { readonly signal?: AbortSignal }): AsyncIterable<unknown>;
 }
 
+/** A location reference, as `session.created`/`session.moved` carry it. */
+export interface OpenCodeV2LocationRef {
+  /** Effective directory of the event, an absolute path (`AbsolutePath`). */
+  readonly directory?: string;
+  /** Opaque workspace id, when the runtime has one. Never a path. */
+  readonly workspaceID?: string;
+}
+
+/** The `project` member of `Location.Info` (`@opencode/schema` `location.d.ts`). */
+export interface OpenCodeV2ProjectInfo {
+  /** Opaque `Project.ID` — compared exactly, never used as a path or a session key. */
+  readonly id?: string;
+  /** Project root directory, as declared. */
+  readonly directory?: string;
+  /** Canonical project directory, as declared. */
+  readonly canonical?: string;
+}
+
+/**
+ * `Location.Info` — the declared type of `ctx.location`.
+ *
+ * This is the only source that can say **which project this plugin instance was
+ * loaded for**, so it is what the scope gate compares a session's declared project
+ * against. Every member is optional here because the adapter must survive a host
+ * that exposes less (or a future release that changes the shape); a location with
+ * nothing usable means sessions are reported as unverified instead of guessed.
+ */
+export interface OpenCodeV2LocationInfo {
+  /** The host's effective working directory. */
+  readonly directory?: string;
+  /** Opaque workspace id, when the runtime has one. */
+  readonly workspaceID?: string;
+  /** The project the host belongs to. */
+  readonly project?: OpenCodeV2ProjectInfo;
+}
+
+/**
+ * `data` of a `session.created` event (contract-verified, see the header).
+ *
+ * Only the fields the observer reads are declared; the rest of the payload
+ * (title, agent, model, metadata, permissions) is deliberately not modelled so
+ * nothing can accidentally be stored from it.
+ */
+export interface OpenCodeV2SessionCreatedData {
+  /** The session id. V1 describes the same transition as `properties.info.id`. */
+  readonly sessionID?: string;
+  /** Opaque runtime project id. */
+  readonly projectID?: string;
+  /** Where the session lives and which workspace it belongs to. */
+  readonly location?: OpenCodeV2LocationRef;
+  /** Relative path inside the project, when the session was created at one. */
+  readonly subpath?: string;
+}
+
+/** `data` of a `session.deleted` event (contract-verified): the id, nothing else. */
+export interface OpenCodeV2SessionDeletedData {
+  readonly sessionID?: string;
+}
+
+/** `data` of a `session.moved` event: the new location and project, plus the id. */
+export interface OpenCodeV2SessionMovedData {
+  readonly sessionID?: string;
+  readonly projectID?: string;
+  readonly location?: OpenCodeV2LocationRef;
+  readonly subpath?: string;
+}
+
 /**
  * The `setup` context.
  *
@@ -207,7 +341,8 @@ export interface OpenCodeV2PluginContext {
   readonly event?: OpenCodeV2EventDomain;
   readonly options?: Readonly<Record<string, unknown>>;
   readonly app?: unknown;
-  readonly location?: unknown;
+  /** The host's own location/project (`Location.Info`); unverified at runtime. */
+  readonly location?: OpenCodeV2LocationInfo;
 }
 
 /** Cleanup returned from `setup`. */

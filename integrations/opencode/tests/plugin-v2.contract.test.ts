@@ -5,16 +5,22 @@ import {
   OBSERVER_V2_PLUGIN_ID,
   OPENCODE_V2_PLUGIN_PACKAGE,
   OPENCODE_V2_PLUGIN_VERIFIED_VERSION,
+  OPENCODE_V2_SCHEMA_PACKAGE,
+  OPENCODE_V2_SCHEMA_VERIFIED_VERSION,
   V2_REQUIRED_CAPABILITIES,
   createOpenCodeObserverPluginV2,
   defineOpenCodeV2Plugin,
 } from '../src/index.js';
 import defaultExport from '../src/index.js';
 import {
+  VERIFIED_V2_LOCATION_DTS_SHA256,
   VERIFIED_V2_PLUGIN_DTS_SHA256,
   VERIFIED_V2_PLUGIN_PACKAGE,
   VERIFIED_V2_PLUGIN_VERSION,
   VERIFIED_V2_REGISTRATION_DTS_SHA256,
+  VERIFIED_V2_SCHEMA_PACKAGE,
+  VERIFIED_V2_SCHEMA_VERSION,
+  VERIFIED_V2_SESSION_EVENT_DTS_SHA256,
   VERIFIED_V2_TOOL_DTS_SHA256,
   createPublishedV2Context,
 } from './fixtures/opencode-plugin-v2.contract.js';
@@ -35,6 +41,13 @@ describe('OpenCode V2 plugin API compatibility', () => {
       VERIFIED_V2_TOOL_DTS_SHA256,
       VERIFIED_V2_REGISTRATION_DTS_SHA256,
     ]) {
+      expect(digest).toMatch(/^[0-9a-f]{64}$/);
+    }
+    // Stage 1I added the event contracts, which live in the schema package the
+    // plugin package depends on. Same verification method, recorded the same way.
+    expect(VERIFIED_V2_SCHEMA_PACKAGE).toBe(OPENCODE_V2_SCHEMA_PACKAGE);
+    expect(VERIFIED_V2_SCHEMA_VERSION).toBe(OPENCODE_V2_SCHEMA_VERIFIED_VERSION);
+    for (const digest of [VERIFIED_V2_SESSION_EVENT_DTS_SHA256, VERIFIED_V2_LOCATION_DTS_SHA256]) {
       expect(digest).toMatch(/^[0-9a-f]{64}$/);
     }
   });

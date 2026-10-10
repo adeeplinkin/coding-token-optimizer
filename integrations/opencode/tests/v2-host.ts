@@ -2,11 +2,16 @@ import type {
   ObserverDiagnostic,
   ObserverOptions,
   OpenCodeObserver,
+  OpenCodeV2LocationInfo,
   OpenCodeV2PluginContext,
   OpenCodeV2Registration,
+  OpenCodeV2SessionCreatedData,
+  OpenCodeV2SessionDeletedData,
+  OpenCodeV2SessionMovedData,
   OpenCodeV2ToolHookSpec,
 } from '../src/index.js';
 import { IMPLEMENTED_V2_TOOL_HOOKS, createOpenCodeObserverV2 } from '../src/index.js';
+import { fnv1aHex } from './helpers.js';
 
 /**
  * A minimal OpenCode **V2** host.
@@ -43,6 +48,84 @@ export interface V2Host {
   readonly close: () => Promise<void>;
 }
 
+/** What the fake host declares about itself beyond the observer options. */
+export interface V2HostEnvironment {
+  /**
+   * The host's own `ctx.location` (`Location.Info`). `undefined` simulates a host
+   * that declares no location at all, which is the case every summary must
+   * survive as "project unverified".
+   */
+  readonly location?: unknown;
+  /** Options the host passes as `ctx.options` on the first `setup` call. */
+  readonly pluginOptions?: Readonly<Record<string, unknown>>;
+}
+
+/** A runtime-shaped V2 envelope, exactly as the 2.0.24 server delivers it. */
+export function v2Envelope(type: string, data: unknown): Record<string, unknown> {
+  return { id: 'evt_1', created: 1_700_000_000_000, type, data };
+}
+
+/**
+ * A `session.created` payload in the verified `@opencode/schema@2.0.24` shape.
+ *
+ * Defaults describe a synthetic project so assertions can check the scope gate
+ * without ever touching a real path.
+ */
+export function sessionCreatedData(
+  overrides: OpenCodeV2SessionCreatedData = {},
+): Record<string, unknown> {
+  return {
+    sessionID: 'ses_created',
+    projectID: 'prj_created',
+    location: { directory: 'C:\\synthetic\\project' },
+    slug: 'synthetic-session',
+    version: '1',
+    ...overrides,
+  };
+}
+
+/** A `session.deleted` payload in the verified shape: the id, nothing else. */
+export function sessionDeletedData(
+  overrides: OpenCodeV2SessionDeletedData = {},
+): Record<string, unknown> {
+  return { sessionID: 'ses_created', ...overrides };
+}
+
+/** A `session.moved` payload in the verified shape. */
+export function sessionMovedData(
+  overrides: OpenCodeV2SessionMovedData = {},
+): Record<string, unknown> {
+  return {
+    sessionID: 'ses_created',
+    projectID: 'prj_created',
+    location: { directory: 'C:\\synthetic\\project' },
+    ...overrides,
+  };
+}
+
+/**
+ * A `session.usage.updated` payload in the verified shape.
+ *
+ * The numbers are the same ones Stage 1H observed live, so a test can pin an
+ * exact value and still be reading a realistic payload.
+ */
+export function v2UsageData(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    sessionID: 'ses_host',
+    cost: 0.02,
+    tokens: { input: 368, output: 75, reasoning: 91, cache: { read: 10496, write: 0 } },
+    ...overrides,
+  };
+}
+
+/** A synthetic `Location.Info` for the given project. */
+export function projectLocation(directory: string, projectId: string): OpenCodeV2LocationInfo {
+  return {
+    directory,
+    project: { id: projectId, directory, canonical: directory },
+  };
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
@@ -66,9 +149,27 @@ export async function waitUntil(
   }
 }
 
-export async function createV2Host(options: ObserverOptions = {}): Promise<V2Host> {
-  const created = createOpenCodeObserverV2(options);
+export async function createV2Host(
+  options: ObserverOptions = {},
+  environment: V2HostEnvironment = {},
+): Promise<V2Host> {
   const diagnostics: ObserverDiagnostic[] = [];
+  const created = createOpenCodeObserverV2({
+    // Defaults here keep tests deterministic and isolated: an explicit empty
+    // environment stops a developer's real environment from enabling a summary
+    // file or disabling the observer inside a test, and a fixed hasher keeps read
+    // and project identities reproducible.
+    env: {},
+    hash: fnv1aHex,
+    ...options,
+    // The host collects diagnostics itself: a test asserting on observer behaviour
+    // needs to see what the observer reported, and a caller-supplied callback is
+    // still honoured. Stage 1I's tests found this wire was missing.
+    onDiagnostic: (diagnostic) => {
+      diagnostics.push(diagnostic);
+      options.onDiagnostic?.(diagnostic);
+    },
+  });
   const callbacks = new Map<string, (event: unknown) => unknown>();
   const buffer: unknown[] = [];
   let closed = false;
@@ -128,6 +229,11 @@ export async function createV2Host(options: ObserverOptions = {}): Promise<V2Hos
         return iterable;
       },
     },
+    // A host that declares no location is simulated by omitting the member
+    // entirely, exactly as `exactOptionalPropertyTypes` models the real contract.
+    ...(environment.location === undefined
+      ? {}
+      : { location: environment.location as OpenCodeV2LocationInfo }),
   };
 
   let cleanup: (() => Promise<void> | void) | undefined;
@@ -141,7 +247,7 @@ export async function createV2Host(options: ObserverOptions = {}): Promise<V2Hos
 
   // A host always runs `setup` before it can deliver anything, so the harness does
   // the same rather than leaving it to each test to remember.
-  await setup();
+  await setup(environment.pluginOptions ?? {});
 
   return {
     observer: created.observer,

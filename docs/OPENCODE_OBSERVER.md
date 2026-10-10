@@ -4,10 +4,12 @@
 **Status:** implemented and unit-tested; **observation only** — no optimization
 **Target APIs:** `@opencode-ai/plugin` **1.18.35** (V1 `Hooks` contract) **and** `@opencode/plugin`
 **2.0.24** (V2 `Plugin.define({ id, setup })` contract — see §18)
-**Runtime validation:** **attempted, blocked** — Stage 1E found the installed OpenCode Desktop
-**2.0.24** implements the **V2** plugin API, so this V1 adapter cannot load there (see
-[docs/OPENCODE_DESKTOP_VALIDATION.md](OPENCODE_DESKTOP_VALIDATION.md) and §14). This adapter remains
-valid for a V1-line OpenCode (`1.18.x`); a V2 port is future work.
+**Runtime validation:** **live-validated** — the installed OpenCode Desktop **2.0.24** implements the
+**V2** plugin API, and the **V2** adapter (§18) was loaded and validated there in Stages 1G–1I: live
+hooks, live usage snapshots, one-shot persistence, and — since Stage 1I — live session-lifecycle
+mapping and project isolation (see
+[docs/OPENCODE_DESKTOP_VALIDATION.md](OPENCODE_DESKTOP_VALIDATION.md) §15–§17). The V1 adapter remains
+valid and unchanged for a V1-line OpenCode (`1.18.x`), where the V2 event vocabulary does not apply.
 
 > Dr. Token must prove it can observe agent activity correctly before attempting to
 > optimize it. This stage does the proving; it does not optimize.
@@ -489,7 +491,7 @@ when quoting it.
   exceptions (so hooks must never throw).
 - That the V2 plugin API is a different, unreleased contract.
 
-### Unit-tested adapter behaviour (`npm test`, 257 observer tests in `integrations/opencode`)
+### Unit-tested adapter behaviour (`npm test`, 287 observer tests in `integrations/opencode`)
 
 - Plugin initialization and hook surface; tool execution counting; before/after
   correlation; tool frequency; repeated identical reads; different ranges; separate
@@ -504,6 +506,15 @@ when quoting it.
   no lifecycle event, and a usage snapshot is written on arrival even with the periodic timer disabled.
 - Filesystem behaviour: torn-tail repair after an interrupted write, append-only JSONL integrity,
   failing and unwritable sinks reported as `sink-failed` without breaking observation.
+- V2 session lifecycle and project isolation end to end through the real plugin: mapping
+  `session.created`/`session.deleted`/`session.moved` from the verified `data` shapes, the scope gate
+  (project id first, then directory containment), refusal of other-project sessions, late events for
+  deleted sessions, out-of-order delivery, concurrent sessions with interleaved events and a shared
+  read target, and arrival-time persistence of project attribution.
+- The V2 host harness (`tests/v2-host.ts`): real `setup(ctx)`, real hook registration, the actual
+  subscription iterable, runtime-shaped envelopes and cleanup. Earlier stages' tests called observer
+  methods directly and missed defects that only a live run then found; this layer exercises the adapter
+  the way the host does.
 - Compile-time satisfaction of the published V1 **and** V2 types (vendored contract fixtures).
 - Source-level absence of network, logging, subprocess and filesystem paths.
 
@@ -533,6 +544,16 @@ payload), both fixed and re-validated live — see
 [§16](OPENCODE_DESKTOP_VALIDATION.md#16-stage-1h--v2-usage-events-and-reliable-summary-persistence-runtime-tested).
 Still nothing is optimised, and no saving is claimed.
 
+**Stage 1I update (2026-10-10): the lifecycle is mapped, and isolation is live-verified.** Three
+zero-cost isolated runs (the run names an unresolvable model, so no provider is ever reached) validated
+the Stage 1I adapter in a real 2.0.24 server: a live `session.created` was mapped into a summary
+(`lifecycle.createdEvents: 1`) with `project.verification: "matched"` against the instance's own
+`ctx.location`, and the summary reached the sink **~11 ms after the event** with a 60 s checkpoint
+interval and no unload; a session declaring a different project was refused (`sessionsOutOfScope: 1`,
+nothing written); a disabled observer processed nothing although the event was delivered. Evidence,
+procedures and limitations:
+[§17](OPENCODE_DESKTOP_VALIDATION.md#17-stage-1i--live-lifecycle-project-isolation-and-harness-validation-runtime-tested).
+
 What was listed as unverified here is now partly settled, and partly superseded:
 
 - **Plugin loading and order** — observed: OpenCode loads it per process (one `setup`, one
@@ -547,9 +568,11 @@ What was listed as unverified here is now partly settled, and partly superseded:
 - **Aborted or errored requests** — still unverified, and now known to matter: the flush trigger
   registered for `session.execution.succeeded` **did not fire** in the live one-shot run, so no
   durability guarantee rests on it (the usage-snapshot write and the periodic checkpoint carried it).
-- **Sessions from other projects** — still unverified. Per-session keying is implemented; directory
-  scoping is not, and the V2 lifecycle payload layout that would register a session is not yet mapped
-  (§18.7).
+- **Sessions from other projects** — settled in Stage 1I: the V2 lifecycle payloads are mapped, and the
+  scope gate compares the instance's own project (`ctx.location`) with the session's declared project.
+  Both outcomes were observed live — a matching session was recorded with `verification: "matched"`, and
+  a session declaring another project was refused with `sessionsOutOfScope: 1` and nothing written
+  (§18.7, §17).
 - **Real-world repeated-read rates and tool-call distributions** — still unverified; the live samples
   are a handful of synthetic two-read sessions.
 
@@ -724,8 +747,8 @@ Bypass is unchanged: `{ "enabled": false }` or `DR_TOKEN_OPENCODE_OBSERVER=off`.
 
 ### 18.5 V2 compatibility status
 
-Updated by Stage 1G (live hooks) and Stage 1H (live usage + one-shot persistence) against the real
-OpenCode Desktop 2.0.24 bundled CLI
+Updated by Stage 1G (live hooks), Stage 1H (live usage + one-shot persistence) and Stage 1I (live
+lifecycle mapping + project isolation) against the real OpenCode Desktop 2.0.24 bundled CLI
 ([Stage 1G record](OPENCODE_DESKTOP_VALIDATION.md#15-stage-1g--live-v2-validation-runtime-tested),
 [Stage 1H record](OPENCODE_DESKTOP_VALIDATION.md#16-stage-1h--v2-usage-events-and-reliable-summary-persistence-runtime-tested)).
 
@@ -740,8 +763,9 @@ OpenCode Desktop 2.0.24 bundled CLI
 | `ctx.event.subscribe` item shape (payload under `data`) | ✅ | ✅ | ✅ (55 events delivered in one run) |
 | **V2 usage snapshots (`session.usage.updated`)** | ✅ | ✅ | ✅ (2 events, exact values, correct session) |
 | **One-shot summary persistence** (no unload required) | ✅ | ✅ | ✅ (final snapshot on disk, cleanup never ran) |
-| V2 session **lifecycle** mapping (`session.created`/`session.deleted`) | ⚠️ received, layout unknown | ❌ | ❌ received, unmapped — see §18.7 |
-| Bypass (`enabled:false` / env) | ✅ | ✅ | ❌ (unit-tested only) |
+| V2 session **lifecycle** mapping (`session.created`/`session.deleted`/`session.moved`) | ✅ (`@opencode/schema@2.0.24`) | ✅ | ✅ `session.created` mapped live; `deleted`/`moved` harness-tested (§18.7, §17) |
+| **Project scope gate** (instance `ctx.location` vs session facts) | ✅ | ✅ | ✅ matched and refused live (§18.7, §17) |
+| Bypass (`enabled:false` / env) | ✅ | ✅ | ✅ live: disabled observer processed nothing (§17) |
 
 Three V2-vs-V1 differences were found live:
 
@@ -752,8 +776,9 @@ Three V2-vs-V1 differences were found live:
    and the reason Stage 1G saw no usage at all). `asRuntimeEvent` now preserves **both**, and the
    observer prefers `properties`, so V1 behaviour is unchanged.
 3. **V2's lifecycle vocabulary is not V1's.** `session.created`/`session.deleted` are delivered with a
-   `data` payload that does not carry V1's `info.id` layout, so the counters stay at zero rather than
-   being guessed at (§18.7).
+   `data` payload that carries `sessionID` (plus `projectID`/`location` on creation) — V1 uses
+   `properties.info.id`. Stage 1I maps them from the shipped `@opencode/schema@2.0.24` declarations
+   and confirms the shape live (§18.7).
 
 V2 also emits an entirely different event vocabulary (`session.step.started`, `session.tool.called`,
 `session.reasoning.delta`, `session.inbox.*`, `session.execution.*`, …), none of which overlaps V1.
@@ -783,16 +808,43 @@ in both, the last snapshot equalled the totals the runtime itself stored for the
 per-request increment could not be. That is evidence, not a published contract, so `aggregation` stays
 `"unverified"` and only the source's own numbers are kept.
 
-### 18.7 Not implemented: V2 lifecycle and per-step usage
+### 18.7 V2 session lifecycle and project isolation (implemented in Stage 1I)
 
-- `session.created` / `session.deleted` are now **received** (their payload is under `data`), but the
-  layout does not match V1's `properties.info.id`, so the summary's lifecycle counters remain zero and
-  the event is diagnosed instead of guessed at. Capturing those key names is the concrete next step.
+The lifecycle payloads were read out of the shipped `@opencode/schema@2.0.24` declarations (verbatim
+excerpts recorded in [`src/types-v2.ts`](../integrations/opencode/src/types-v2.ts)) and confirmed live
+by Stage 1I's isolated runtime runs:
+
+| Event | Verified `data` shape | What the adapter does |
+| --- | --- | --- |
+| `session.created` | `{ projectID, location: { directory, workspaceID? }, subpath?, slug, version, sessionID, … }` | maps the session, applies the declared project facts, counts `createdEvents` |
+| `session.moved` | `{ projectID, location: { directory, workspaceID? }, subpath?, sessionID }` | re-applies the facts and re-runs the scope gate |
+| `session.deleted` | `{ sessionID }` | closes the session: writes the final summary, then releases state |
+
+- **Project scope gate.** The V2 adapter declares the instance's own project to the observer from
+  `ctx.location` (`Location.Info`: `{ directory, workspaceID?, project: { id, directory, canonical } }`).
+  A session is `matched` when both sides declare a project id and they are equal, or — only when an id
+  is missing on either side — when the session's declared directory is the project directory or lies
+  inside it. A session that declares a **different** project is dropped (`sessionsOutOfScope`,
+  diagnostic `project-mismatch`) and nothing is written for it. When either side declares nothing
+  usable, the session is still recorded but reported as `verification: "unverifiable"` with an explicit
+  note — never assigned to a guessed project. Directory comparison folds the Windows forms only
+  (backslashes, drive-letter case, doubled and trailing separators) and never resolves symlinks or
+  `..`; the runtime's own `canonical` field is preferred when present.
+- **Privacy.** The declared directory is kept in memory only, for comparison. Summaries carry the
+  project's opaque id, the workspace id and a **one-way hash** of the normalized directory — never a
+  path. A Stage 1H live run recorded that `session.created` can arrive for a session whose directory is
+  not the project at all; now such a session is either verified against the instance project or
+  explicitly reported as unverified, instead of silently attributed.
+- **Late, duplicate and out-of-order events.** Session ids whose deletion was observed, and ids refused
+  as out of scope, are remembered (bounded) and checked before any state is created, so a late
+  tool/usage event cannot resurrect a deleted session and duplicate deletions cannot run the transition
+  twice. Both are counted (`lateEventsIgnored`) and diagnosed (`session-closed`). A session observed
+  before its `session.created` is re-evaluated when the event arrives.
 - `session.step.ended` carries per-step `cost`/`tokens` and `session.tool.called`/`session.tool.success`
   carry V2-native tool data. Neither is consumed: pooling per-step usage beside the session snapshot
   would double count, and the tool hooks already provide the same observations.
 - `session.execution.succeeded` is registered as a flush trigger, but it was **not delivered** in the
-  live one-shot run, so no durability guarantee depends on it.
+  live one-shot runs, so no durability guarantee depends on it.
 
 ### 18.8 Summary persistence (implemented in Stage 1H)
 
@@ -802,6 +854,7 @@ disk. With a sink configured, the observer now writes:
 | Trigger | Behaviour |
 | --- | --- |
 | A `session.usage.updated` snapshot | written **immediately** (queued, never awaited into the event path) — low frequency, highest-value content |
+| Project attribution from `session.created`/`session.moved` | written **immediately**, same reasoning: rare, high-value, and it arrives at the very start of a session — exactly when a one-shot host is most likely to be terminated |
 | A dirty session + a timer | periodic checkpoint, `checkpointIntervalMs` (default 1000 ms, `unref`'d so it never keeps the host alive) — bounded write rate for busy tool traffic |
 | `session.idle` (V1) / `session.execution.succeeded` (V2, when delivered) | flush |
 | `session.deleted`, `dispose()` | flush, then release state |
@@ -817,8 +870,8 @@ write. With no `summaryFile`, no `DR_TOKEN_OBSERVER_SUMMARY_FILE` and no injecte
 exists at all**.
 
 Residual limitation, measured rather than assumed: if a session's **last** change is a tool call and the
-host is killed inside the checkpoint interval, that tail is not written. The live run lost nothing
-because its final change was a usage snapshot, which is written on arrival.
+host is killed inside the checkpoint interval, that tail is not written. The live runs lost nothing
+because their final changes were a usage snapshot and a project attribution, both written on arrival.
 
 ### 18.9 Reproducing the live validation
 
@@ -848,3 +901,26 @@ A two-read session must report `toolStartsObserved: 2`, `correlatedCompletions: 
 Stage 1H — a `usage.sourceReported` block with real numbers in it. To check persistence, watch the
 configured `observations.jsonl` **while the session runs**: it must already contain a line whose
 `sourceReported.latest` matches the session export's own totals, even though the host never unloads.
+
+**Stage 1I zero-cost recipe (cannot reach a provider).** The lifecycle/isolation runs deliberately name
+an unresolvable model, so the session fails at model resolution before any request exists:
+
+```sh
+BASE="$TMPDIR/dr-token-stage1i-run2"
+mkdir -p "$BASE/project/.opencode/plugins" "$BASE/iso/config" "$BASE/iso/data"
+# stage the built adapter under .opencode/vendor/dr-token-opencode-observer/dist and a harness
+# plugin under .opencode/plugins; the harness forwards the host's own ctx.location unless
+# DR_TOKEN_STAGE1I_WRONG_PROJECT=1, and sets enabled:false when DR_TOKEN_STAGE1I_DISABLED=1
+cd "$BASE/project"
+XDG_CONFIG_HOME="$BASE/iso/config" XDG_DATA_HOME="$BASE/iso/data" \
+  "$CLI" run --standalone --print-logs --auto --title "stage1i probe" \
+  --model nonexistent/nonexistent-model "Reply exactly: DONE."
+```
+
+Expected: the process exits with `Model unavailable: nonexistent/nonexistent-model`; with a sink
+configured, `observations.jsonl` already contains a summary with `lifecycle.createdEvents: 1` and
+`project.verification: "matched"` when the session's `data.projectID`/`data.location` agree with the
+host's `ctx.location`; with `DR_TOKEN_STAGE1I_WRONG_PROJECT=1` no summary and no sink file appear and the
+snapshot shows `sessionsOutOfScope: 1`; with `DR_TOKEN_STAGE1I_DISABLED=1` nothing is processed at all.
+`session.deleted`/`session.moved` are exercised deterministically by `tests/v2-host.ts` +
+`tests/v2-lifecycle.test.ts`; no live run has produced them yet.

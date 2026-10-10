@@ -1,11 +1,13 @@
-# OpenCode Desktop validation (Stage 1E → Stage 1H)
+# OpenCode Desktop validation (Stage 1E → Stage 1I)
 
-**Status (Stage 1H, 2026-10-10): LIVE HOOK, USAGE AND ONE-SHOT-PERSISTENCE VALIDATION COMPLETED.** The
+**Status (Stage 1I, 2026-10-10): LIVE LIFECYCLE AND PROJECT-ISOLATION VALIDATION COMPLETED.** The
 V2 adapter was loaded by the real OpenCode Desktop 2.0.24 runtime; its tool hooks fired on real tool
-executions, and it now also **records the runtime's own token/cost snapshots** and **persists a summary
-during a one-shot session**. §1–§14 are the Stage 1E record, kept as written (they remain accurate for
-the V1 adapter that stage could not load); **§15 is the Stage 1G live result** and **§16 is the Stage 1H
-live result**, which also found and fixed the reason Stage 1G saw no usage data at all.
+executions, it **records the runtime's own token/cost snapshots**, **persists a summary during a
+one-shot session**, and since Stage 1I it **maps `session.created` into a project-verified summary**
+and **refuses sessions that declare another project**. §1–§14 are the Stage 1E record, kept as written
+(they remain accurate for the V1 adapter that stage could not load); **§15 is the Stage 1G live
+result**, **§16 is the Stage 1H live result**, and **§17 is the Stage 1I live result**, which also
+documents the zero-cost isolated-run method used to obtain it.
 
 **Date:** 2026-10-10 · **Platform:** Windows 11 · **Stage 1D base commit:** `3bb0943` · **Stage 1F commit:** `e7e0f89`
 
@@ -603,15 +605,19 @@ service instance's own passive observation, not from that attempt.
 
 ### 16.10 Still not runtime-verified
 
-- **V2 session lifecycle mapping** (§16.7) — the concrete next action is to capture the `data` key
-  names for `session.created`/`session.deleted` and map them; a session created through the service
-  produced both events once, which is the cheapest way to capture them.
-- **Session separation across concurrent sessions.** Still blocked: a shared server requires the
-  password it auto-generates, and handling a service password is out of scope. Unit-tested only.
+- **V2 session lifecycle mapping** (§16.7) — **superseded by §17**: the `data` key names were read from
+  the shipped `@opencode/schema@2.0.24` declarations, and `session.created` was then mapped and
+  observed live in an isolated run. (`session.deleted`/`session.moved` remain harness-tested only.)
+- **Session separation across concurrent sessions.** Isolation semantics are **superseded by §17** (the
+  scope gate and concurrent-session separation are covered by the V2 host harness, and refusal of a
+  differently-attributed session was observed live); *two simultaneous sessions in one shared live
+  server* remain untested — still blocked on the service password, which stays out of scope.
 - **GUI-driven sessions**, V2 read *range* parameter names, `id` stability across very long
   sequences, and the mapping of `session.step.ended` usage (deliberately not pooled).
 - **Bypass** (`enabled:false` / `DR_TOKEN_OPENCODE_OBSERVER=off`) remains unit-tested only; no live
-disabled comparison was repeated in Stage 1H, and no code path that could affect execution changed.
+disabled comparison was repeated in Stage 1H; **superseded by §17**, where a disabled observer was
+validated live in an isolated run — the `session.created` event was delivered and nothing was processed
+or written.
 
 ### 16.11 Security and cost
 
@@ -622,3 +628,104 @@ file content was read; global configuration was not modified; the Desktop servic
 reconfigured. The two diagnostic servers started on loopback ports 4571/4572 (with a password supplied
 by this session's own environment, not the host's generated one) were stopped, and the log containing a
 transient auto-generated password was deleted. **No token saving is claimed, and none was measured.**
+
+---
+
+## 17. Stage 1I — live lifecycle, project isolation and harness validation (runtime-tested)
+
+### 17.1 Method
+
+Three runs in a **fresh disposable project** (`%TEMP%\dr-token-stage1i-run2\project`), each with its own
+isolated XDG config/data/cache/state directories (`…\dr-token-stage1i-run2\iso`), using the Desktop's
+own bundled CLI **2.0.24** in `run --standalone` mode. Each run names an **unresolvable model**
+(`--model nonexistent/nonexistent-model`), so the session fails at model resolution and **no provider
+is ever contacted**; this is the zero-cost way to exercise session creation, plugin loading and event
+delivery. The staged plugin (`…\.opencode\plugins\dr-token-observer.ts`) is a harness that forwards the
+host's real `ctx.location`, tool and event domains to the unmodified built adapter
+(`…\.opencode\vendor\dr-token-opencode-observer\dist`) and records **event type names, payload key
+names, primitive carrier types and the observer's own snapshot/summaries only** — never an event value,
+path, prompt or tool output. Full runs and artifacts: `A.err`/`B.err`/`C.err`, `dr-token-stage1i.marker`,
+`dr-token-stage1i-evidence-<pid>.json`, `observations.jsonl` in that directory.
+
+The user's Desktop background service was **not** used to create any session. (It did hot-reload the
+Stage 1I harness staged into the Stage 1H disposable project at `%TEMP%\dr-token-opencode-e2e`; see
+§17.6.)
+
+### 17.2 Contract facts confirmed live
+
+- `session.created` arrives with its body under `data` and the key names
+  `location, model, projectID, sessionID, slug, subpath, version`; `data.location` carries `directory`.
+  This matches the declarations read from `@opencode/schema@2.0.24` (observer doc §18.7).
+- `ctx.location` is present in the real 2.0.24 host with the members
+  `directory, project, workspaceID` and `project: { canonical, directory, id }` — key names only were
+  recorded.
+- The run's V2 event vocabulary observed live included `session.renamed`, `session.inbox.enqueued`,
+  `session.inbox.delivered`, `session.execution.started`, `session.execution.failed`,
+  `session.instructions.updated` alongside the registry events; all are safely ignored, none is
+  mistaken for a token reading.
+
+### 17.3 Scenario A — lifecycle mapping, attribution and arrival-time persistence (PASS)
+
+A live session (`ses_ed983a174…`) was created in the isolated project. The observer's own snapshot
+(`dr-token-stage1i-evidence-15572.json`) and the sink file show:
+
+- `sessionCount: 1`, `sessionsCreated: 1`, `eventsObserved: 16`, `internalErrors: 0`;
+- the session summary has `lifecycle.createdEvents: 1` — the V2 lifecycle mapping that Stage 1H could
+  not perform;
+- `project: { basis: "runtime-declared", verification: "matched", projectId: "bb787…", directoryHash: "4577…" }`
+  — compared by project id against the instance's own `ctx.location`, with only a one-way hash of the
+  directory persisted (the absolute path appears nowhere in the file);
+- `observations.jsonl` was written at **15:44:08.190Z — 11 ms after the `session.created` event
+  (15:44:08.179Z)** with `checkpointIntervalMs: 60_000` and **no cleanup ever running** (the host was
+  killed by the unresolved-model error at 15:44:08.356Z). This live-proves the Stage 1I arrival-path
+  flush: neither dispose nor a periodic checkpoint could have produced that write.
+
+### 17.4 Scenario B — a session declaring another project is refused (PASS)
+
+With the harness declaring a synthetic instance project different from the live session's project:
+
+- `sessionsCreated: 1`, `sessionCount: 0`, `sessionsOutOfScope: 1`, `lateEventsIgnored: 0`,
+  `internalErrors: 0`; diagnostic `project-mismatch` (with the usual `event-ignored`);
+- `summaries: 0` and **no sink file was created**: nothing was written for the refused session.
+
+### 17.5 Scenario C — a disabled observer processes nothing (PASS)
+
+With `DR_TOKEN_STAGE1I_DISABLED=1`:
+
+- the harness confirmed the delivered `session.created` (`eventTypes["session.created"] = 1`), yet the
+  observer's snapshot shows `enabled: false`, `eventsObserved: 0`, `sessionsCreated: 0`, and no sink
+  file exists;
+- this is the first live validation of the bypass path (Stage 1H recorded it as unit-tested only).
+
+### 17.6 The Desktop background service instance (disclosure)
+
+Staging validation harnesses into the Stage 1H disposable project
+(`%TEMP%\dr-token-opencode-e2e`) caused the **user's already-running Desktop background service**
+(`opencode-cli serve --service`, pid 19628) to hot-reload the harness, because the service's session is
+attached to that directory. Its passive observation was recorded (`dr-token-stage1i.marker`,
+`dr-token-stage1i-evidence-19628.json`): the adapter initialised in that real service process with
+`ctx.location` present in the verified shape, observed 11 registry events, ignored all of them safely,
+and reported `sessionsCreated: 0`, `internalErrors: 0`. **No session was created through the service**,
+and no model call occurred there. The harness is observation-only and confined to the disposable
+directory; the user may remove `…\dr-token-opencode-e2e\.opencode\plugins\` and `…\vendor\` to stop the
+service from loading it.
+
+### 17.7 Still not runtime-verified after Stage 1I
+
+- **Live `session.deleted` / `session.moved`**: no isolated run produced either event (the one-shot host
+  is killed before deletion). Both are exercised deterministically through the real V2 plugin by
+  `tests/v2-lifecycle.test.ts` (deletion flushes then releases state; a move re-runs the scope gate),
+  but they are **not** live-observed.
+- **Two simultaneous live sessions in one server**: isolation semantics and interleaving are covered by
+  the harness; a shared live server still requires the service password, which remains out of scope.
+- **GUI-driven sessions** and `session.step.ended` usage mapping (deliberately not pooled) remain
+  unverified as before.
+
+### 17.8 Security and cost
+
+**Zero model calls**: every run names an unresolvable model, and each run's log shows
+`ModelUnavailableError: Model unavailable: nonexistent/nonexistent-model`. No credential was read or
+created; no user conversation, prompt or file content was recorded (the harness stores event *names*,
+payload *key names* and the observer's own snapshot only); the user's global configuration and the
+Desktop service's own settings were not modified; all writes stayed inside `%TEMP%`. **No token saving
+is claimed, and none was measured.**

@@ -28,7 +28,11 @@ export type {
   ObservedRunMetrics,
 } from './benchmark-adapter.js';
 export { READ_TARGET_ID_LENGTH, defaultHash, isHexDigestLike } from './hash.js';
-export { OpenCodeObserver, isDisabledByEnvironment } from './observer.js';
+export {
+  OpenCodeObserver,
+  isDisabledByEnvironment,
+  normalizeProjectDirectory,
+} from './observer.js';
 export {
   DrTokenOpenCodeObserver,
   createOpenCodeObserver,
@@ -42,6 +46,7 @@ export {
   asRuntimeEvent,
   createOpenCodeObserverPluginV2,
   createOpenCodeObserverV2,
+  readExpectedProject,
   toV1ToolAfter,
   toV1ToolBefore,
 } from './plugin-v2.js';
@@ -51,6 +56,8 @@ export {
   OBSERVER_V2_PLUGIN_ID,
   OPENCODE_V2_PLUGIN_PACKAGE,
   OPENCODE_V2_PLUGIN_VERIFIED_VERSION,
+  OPENCODE_V2_SCHEMA_PACKAGE,
+  OPENCODE_V2_SCHEMA_VERIFIED_VERSION,
   defineOpenCodeV2Plugin,
 } from './types-v2.js';
 export type {
@@ -58,9 +65,15 @@ export type {
   OpenCodeV2Cleanup,
   OpenCodeV2Event,
   OpenCodeV2EventDomain,
+  OpenCodeV2LocationInfo,
+  OpenCodeV2LocationRef,
   OpenCodeV2Plugin,
   OpenCodeV2PluginContext,
+  OpenCodeV2ProjectInfo,
   OpenCodeV2Registration,
+  OpenCodeV2SessionCreatedData,
+  OpenCodeV2SessionDeletedData,
+  OpenCodeV2SessionMovedData,
   OpenCodeV2ToolDomain,
   OpenCodeV2ToolExecuteAfterEvent,
   OpenCodeV2ToolExecuteAfterFields,
@@ -135,6 +148,7 @@ export type {
   ObserverDiagnostic,
   ObserverPluginApiIdentity,
   ObserverDiagnosticCode,
+  ObserverExpectedProject,
   ObserverOptions,
   ObserverSnapshot,
   OpenCodeEventHookInput,
@@ -148,11 +162,14 @@ export type {
   OpenCodeToolExecuteAfterOutput,
   OpenCodeToolExecuteBeforeInput,
   OpenCodeToolExecuteBeforeOutput,
+  ProjectAttributionBasis,
+  ProjectScopeVerification,
   ReadObservationSummary,
   SessionLifecycleSummary,
   SessionObservationCounts,
   SessionObservationMeasurements,
   SessionObservationSummary,
+  SessionProjectScope,
   SourceReportedUsageSummary,
   ToolFrequencyEntry,
   UsageAggregationSemantics,
