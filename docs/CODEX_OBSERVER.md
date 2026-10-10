@@ -364,16 +364,19 @@ one-way digests for path-like fields — never prompts, file contents or tool re
 and `SessionStart`/`UserPromptSubmit`/`SessionEnd` were delivered and observed — but the turn failed at
 the account's usage limit before the model ran, so steps 2's tool assertions, 3 and 5 stayed blocked
 ([details](CODEX_VALIDATION.md)). Re-running step 2 after quota returns is the only remaining work and
-needs no code change. Everything below uses your Codex account and issues a real model request, so it
-is scoped so it cannot touch your Desktop configuration:
+needs no code change — the exact command sequence (including the archive-not-delete step that preserves
+the Stage 1M evidence, the planted privacy canary and the mechanical evidence check) is
+[CODEX_VALIDATION.md](CODEX_VALIDATION.md) §13.4. Everything below uses your Codex account and issues a
+real model request, so it is scoped so it cannot touch your Desktop configuration:
 
 1. **Preconditions.** A disposable `CODEX_HOME` (§10), a scratch project, the example hooks merged
    there, and the hooks trusted through Codex's own review (`/hooks` in that home's TUI). No
    `--dangerously-bypass-hook-trust`.
 2. **One small turn.** Start the CLI against the scratch project with `CODEX_HOME` pointed at the
-   disposable home, and ask for one trivial action that triggers a shell read (for example, "read
-   README.md"). Record: which hooks fired, their input fields, whether `transcript_path` was
-   populated, and how long each hook took.
+   disposable home, and ask for one trivial action that triggers a shell read **twice** (for example
+   "read notes.md twice with `cat notes.md`"; `type`, `head`, `tail` and `Get-Content` are recognized
+   too). Record: which hooks fired, their input fields, whether `transcript_path` was populated, and how
+   long each hook took.
 3. **Observation assertions.** The summary must show `sessionStarts: 1`, at least one
    `toolStartsObserved`/`toolCompletionsObserved`, a `correlatedCompletions` count matching, and (for
    two reads of the same file) `repeatedRequests: 1`. A read the adapter refuses appears as

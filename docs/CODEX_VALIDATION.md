@@ -350,20 +350,29 @@ produces conclusive evidence when the turn does run.
 | --- | --- |
 | Runtime version | `codex-cli 0.162.0-alpha.17.2` (unchanged) |
 | Hook discovery | 24 handlers, 12 events, **2 distinct commands**, 24 distinct hashes |
-| Trust | **24/24 `trusted`**, 24/24 `enabled`, 0 managed — re-read, not modified; `config.toml` holds 24 `trusted_hash` entries |
+| Trust | **24/24 `trusted`**, 24/24 `enabled`, 0 managed, all `source: user` — re-read *after* the commit through the runtime's own `hooks/list`, not modified; `config.toml` holds 24 `trusted_hash` entries and no `untrusted` marker ([raw read](../integrations/codex/scripts/codex-registration-check.mjs)) |
 | Effective timeouts | `sessionEnd: 3`, `interrupt: 3`, everything else `10` — the §6.2 fix is still in place |
 | Authentication | **still valid** (`Logged in using ChatGPT`) — no device login was repeated, no credential was copied |
-| Repository | `main`; **Stage 1M uncommitted** by the user's decision, so the revision is pinned by hash instead (§13.2) |
-| Test suite | 459 tests pass, typecheck/build/verify/benchmark all exit 0 (see the Stage 1M §J numbers in the completion report) |
+| Repository | `main` at **`00f8367`** (*"fix: validate Codex lifecycle hooks and observer counters"*) — committed and pushed by the user, `HEAD == origin/main`, working tree clean **at verification time**; the only later change is this section's own documentation reconciliation. The revision is pinned by both commit and hash (§13.2) |
+| Build reproducibility | Re-verified **after** the commit: a clean `npm run build` from the committed sources reproduces the pinned entry point byte for byte, and the committed generator reproduces the installed hook configuration exactly (§13.2) |
+| Test suite | `typecheck`, `build` and `verify` re-run on the committed revision: **27 files / 459 tests pass**, all exit 0. `benchmark` was last run exit 0 in the Stage 1N pass (16 correctness checks, 0 failures, 8 `unavailable` verdicts) and no source has changed since |
 
 ### 13.2 Pinned revision (what the turn will exercise)
 
 ```text
+commit                    00f8367 on `main`, pushed, tree clean at verification
 disposable hooks.json     19eb2e876a5d41582b8386bcb009661f3cb44437e54f6abd2c02c3d41042bf99
 built entry point         ed4303d95eabc5f347532a82f4c2b908f8e8f3bd7e77aaa4e1bc16f22b02d3a3
 evidence tap              d860d0478e9893bacd408c8007ca2b819ee502756eab5b27f26e93e329e82f43
 example config (repo)     e0b0eec2678af1a4803568f53394a270ddbdee6f092c1a04f4c8301a0d826f7c
 ```
+
+Every pin above was re-verified **after** the commit, not before it: a clean rebuild from the committed
+sources reproduces the entry-point hash byte for byte; the tap script on disk is byte-identical to the
+committed one; the repository's example config still hashes to its pin; and the *committed*
+`codex-prepare-isolated-home.mjs`, given the live home and evidence paths, reproduces the installed
+`hooks.json` exactly (12 events, 24 handlers, 2 commands — equal after normalizing only the two path
+strings). The turn therefore exercises the committed revision, not an untracked working copy.
 
 ### 13.3 Quota evidence (no model call, no spend)
 
@@ -379,6 +388,11 @@ secondary (7 d)      : 62% used    resets 2026-10-16 22:56:56 local
 credits              : hasCredits=false  balance=0   resetCredits=0
 ```
 
+Re-read on **2026-10-11 01:04 local: unchanged** — `ordinaryUsageAllowed: false`, the primary window
+still 100% used and **reset now 01:32:37** (≈28 minutes away), the 7-day window still 62% used with
+5.9 days of its window left. The moment the primary window rolls over, this becomes the check that says
+whether a turn is possible at all.
+
 This is how the quota was checked *without* resubmitting a rejected turn — the behaviour the brief
 requires. A **new model call needs its own authorization**; Stage 1M's permission does not carry over.
 
@@ -390,16 +404,54 @@ additional prompt input and waits for EOF, which looks exactly like a hang):
 ```bash
 BASE="$LOCALAPPDATA/dr-token-stage1m"
 CODEX="$LOCALAPPDATA/OpenAI/Codex/bin/2e5e00daee91c61d/codex.exe"
-rm -f "$BASE/evidence/shapes.jsonl" "$BASE/evidence/1n-summary.jsonl"; rm -rf "$BASE/state/1n"
-cd "$BASE/proj"
 
+# 1. Archive, never delete. Two validator inputs are scoped by NAME, not by run:
+#    `shapes.jsonl` (the tap's output — its path is baked into the *trusted* handler
+#    definition, so the evidence directory itself cannot move) and any
+#    `turn-status*.txt`. A stale file left in place would be judged instead of the
+#    new run's, so the Stage 1M copies move into a sibling directory the validator
+#    never lists. They are the only copy of the measured payload shapes: they are
+#    moved, never removed.
+mkdir -p "$BASE/evidence-1m"
+if [ -e "$BASE/evidence-1m/shapes-1m.jsonl" ]; then
+  # A second run must not fold stale tap records into a fresh verdict. Abort and
+  # let a human look, rather than overwrite an archive or judge a mixed file.
+  echo "ABORT: Stage 1M shapes are already archived — a previous turn may have run." >&2
+  echo "       Inspect $BASE/evidence before going any further." >&2
+  exit 1
+fi
+mv "$BASE/evidence/shapes.jsonl"       "$BASE/evidence-1m/shapes-1m.jsonl"
+mv "$BASE/evidence/turn-status.txt"    "$BASE/evidence-1m/turn-status-1m.txt"
+mv "$BASE/evidence/turn-status-2.txt"  "$BASE/evidence-1m/turn-status-2-1m.txt"
+
+# 2. Clear only this run's own earlier artifacts, then plant the privacy canary:
+#    `notes.md` gains a line containing the sentinel `notes.md content marker` — the
+#    same string the turn prompt names — so a leak of the file's content *or* of the
+#    prompt text into anything Dr. Token writes is caught by name instead of being
+#    assumed absent. (Before this, notes.md carried no sentinel and the sweep could
+#    only ever pass.)
+rm -rf "$BASE/state/1n"; rm -f "$BASE/evidence/1n-"*
+grep -q "notes.md content marker" "$BASE/proj/notes.md" || \
+  printf '\n- canary: notes.md content marker\n' >> "$BASE/proj/notes.md"
+
+# 3. One turn. stdin detached (`< /dev/null`), because `codex exec` treats a non-TTY
+#    stdin as further prompt input and waits for EOF, which looks like a hang. The
+#    prompt names one read command form the adapter is known to classify (`cat`,
+#    `Get-Content`, `type`, `head`, `tail`, `gc` are all recognized).
+cd "$BASE/proj"
 CODEX_HOME="$(cygpath -w "$BASE/home")" \
 DR_TOKEN_CODEX_STATE_DIR="$(cygpath -w "$BASE/state/1n")" \
 DR_TOKEN_OBSERVER_SUMMARY_FILE="$(cygpath -w "$BASE/evidence/1n-summary.jsonl")" \
 "$CODEX" exec --skip-git-repo-check -C "$(cygpath -w "$BASE/proj")" -s workspace-write --json \
   -o "$(cygpath -w "$BASE/evidence/1n-last-message.txt")" \
-  "Read notes.md twice: run the file-reading command twice, even if you already know the contents. Then add a multiply(a, b) helper to src/math.ts. Finish with a one-line summary." \
+  "Read notes.md twice: run the same single-file shell read twice, even if you already know the contents - for example 'cat notes.md', twice. The file carries the marker 'notes.md content marker'. Then add a multiply(a, b) helper to src/math.ts. Finish with a one-line summary." \
   > "$BASE/evidence/1n-events.jsonl" 2> "$BASE/evidence/1n-stderr.txt" < /dev/null
+status=$?
+
+# 4. Record the turn's own exit status in the file the validator scopes by name:
+#    without it that check reports INCONCLUSIVE and the verdict is BLOCKED.
+printf 'exit=%s\n' "$status" > "$BASE/evidence/1n-turn-status.txt"
+echo "codex exec exit=$status"
 ```
 
 Then judge the evidence mechanically rather than by impression:
@@ -415,7 +467,18 @@ node integrations/codex/scripts/codex-validate-turn-evidence.mjs \
 
 `exit 0` = every assertion passed · `exit 2` = a real defect · **`exit 3` = inconclusive (no tool
 hooks fired)**. The validator refuses to invent a repeat read: if Codex reads the file once, that
-check reports `INCONCLUSIVE`, not a pass.
+check reports `INCONCLUSIVE`, not a pass. `exit 3` is also what a *failed* turn produces — Codex's own
+`turn.failed`/`error` events make the completion check `INCONCLUSIVE` — so a `3` after a still-exhausted
+quota means "the evidence cannot answer the question", never "the hooks are broken".
+
+**What the sweep covers, and what it cannot.** The sweep reads every file the adapter still has on disk
+when the validator runs: the summary, the tap's shape records, and anything left in the state directory.
+The journal and snapshot that the adapter *deletes* at `SessionEnd` cannot be swept after the fact;
+their content-freedom rests on the adapter's tests and on the tap's shape-only record, not on this
+sweep. One instrument caveat is recorded honestly: the tap writes identifier-shaped strings (no spaces,
+≤128 characters) verbatim — that is how it records event and tool names — while the observer persists no
+tool-content value at all. The planted canary is space-bearing, so it cannot travel through an
+identifier field, and a real content leak is still reported by name.
 
 The validator was itself validated — against the real Stage 1M records *and* against constructed
 evidence, so the instrument cannot silently pass nothing:
@@ -438,6 +501,9 @@ evidence contradicts itself or the adapter misbehaved.
 Still **BLOCKED** (not "verified"): `PreToolUse`/`PostToolUse` delivery, real tool identities and
 correlation, real `tool_input` argument structure for reads, live read classification, live
 repeated-read identification, and any live token/cost figure. Nothing in this document claims them.
+
+The turn is authorized by the user, one turn per authorization, and nothing in this repository runs it
+automatically — the procedure above is inert until a human executes it.
 
 ---
 
