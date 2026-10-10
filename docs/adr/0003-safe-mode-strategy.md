@@ -1,10 +1,10 @@
 # ADR 0003 — Safe Mode strategy: exact duplicate tool-result elision with a presence proof
 
-- **Status:** Proposed (design accepted for implementation planning; nothing implemented or benchmarked)
+- **Status:** Proposed (design accepted for implementation planning; nothing implemented or benchmarked; its OpenCode dependency was **runtime-verified in Stage 1P** — see the implementation note)
 - **Date:** 2026-10-11
 - **Stage:** 1O (Safe Mode architecture, feasibility and benchmark design)
 - **Deciders:** Dr. Token maintainers
-- **Related:** [docs/SAFE_MODE_DESIGN.md](../SAFE_MODE_DESIGN.md) · [docs/adr/0001-opencode-integration.md](0001-opencode-integration.md) · [docs/adr/0002-codex-integration.md](0002-codex-integration.md) · [docs/BENCHMARKING.md](../BENCHMARKING.md) · [docs/CODEX_VALIDATION.md](../CODEX_VALIDATION.md) §14
+- **Related:** [docs/SAFE_MODE_DESIGN.md](../SAFE_MODE_DESIGN.md) · [docs/OPENCODE_REQUEST_HOOK_VALIDATION.md](../OPENCODE_REQUEST_HOOK_VALIDATION.md) · [docs/adr/0001-opencode-integration.md](0001-opencode-integration.md) · [docs/adr/0002-codex-integration.md](0002-codex-integration.md) · [docs/BENCHMARKING.md](../BENCHMARKING.md) · [docs/CODEX_VALIDATION.md](../CODEX_VALIDATION.md) §14
 
 ## Context
 
@@ -72,9 +72,10 @@ implement it on **OpenCode V2 only**.
 
 **Negative / costs**
 
-- **The strategy may not work at all**, because the hook it depends on
-  (`session.hook("context")`) is *contract-verified, not runtime-verified*. M1 and M2 exist to settle
-  that, and a negative result is a legitimate outcome of this ADR.
+- **The influence half is still unproven.** Stage 1P runtime-verified that the hook fires with the
+  complete request, so *observation* is settled; whether the runtime **honours a mutated request** is
+  not, and no token claim may rest on it until M2 proves it. A negative result there is a legitimate
+  outcome of this ADR.
 - Savings are bounded by the window in which two identical copies coexist in one request — compaction
   trimming one of them legitimately disables the elision. Expect modest, not dramatic, numbers.
 - The v1 allowlist is deliberately one tool (`read`), so coverage starts small.
@@ -117,7 +118,7 @@ implement it on **OpenCode V2 only**.
 
 ## Open questions
 
-- Is `session.hook("context")` honoured at runtime by OpenCode Desktop 2.0.24? (M1/M2 settle it.)
+- Would a mutated `SessionContext` be honoured by OpenCode Desktop 2.0.24? Delivery is proven; influence is not (M2's wire check).
 - Does the host's usage counter move when the request shrinks, or does cache accounting hide it?
 - How do two plugins that both rewrite `messages` interact?
 - What is the real-world duplicate-read rate that M1 will measure, and is it large enough to justify M3–M5?
@@ -127,3 +128,31 @@ implement it on **OpenCode V2 only**.
   comparable without weakening the existing guards?
 
 None of these may be answered by inference, and none of them may be answered by loosening a check.
+
+## Implementation note (Stage 1P)
+
+Stage 1P did **not** implement the decision; it verified the dependency it rests on, at zero cost:
+
+- A dedicated observation-only probe (`integrations/opencode/src/request-probe.ts`, not exported from
+  the package entry point) registered `ctx.session.hook("context")` and `ctx.session.hook("http.request")`
+  on the real runtime and observed **11 invocations**, each ~2 ms before the corresponding outbound
+  request, carrying the complete assembled request (4 system parts, the message list, 12 tool
+  definitions, the option map) — so the artifact this ADR's strategy needs genuinely exists at runtime.
+- The repeated callbacks were **retries with backoff**, not duplicate plugin delivery, and **two plugin
+  instances both received the same request** — the multi-plugin interaction this ADR lists as an open
+  question is therefore real rather than hypothetical.
+- **No provider was contacted and no credential was used**: the runs pointed a built-in provider at a
+  dead loopback endpoint, which is why the timing evidence is free.
+- The probe assigns nothing, returns nothing, leaks no content, is bounded and bypassable, and the host
+  behaved identically with it present, absent and disabled.
+
+- In one **authorized** live session (Free-tariff model, synthetic content), the assembled request was
+  observed to contain **two separate `tool-result` parts for `read` with byte-identical content in the
+  same request** — one duplicate group, one elidable later copy, 135 characters — which is exactly this
+  ADR's equivalence precondition (byte-identical content with the earlier copy still present), observed
+  on real traffic rather than argued from a declaration.
+
+**Not yet earned:** whether a **mutated** request would be honoured (M2), how often duplicates occur in
+real work (M1), and the compaction/title/generate request kinds. The full record, including two probe
+defects found by its own tests, is in
+[docs/OPENCODE_REQUEST_HOOK_VALIDATION.md](../OPENCODE_REQUEST_HOOK_VALIDATION.md).
