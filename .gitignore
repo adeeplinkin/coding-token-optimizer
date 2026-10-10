@@ -164,3 +164,6 @@ src-tauri/target/
 
 # Logs
 *.log
+
+# Freebuff isolated development worktrees
+.freebuff/worktrees/
