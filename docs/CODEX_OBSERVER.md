@@ -4,9 +4,13 @@
 **Status:** implemented and unit-tested; **observation only** — no optimization
 **Target contract:** OpenAI Codex lifecycle hooks, verified against `codex-cli`
 **0.162.0-alpha.17.2** (bundled by the Codex desktop app on the development machine)
-**Runtime validation:** hook **registration/discovery is runtime-verified** (the installed Codex
-enumerates all 12 hooks from Dr. Token's generated configuration — see §10); hook **execution, tool
-observation and token measurement are not verified**, because that needs a real Codex turn (see §11).
+**Runtime validation (Stage 1M):** hook **registration, trust and lifecycle delivery are
+runtime-verified** — Codex enumerated all 12 hooks, the user trusted all 24 handlers through Codex's
+own review, and `SessionStart`, `UserPromptSubmit` and `SessionEnd` then fired in a real session with
+their payload shapes captured. **Tool hooks (`PreToolUse`/`PostToolUse`), live read identification and
+token measurement are still unverified**: the one authorized turn failed at the account's usage limit
+before the model ran, so no tool executed. Full evidence, defects and reproduction:
+[docs/CODEX_VALIDATION.md](CODEX_VALIDATION.md).
 
 > Dr. Token must prove it can observe agent activity correctly before attempting to
 > optimize it. This stage does the proving for Codex; it does not optimize.
@@ -76,6 +80,11 @@ Every handler in the example uses `type: "command"` and the same read-only entry
 `commandWindows` provided for the Windows form. No handler sets `async`, because an observer that
 returns nothing has nothing to gain from racing the turn.
 
+**Timeouts are deliberately small.** Codex **clamps the `SessionEnd` and `Interrupt` hook timeouts to
+3 seconds** and emits a session diagnostic for every handler that asks for more (runtime-verified in
+Stage 1M — the noise appeared once per handler until this was fixed). The example therefore requests
+3 seconds on those two events and 10 elsewhere; no other event was clamped at 10. Do not raise them.
+
 ### 2.3 Environment switches
 
 | Variable | Effect |
@@ -96,6 +105,8 @@ against the hash of the exact hook definition. Dr. Token keeps that requirement 
 
 - the Stage 1L registration check confirmed Codex reports Dr. Token's hooks as
   `trustStatus: "untrusted"` and `enabled: true` — discovered, reviewed, not yet trusted;
+- in Stage 1M the user reviewed and trusted them through that flow, after which `hooks/list` reported
+  **all 24 handlers `trusted` and `enabled`**, and delivery was confirmed live (see §10);
 - trust is granted by you, through Codex's own flow (`/hooks` in the CLI, or your plugin installer);
 - **Dr. Token never uses `--dangerously-bypass-hook-trust`**, and the adapter never asks for it. That
   flag exists in Codex and is deliberately not part of any Dr. Token procedure or product path;
@@ -105,7 +116,10 @@ against the hash of the exact hook definition. Dr. Token keeps that requirement 
 
 The hash also means an upgrade that changes the hook definition invalidates the trust and Codex will
 ask for review again. That is intended: the adapter's *hook configuration* changes only when this
-document says so.
+document says so. (Observed in Stage 1M: correcting only the `SessionEnd`/`Interrupt` timeouts did
+**not** invalidate trust in `0.162.0-alpha.17.2`. Treat that as luck rather than a rule — re-check
+`hooks/list` after any edit, and never assume a trusted hook is still trusted because it looks the
+same.)
 
 ---
 
@@ -128,8 +142,17 @@ counters listed; **no payload content is ever stored**.
 | `SessionEnd` | count, then the session summary is written (if a sink is configured) and the session's state is released | `reason` beyond the documented constant |
 | any other event name | an `ignored` counter | the event name's text |
 
-Nothing the adapter records can be returned to Codex: the entry point's only output channel is stderr
-diagnostics under `DR_TOKEN_CODEX_DEBUG`.
+Nothing the adapter records can be returned to Codex: the entry point's only output channel is stderr  diagnostics under `DR_TOKEN_CODEX_DEBUG`. The live run confirmed this on the host side: no hook
+produced any message in the session event stream (see §7).
+
+**Runtime-verified delivery (Stage 1M).** In a real session, `SessionStart`, `UserPromptSubmit` and
+`SessionEnd` reached the adapter. The measured payloads were a **flat** JSON object with a
+**PascalCase** `hook_event_name` (Codex's `hooks/list` reports event names in camelCase), a UUID
+`session_id`, a `turn_id` on turn-scoped events, a populated `transcript_path`, `cwd`, `model`,
+`permission_mode`, and the documented `source`/`reason` enums — all fields the adapter already
+handled. `SessionEnd` also arrives when a turn **fails**, and several handlers on one event all run.
+`PreToolUse`/`PostToolUse` were not exercised because no tool ran; see
+[docs/CODEX_VALIDATION.md](CODEX_VALIDATION.md) §8.
 
 ---
 
@@ -179,9 +202,13 @@ one that does not.
 
 **Why this is strict rather than clever.** A wrong identity produces a *false* repeated-read
 observation, which is worse than a missing one. Every refusal is visible in the summary as
-`unidentifiedRequests` plus a note, so a reader can see how much the adapter declined to guess. Which
-read tools a given session actually calls, and whether any reports ranges, is **not runtime-verified**
-until a real turn is observed (§10–§11).
+`unidentifiedRequests` plus a note, so a reader can see how much the adapter declined to guess.
+
+**Live status (Stage 1M): no real repeated-read result exists yet.** No tool was called in the one
+authorized turn, so the classifier has never seen a real Codex read; the counts above come from tests
+that drive the real entry point with documented payloads. Which read tools a given session actually
+calls, and whether any reports ranges, is therefore still **unverified** (§10–§11,
+[validation report](CODEX_VALIDATION.md) §8).
 
 ---
 
@@ -247,7 +274,8 @@ in-memory only (stderr under debug) and are not persisted.
 ## 9. Usage data
 
 **Codex hook payloads carry no token or cost values.** No documented hook field reports input, output,
-cache or cost figures, and Stage 1L's registration check did not change that. The adapter therefore
+cache or cost figures, Stage 1L's registration check did not change that, and the payloads measured in
+Stage 1M (`SessionStart`, `UserPromptSubmit`, `SessionEnd`) contained no usage field of any kind. The adapter therefore
 reports every usage measurement as `unavailable`, with a note naming the verified sources a future
 measurement path could use:
 
@@ -275,8 +303,13 @@ The verification ladder, with each rung's evidence kept separate:
 | **Contract** | ✅ Contract- and runtime-confirmed | Documented hook events/fields quoted in `src/types.ts`; Stage 1K enumerated 174 protocol methods and generated the version-exact schema |
 | **Binary/module loading** | ✅ Runtime-verified | `node dist/entry.js` runs under the installed Node; the entry point imports without side effects |
 | **Hook registration/discovery** | ✅ **Runtime-verified (Stage 1L)** | In an isolated `CODEX_HOME`, the installed `codex-cli 0.162.0-alpha.17.2` returned all **12 hooks** from `hooks/list`: `handlerType: command`, `enabled: true`, `isManaged: false`, `source: user`, `trustStatus: untrusted`, each command resolving to `dist/entry.js` |
-| **Hook execution** | ❌ Not verified | Requires a real turn (`turn/start` or the desktop app); no model call was authorized |
-| **Tool observation** | ❌ Not verified | Follows from hook execution; the parser/accumulator behaviour is unit-tested against documented payloads |
+| **Hook trust review** | ✅ **Runtime-verified (Stage 1M)** | The user trusted all 24 handlers via Codex's `/hooks`; `hooks/list` then reported `trustStatus: trusted` for every one, and stayed `trusted` after the timeout correction |
+| **Hook execution — lifecycle** | ✅ **Runtime-verified (Stage 1M)** | `SessionStart`, `UserPromptSubmit` and `SessionEnd` fired in a real `codex exec` session; payload shapes captured; summary reported `hookEventsObserved: 3` = `journal.records: 3` |
+| **Session cleanup and release** | ✅ **Runtime-verified (Stage 1M)** | After the live session's `SessionEnd`, the isolated state directory contained no session files — the summary had been written and the state released |
+| **Privacy of everything written** | ✅ **Runtime-verified (Stage 1M)** | Every file the live run wrote was swept: no prompt, file content, tool response, absolute path or credential — path-like fields are digests |
+| **Fail-open containment during a failed turn** | ✅ **Runtime-verified (Stage 1M)** | The turn failed (account usage limit) and every hook still exited 0, wrote nothing to stdout, and left a valid summary |
+| **Hook execution — tool events** | 🚫 **Blocked** | The authorized turn failed at the account usage limit *before* the model ran, so no tool executed and `PreToolUse`/`PostToolUse` never fired. Repeatable once quota returns (see [validation report](CODEX_VALIDATION.md) §8–§9) |
+| **Tool observation on the live path** | 🚫 **Blocked** | Same cause; the parser/accumulator/classifier behaviour is automated-tested by driving the real entry point with documented payloads |
 | **Token measurement** | ❌ Not implemented | No hook carries usage (§9) |
 
 Reproduce the registration check (no model call, isolated home, nothing written outside it):
@@ -297,14 +330,42 @@ node integrations/codex/scripts/codex-registration-check.mjs
 
 The script performs the documented `initialize`/`initialized` handshake and calls `hooks/list`; **it
 sends no `turn/start`**, so it makes no model request and spends nothing. A `discoveredHookCount` of 12
-with `trustStatus: untrusted` means Codex found the hooks and is waiting for your trust review.
+with `trustStatus: untrusted` means Codex found the hooks and is waiting for your trust review; all
+`trusted` means delivery can be tested. The report also carries each handler's effective `timeoutSec`,
+so a clamped configuration is visible without starting a session.
+
+Two further no-model-call tools were added in Stage 1M (both are validation aids, not part of the
+product install):
+
+```bash
+# Generate a disposable CODEX_HOME config with the observer plus a shape-only evidence tap
+node integrations/codex/scripts/codex-prepare-isolated-home.mjs \
+  --package "$(cygpath -w "$(pwd)/integrations/codex")" \
+  --home "$(cygpath -w "$TEMP/dr-token-codex-check/home")" \
+  --evidence "$(cygpath -w "$TEMP/dr-token-codex-check/evidence")"
+
+# Replay a documented session through the REAL entry point, one process per event
+node integrations/codex/scripts/codex-simulate-hook-session.mjs \
+  --package "$(cygpath -w "$(pwd)/integrations/codex")" \
+  --state "$(cygpath -w "$TEMP/dr-token-codex-check/state")" \
+  --summary "$(cygpath -w "$TEMP/dr-token-codex-check/summary.jsonl")" \
+  --project "$(cygpath -w "$TEMP/dr-token-codex-check/proj")"
+```
+
+The tap (`codex-evidence-tap.mjs`) records only payload *shapes* — keys, JSON types, lengths and
+one-way digests for path-like fields — never prompts, file contents or tool responses. It is an extra
+`command` handler that can simply be omitted from a real installation.
 
 ---
 
 ## 11. Live validation procedure (authorized turn)
 
-Everything below is **pending explicit authorization**, because it uses your Codex account and issues a
-real model request. It is scoped so it cannot touch your Desktop configuration:
+**Stage 1M executed steps 1, 2 and 4 partially**: the hooks were trusted, one authorized turn was run,
+and `SessionStart`/`UserPromptSubmit`/`SessionEnd` were delivered and observed — but the turn failed at
+the account's usage limit before the model ran, so steps 2's tool assertions, 3 and 5 stayed blocked
+([details](CODEX_VALIDATION.md)). Re-running step 2 after quota returns is the only remaining work and
+needs no code change. Everything below uses your Codex account and issues a real model request, so it
+is scoped so it cannot touch your Desktop configuration:
 
 1. **Preconditions.** A disposable `CODEX_HOME` (§10), a scratch project, the example hooks merged
    there, and the hooks trusted through Codex's own review (`/hooks` in that home's TUI). No
@@ -346,12 +407,31 @@ Observation can be stopped three ways, in increasing thoroughness:
 Dr. Token never modified your `%USERPROFILE%\.codex` — not `config.toml`, not `hooks.json`, not the
 `notify` program, not your plugins — so removal is limited to what you added by hand.
 
+**Logging out of a disposable environment.** If you installed the hooks into a throwaway
+`CODEX_HOME` (the way the validation does), that home holds its own `auth.json`, its own trust records
+in `config.toml`, and its own observation state. To retire it: log out of *that* home only
+(`CODEX_HOME="<home>" codex logout`), then delete the home and the state directory (and the summary
+file, if you configured one). Your real Codex home and login are never involved. Full step list:
+[docs/CODEX_VALIDATION.md](CODEX_VALIDATION.md) §14.
+
+**Judging a real run's evidence.**
+[`integrations/codex/scripts/codex-validate-turn-evidence.mjs`](../integrations/codex/scripts/codex-validate-turn-evidence.mjs)
+turns one turn's evidence into assertions: tool-hook delivery, tool identity correlation, the
+repeated-read arithmetic invariant (`repeatedRequests === identifiedRequests - distinctTargets`, so a
+fabricated repeat fails), state release, content privacy, absence of hook configuration diagnostics and
+absence of any hook output reaching Codex. It exits `0` when everything holds, `2` on a real defect,
+and **`3` when tool hooks did not fire — inconclusive, never a pass.**
+
 ---
 
 ## 13. Limitations and open questions
 
-1. **Hook execution is unverified.** Registration is proven; firing during a turn is not. Until §11 is
-   run, every delivery-dependent claim stays open.
+1. **Tool hooks are unverified.** Lifecycle delivery is proven (`SessionStart`, `UserPromptSubmit`,
+   `SessionEnd`), but `PreToolUse`/`PostToolUse` never fired in the one authorized turn because the
+   account's usage limit stopped the model before it could use a tool. Live tool payloads, live read
+   identification and live repeated-read attribution therefore stay open — and the adapter's
+   conservative classifier is *expected* to report `unidentifiedRequests > 0` once they can be
+   measured.
 2. **The desktop app is unproven.** Recent Codex documentation supports plugin-bundled hooks for
    manually installed desktop plugins; whether the app executes *user-level* hooks in the runtime it
    owns is unverified. Dr. Token's desktop story rests on this.
@@ -382,10 +462,12 @@ Dr. Token never modified your `%USERPROFILE%\.codex` — not `config.toml`, not 
 | --- | --- | --- |
 | Lifecycle hook discovery (12 events) | **Runtime-verified** | `hooks/list` in an isolated home, installed `0.162.0-alpha.17.2` |
 | Hook command handlers (`command`, `commandWindows`) | Runtime-verified (discovery) / Contract-confirmed (execution) | Separator- and form-level details confirmed by the discovered definition |
-| Hook trust requirement | **Runtime-verified** | Reported `trustStatus: untrusted` until reviewed |
-| Hook stdin payload fields | Contract-confirmed | Documented fields quoted and vendored in `tests/fixtures` |
-| Hook output influence channels | Contract-confirmed, **deliberately unused** | The adapter writes no stdout and no `decision`/`updatedInput`/`additionalContext` |
-| Tool start/completion observation | Contract-confirmed; **unit-tested** against documented payloads; delivery unverified | — |
+| Hook trust requirement | **Runtime-verified** | `untrusted` until the user reviewed the hooks; `trusted` for all 24 handlers afterwards |
+| Lifecycle hook delivery (`SessionStart`, `UserPromptSubmit`, `SessionEnd`) | **Runtime-verified (Stage 1M)** | Fired in a real session; payload shapes and enums captured |
+| `SessionEnd`/`Interrupt` timeout ceiling (3 s, reported as a diagnostic) | **Runtime-verified (Stage 1M)** | The diagnostic appeared once per handler before the fix and disappeared afterwards, in otherwise identical sessions |
+| Hook stdin payload fields | **Runtime-verified for the three delivered events**; contract-confirmed for the rest | Flat envelope, PascalCase event name, UUID session id, populated `transcript_path` |
+| Hook output influence channels | Contract-confirmed, **deliberately unused** | The adapter writes no stdout and no `decision`/`updatedInput`/`additionalContext`; no hook output appeared in the session stream |
+| Tool start/completion observation | **Blocked** (usage limit) | Contract-confirmed and automated-tested against documented payloads; delivery not yet observed |
 | Repeated-read detection | Unit-tested | Conservative identity; refusals counted |
 | Cross-process persistence | **Unit-tested**, including 12-way concurrent hook processes | Journal + snapshot + sweep |
 | Token/cost observation | **Unsupported** | No hook carries usage; nothing is derived |

@@ -365,6 +365,11 @@ export interface ToolFrequencyEntry {
 
 /** Per-session event counters. */
 export interface CodexSessionCounts {
+  /**
+   * Every hook event folded for this session — including events that were only
+   * counted as ignored or unusable. It always equals the number of journal
+   * records folded, so it can be checked against `journal.records`.
+   */
   readonly hookEventsObserved: number;
   readonly hookEventsIgnored: number;
   readonly unusablePayloads: number;

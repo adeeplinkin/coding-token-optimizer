@@ -82,11 +82,19 @@ const report = {
     eventName: hook.eventName,
     handlerType: hook.handlerType,
     command: hook.command,
+    // The effective timeout Codex will apply to this handler. Stage 1M found that
+    // Codex clamps `SessionEnd` and `Interrupt` to 3 seconds and reports a
+    // diagnostic for handlers that ask for more, so this field is evidence about
+    // the shipped configuration rather than a detail.
+    timeoutSec: hook.timeoutSec ?? hook.timeout ?? null,
+    statusMessage: hook.statusMessage ?? null,
     enabled: hook.enabled,
     trustStatus: hook.trustStatus,
     isManaged: hook.isManaged,
     source: hook.source,
+    sourcePath: hook.sourcePath ?? null,
     matcher: hook.matcher,
+    currentHash: hook.currentHash ?? null,
   })),
   otherMessages: received
     .filter((message) => message.id === undefined && !message.raw && !message.stderr)

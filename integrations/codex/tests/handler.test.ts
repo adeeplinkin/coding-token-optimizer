@@ -112,6 +112,29 @@ describe('disabled mode', () => {
   });
 });
 
+describe('event accounting', () => {
+  it('counts every folded hook event, including ignored and unusable ones', async () => {
+    const harness = await createHarness();
+    await harness.send(documentedSessionStart());
+    // A recognized-but-unimplemented event is still an observed event.
+    await harness.send({ hook_event_name: 'SomeFutureEvent', session_id: 'thr_123' });
+
+    const summary = await harness.endSession();
+    expect(summary.counts.hookEventsObserved).toBe(3);
+    expect(summary.counts.hookEventsIgnored).toBe(1);
+    // The counter must agree with the journal it was folded from.
+    expect(summary.journal.records).toBe(summary.counts.hookEventsObserved);
+
+    // A payload with no usable event name carries no session id either, so it is
+    // recorded as unusable under the unattributed session — and still counted.
+    await harness.send('not a hook payload');
+    const unattributed = await harness.endUnattributed();
+    expect(unattributed.counts.unusablePayloads).toBe(1);
+    expect(unattributed.counts.hookEventsObserved).toBe(2);
+    expect(unattributed.sessionIdentity).toBe('unknown');
+  });
+});
+
 describe('tool observation', () => {
   it('counts a correlated tool call and reports it in the summary', async () => {
     const harness = await createHarness();

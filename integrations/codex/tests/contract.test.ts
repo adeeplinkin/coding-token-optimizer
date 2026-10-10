@@ -113,6 +113,29 @@ describe('records cannot influence Codex', () => {
     }
   });
 
+  it('asks for hook timeouts Codex does not have to clamp', async () => {
+    const example = JSON.parse(
+      await readFile(path.join(PACKAGE_ROOT, 'codex-hooks.example.json'), 'utf8'),
+    ) as { hooks: Record<string, { hooks: { timeout?: number }[] }[]> };
+
+    // Runtime-verified in Stage 1M: Codex clamps the `SessionEnd` and `Interrupt`
+    // hook timeouts to 3 seconds and reports a diagnostic in the session for every
+    // handler that asks for more (observed live, one message per handler). The
+    // shipped configuration therefore asks for exactly 3 on those two events. The
+    // 10-second ceiling elsewhere is Dr. Token's own conservative bound, not a
+    // Codex limit: no other event was clamped at 10.
+    for (const [event, groups] of Object.entries(example.hooks)) {
+      const ceiling = event === 'SessionEnd' || event === 'Interrupt' ? 3 : 10;
+      for (const group of groups) {
+        for (const handler of group.hooks) {
+          expect(typeof handler.timeout, `${event} handler timeout`).toBe('number');
+          expect(handler.timeout, `${event} handler timeout`).toBeGreaterThan(0);
+          expect(handler.timeout, `${event} handler timeout`).toBeLessThanOrEqual(ceiling);
+        }
+      }
+    }
+  });
+
   it('ships an example configuration that only observes', async () => {
     const example = JSON.parse(
       await readFile(path.join(PACKAGE_ROOT, 'codex-hooks.example.json'), 'utf8'),

@@ -194,6 +194,13 @@ describe('state persists across hook processes', () => {
     expect(counts['permissionRequests']).toBe(1);
     expect(counts['sessionStarts']).toBe(1);
     expect(counts['sessionEnds']).toBe(1);
+    // Seven delivered steps plus the SessionEnd: every one of them is counted,
+    // and the total must agree with the journal the summary was folded from.
+    expect(counts['hookEventsObserved']).toBe(8);
+    expect(counts['unusablePayloads']).toBe(0);
+    expect((summary['journal'] as Record<string, number>)['records']).toBe(
+      counts['hookEventsObserved'],
+    );
 
     const reads = summary['reads'] as Record<string, number | string>;
     expect(reads['identifiedRequests']).toBe(2);

@@ -1,5 +1,5 @@
 {
-  "description": "Dr. Token Codex observer — observation only. Replace <DR-TOKEN-PACKAGE> with the absolute path of this package (for example C:\\\\path\\\\to\\\\dr-token\\\\integrations\\\\codex), then merge these entries into ~/.codex/hooks.json or into a plugin's hooks/hooks.json. Non-managed hooks must be reviewed and trusted in Codex (/hooks) before they run. Dr. Token never writes this file or your Codex configuration for you; removing these entries — or setting DR_TOKEN_CODEX_OBSERVER=off — disables observation. Every handler type is `command`, every command is the same read-only entry point, and no handler returns a decision, permission decision, updated input, additional context or continuation, so this configuration cannot change what Codex does.",
+  "description": "Dr. Token Codex observer — observation only. Replace <DR-TOKEN-PACKAGE> with the absolute path of this package (for example C:\\\\path\\\\to\\\\dr-token\\\\integrations\\\\codex), then merge these entries into ~/.codex/hooks.json or into a plugin's hooks/hooks.json. Non-managed hooks must be reviewed and trusted in Codex (/hooks) before they run. Dr. Token never writes this file or your Codex configuration for you; removing these entries — or setting DR_TOKEN_CODEX_OBSERVER=off — disables observation. Every handler type is `command`, every command is the same read-only entry point, and no handler returns a decision, permission decision, updated input, additional context or continuation, so this configuration cannot change what Codex does. The `timeout` values are deliberately small: Codex clamps the `SessionEnd` and `Interrupt` timeouts to 3 seconds (runtime-verified in Stage 1M) and reports a diagnostic for every handler that asks for more, so those two events use 3 and the rest use 10.",
   "hooks": {
     "SessionStart": [
       {
@@ -129,7 +129,7 @@
             "type": "command",
             "command": "node \"<DR-TOKEN-PACKAGE>/dist/entry.js\"",
             "commandWindows": "node \"<DR-TOKEN-PACKAGE>\\dist\\entry.js\"",
-            "timeout": 5
+            "timeout": 3
           }
         ]
       }
@@ -141,7 +141,7 @@
             "type": "command",
             "command": "node \"<DR-TOKEN-PACKAGE>/dist/entry.js\"",
             "commandWindows": "node \"<DR-TOKEN-PACKAGE>\\dist\\entry.js\"",
-            "timeout": 10
+            "timeout": 3
           }
         ]
       }

@@ -661,3 +661,21 @@ any of them reports read ranges.
 authorization — one small turn in a disposable home, plus fail-open injection — rather than any
 optimization work. Details, installation, removal and the exact procedure:
 [docs/CODEX_OBSERVER.md](CODEX_OBSERVER.md).
+
+---
+
+## 16. Stage 1M update — lifecycle hook delivery is now runtime-verified
+
+Stage 1M ran one authorized `codex exec` session against a disposable `CODEX_HOME` with the observer's
+hooks trusted through Codex's own review. Results, in one paragraph: **`SessionStart`,
+`UserPromptSubmit` and `SessionEnd` fired for real** and were observed, with their true payload shapes
+captured (flat envelope; PascalCase `hook_event_name`; UUID `session_id`; `turn_id` on turn-scoped
+events; populated `transcript_path`; `source`/`reason` enums), `SessionEnd` released the session's
+state, and the summary's `hookEventsObserved` matched `journal.records` exactly. **`PreToolUse` and
+`PostToolUse` were not exercised**: the turn failed at the account's usage limit before the model ran,
+so no tool executed — the same reason no live token or cost figure exists. Two real defects surfaced
+and were fixed: a counter (`hookEventsObserved`) that was always reported as zero, and shipped hook
+timeouts that made Codex emit a clamping diagnostic for `SessionEnd` and `Interrupt` in every session
+(Codex clamps those two events to 3 seconds). The transformation claims in §14 remain untouched and
+still pending a successful tool-running turn. Full evidence, classification and reproduction:
+[docs/CODEX_VALIDATION.md](CODEX_VALIDATION.md).

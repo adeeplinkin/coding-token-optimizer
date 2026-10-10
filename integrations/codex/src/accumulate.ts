@@ -263,6 +263,11 @@ export function applyRecord(
 ): readonly ObserverDiagnosticCode[] {
   const diagnostics: ObserverDiagnosticCode[] = [];
   accumulator.records += 1;
+  // Every folded record *is* one hook event this adapter observed, including the
+  // ones it could only classify as ignored or unusable. Counting here (rather
+  // than per event kind) is what keeps `hookEventsObserved` from silently
+  // reporting zero while `journal.records` reports the truth.
+  accumulator.counts.hookEventsObserved += 1;
   measureTimestamps(accumulator, record.at);
 
   if (typeof record.sessionId === 'string' && accumulator.sessionId === undefined) {
