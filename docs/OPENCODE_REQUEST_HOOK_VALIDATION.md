@@ -12,6 +12,7 @@ free-model session**.
 **Probe:** `integrations/opencode/src/request-probe.ts` (observation only, not exported from the package
 entry point). **Tests:** `integrations/opencode/tests/request-probe.test.ts` (29 tests).
 **Related:** [docs/SAFE_MODE_DESIGN.md](SAFE_MODE_DESIGN.md) ·
+[docs/SAFE_MODE_M1_OBSERVATION.md](SAFE_MODE_M1_OBSERVATION.md) (Stage 1Q: the M1 opportunity analyzer built on this hook) ·
 [docs/adr/0003-safe-mode-strategy.md](adr/0003-safe-mode-strategy.md) ·
 [docs/OPENCODE_DESKTOP_VALIDATION.md](OPENCODE_DESKTOP_VALIDATION.md) ·
 [docs/OPENCODE_OBSERVER.md](OPENCODE_OBSERVER.md)

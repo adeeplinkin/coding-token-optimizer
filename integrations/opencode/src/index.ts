@@ -32,7 +32,24 @@ export {
   OpenCodeObserver,
   isDisabledByEnvironment,
   normalizeProjectDirectory,
+  resolveSafeModeSetting,
 } from './observer.js';
+export {
+  DEFAULT_OPPORTUNITY_LIMITS,
+  OPPORTUNITY_OCCURRENCE_REFUSAL_REASONS,
+  OPPORTUNITY_PART_EXCLUSION_REASONS,
+  SAFE_MODE_MARKER_PREFIX,
+  SAFE_MODE_TOOL_ALLOWLIST,
+  analyseRequestOpportunities,
+  emptyOccurrenceRefusalCounts,
+  emptyPartExclusionCounts,
+} from './opportunity.js';
+export type {
+  OpportunityLimits,
+  OpportunityOccurrenceRefusalReason,
+  OpportunityPartExclusionReason,
+  RequestOpportunityAnalysis,
+} from './opportunity.js';
 export {
   DrTokenOpenCodeObserver,
   createOpenCodeObserver,
@@ -71,8 +88,11 @@ export type {
   OpenCodeV2PluginContext,
   OpenCodeV2ProjectInfo,
   OpenCodeV2Registration,
+  OpenCodeV2SessionContext,
   OpenCodeV2SessionCreatedData,
   OpenCodeV2SessionDeletedData,
+  OpenCodeV2SessionDomain,
+  OpenCodeV2SessionHookSpec,
   OpenCodeV2SessionMovedData,
   OpenCodeV2ToolDomain,
   OpenCodeV2ToolExecuteAfterEvent,
@@ -121,6 +141,8 @@ export {
   OBSERVER_SUMMARY_FILE_ENV_VAR,
   OPENCODE_PLUGIN_PACKAGE,
   OPENCODE_PLUGIN_VERIFIED_VERSION,
+  SAFE_MODE_ENV_VAR,
+  SAFE_MODE_OBSERVATION_NOTES,
   USAGE_FIELDS,
 } from './types.js';
 export type {
@@ -165,6 +187,8 @@ export type {
   ProjectAttributionBasis,
   ProjectScopeVerification,
   ReadObservationSummary,
+  SafeModeMode,
+  SafeModeOpportunitySummary,
   SessionLifecycleSummary,
   SessionObservationCounts,
   SessionObservationMeasurements,

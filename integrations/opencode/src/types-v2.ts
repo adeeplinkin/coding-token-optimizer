@@ -12,6 +12,7 @@
  *   sha256(dist/promise/tool.d.ts)         = 14ead93a2c03136af9768f9f02447c5fb357d1bce12a4b38a5e9fe31a0e91eff
  *   sha256(dist/promise/registration.d.ts) = 16436600a035f85d035e3baebb8412084119f620ee4eafc9feba1c7438f6f5ff
  *   sha256(dist/promise/event.d.ts)        = 7e8549dc513c83bd3fcf7cd1b36bcd66b137fac5384f2ac65850b56c0ebcddad
+ *   sha256(dist/promise/session.d.ts)      = 08f5c8728a15839df02f505e38c4cf1b586ccd2de3885eb4f0e471730680b48b
  *
  * Verbatim excerpts from `@opencode/plugin@2.0.24/dist/promise/plugin.d.ts`:
  *
@@ -57,10 +58,59 @@
  *     name: Name,
  *     callback: (input: Spec[Name]) => Promise<void> | void,
  *   ) => Promise<Registration>;
+ *   export type ModelHooks<Spec> = <Name extends keyof Spec>(
+ *     name: Name,
+ *     callback: (input: Spec[Name]) => Promise<void> | void,
+ *     options?: Spec[Name] extends { readonly model: unknown } ? ModelHookOptions : never,
+ *   ) => Promise<Registration>;
  *
  * From `.../dist/promise/event.d.ts`:
  *
  *   export interface EventDomain extends Pick<EventApi, "subscribe"> {}
+ *
+ * ---------------------------------------------------------------------------
+ * VERIFIED V2 SESSION REQUEST-ASSEMBLY CONTRACT (Stage 1P / 1Q)
+ * ---------------------------------------------------------------------------
+ *
+ * Source package: `@opencode/plugin@2.0.24`, file `dist/promise/session.d.ts`,
+ * digest recorded above. Verbatim excerpts (effect wrappers collapsed, comments
+ * trimmed) for the hook Safe Mode M1 registers **only under explicit opt-in**:
+ *
+ *   export interface SessionRequest {
+ *     readonly sessionID: Session.ID;
+ *     readonly model: Model.Ref;
+ *     system: Array<SystemPart>;
+ *     messages: Array<Message>;
+ *     options: SessionRequestOptions;
+ *   }
+ *   export interface SessionContext extends SessionRequest {
+ *     readonly agent: Agent.ID;
+ *     tools: Record<string, { description: string; input: JsonSchema.JsonSchema; }>;
+ *   }
+ *   export type SessionRequestKind = "primary" | "compaction" | "title" | "generate";
+ *   export interface SessionHooks {
+ *     readonly prompt: SessionPrompt;
+ *     readonly context: SessionContext;
+ *     readonly compaction: SessionCompaction;
+ *     readonly generate: SessionGenerate;
+ *     readonly title: SessionTitle;
+ *     readonly "model.request": SessionModelRequest;
+ *     readonly "http.request": SessionHttpRequest;
+ *     readonly "http.response": SessionHttpResponse;
+ *     readonly retry: SessionRetry;
+ *     // ... experimental.ws.* hooks deliberately not modelled here
+ *   }
+ *   export type SessionDomain = Pick<SessionApi, ...> & {
+ *     readonly hook: ModelHooks<SessionHooks>;
+ *   };
+ *
+ * What this contract does **not** carry, and Dr. Token does not assume: the
+ * `SessionContext` handed to the `context` callback has no `kind` member. The
+ * request kind lives on the model-call hooks (`model.request`/`http.request`),
+ * which is why M1's eligibility is content-level and the primary-only gate is
+ * enforced (in a future apply mode) where the kind is observable. Stage 1P
+ * runtime-confirmed delivery, timing and payload completeness of this hook; no
+ * mutation has ever been attempted and none is implemented.
  *
  * The `Session.ID`, `Agent.ID`, `SessionMessage.ID`, `Tool.CallID` and `Tool.Result`
  * aliases above resolve to `string`/`unknown` in the published package; they are kept
@@ -231,6 +281,57 @@ export interface OpenCodeV2ToolDomain {
 }
 
 /**
+ * The `context` payload of `ctx.session.hook` — a defensive mirror of
+ * `SessionContext`.
+ *
+ * The published type requires every member; this mirror declares only the ones
+ * the observer could read and makes them optional, so the adapter keeps working
+ * (and reports the capability as missing) on a host that exposes less. The
+ * request content itself is treated as opaque data by the analyzer and never
+ * asserted into a shape it cannot confirm.
+ */
+export interface OpenCodeV2SessionContext {
+  /** The session this request assembly belongs to. */
+  readonly sessionID?: string;
+  /** The agent the request is assembled for. */
+  readonly agent?: string;
+  readonly model?: unknown;
+  /** System parts; scanned for the Safe Mode marker prefix only. */
+  readonly system?: unknown;
+  /** The message list; the analyzer walks it for `tool-result` parts. */
+  readonly messages?: unknown;
+  readonly options?: unknown;
+  readonly tools?: unknown;
+}
+
+/**
+ * The session hook names this adapter can register.
+ *
+ * Only `context` is declared: it is the one request-assembly hook M1 uses, it is
+ * observation-only by contract (its callback returns `Promise<void> | void`,
+ * with no return-value channel), and none of the other session hooks
+ * (`prompt`, `compaction`, `title`, `model.request`, ...) is registered by this
+ * adapter.
+ */
+export interface OpenCodeV2SessionHookSpec {
+  readonly context: OpenCodeV2SessionContext;
+}
+
+/**
+ * `ctx.session` — only the `hook` member is declared.
+ *
+ * `SessionDomain` publishes more (prompt, create, get, ...). Declaring only the
+ * member the adapter registers keeps the mirror honest: nothing here can call a
+ * session operation.
+ */
+export interface OpenCodeV2SessionDomain {
+  hook<Name extends keyof OpenCodeV2SessionHookSpec>(
+    name: Name,
+    callback: (input: OpenCodeV2SessionHookSpec[Name]) => Promise<void> | void,
+  ): Promise<OpenCodeV2Registration>;
+}
+
+/**
  * One server-sent event, after defensive normalisation.
  *
  * Fields are optional because the concrete V2 event union is **not** verified for
@@ -339,6 +440,8 @@ export interface OpenCodeV2SessionMovedData {
 export interface OpenCodeV2PluginContext {
   readonly tool?: OpenCodeV2ToolDomain;
   readonly event?: OpenCodeV2EventDomain;
+  /** The request-assembly domain, read only when Safe Mode observation is on. */
+  readonly session?: OpenCodeV2SessionDomain;
   readonly options?: Readonly<Record<string, unknown>>;
   readonly app?: unknown;
   /** The host's own location/project (`Location.Info`); unverified at runtime. */

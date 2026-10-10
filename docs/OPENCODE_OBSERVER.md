@@ -756,6 +756,11 @@ Never install it globally, and never in a project holding real credentials. With
 `summaryFile` option and no `DR_TOKEN_OBSERVER_SUMMARY_FILE`, the observer writes nothing.
 Bypass is unchanged: `{ "enabled": false }` or `DR_TOKEN_OPENCODE_OBSERVER=off`.
 
+Safe Mode **M1** observation is separate and also opt-in: `DR_TOKEN_SAFE_MODE=observe` (or
+the `safeMode: "observe"` plugin option) registers `session.hook("context")` and adds a
+content-free `safeMode` section to summaries. With it unset, `ctx.session` is never read and
+no request hook is registered — see [docs/SAFE_MODE_M1_OBSERVATION.md](SAFE_MODE_M1_OBSERVATION.md).
+
 ### 18.5 V2 compatibility status
 
 Updated by Stage 1G (live hooks), Stage 1H (live usage + one-shot persistence), Stage 1I (live
@@ -778,6 +783,7 @@ against the real OpenCode Desktop 2.0.24 bundled CLI
 | V2 session **lifecycle** mapping (`session.created`/`session.deleted`/`session.moved`) | ✅ (`@opencode/schema@2.0.24`) | ✅ | ✅ all three mapped live (Stage 1J): created, deleted, and a matched cross-directory move (§18.7, §17–§18) |
 | **Project scope gate** (instance `ctx.location` vs session facts) | ✅ | ✅ | ✅ matched and refused live (§18.7, §17) |
 | Bypass (`enabled:false` / env) | ✅ | ✅ | ✅ live: disabled observer processed nothing (§17) |
+| **Safe Mode M1 request observation** (opt-in `session.hook("context")`, Stage 1Q) | ✅ (`@opencode/plugin@2.0.24` session contract, digest recorded) | ✅ (56 new tests) | ⚠️ hook delivery runtime-verified (Stage 1P); M1 registration itself not yet run live |
 
 Three V2-vs-V1 differences were found live:
 

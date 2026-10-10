@@ -9,6 +9,7 @@ import {
   OBSERVER_DISABLE_ENV_VAR,
   OBSERVER_SUMMARY_FILE_ENV_VAR,
   OPENCODE_PLUGIN_VERIFIED_VERSION,
+  SAFE_MODE_ENV_VAR,
 } from '../src/index.js';
 
 /**
@@ -131,9 +132,10 @@ describe('dependency hygiene', () => {
     expect(OBSERVER_ADAPTER_REVISION).toBe(manifest.version);
   });
 
-  it('documents both environment switches', () => {
+  it('documents every environment switch', () => {
     expect(OBSERVER_DISABLE_ENV_VAR).toBe('DR_TOKEN_OPENCODE_OBSERVER');
     expect(OBSERVER_SUMMARY_FILE_ENV_VAR).toBe('DR_TOKEN_OBSERVER_SUMMARY_FILE');
+    expect(SAFE_MODE_ENV_VAR).toBe('DR_TOKEN_SAFE_MODE');
   });
 });
 

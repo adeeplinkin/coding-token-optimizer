@@ -1,4 +1,18 @@
 import { defaultHash } from './hash.js';
+import {
+  DEFAULT_OPPORTUNITY_LIMITS,
+  OPPORTUNITY_OCCURRENCE_REFUSAL_REASONS,
+  OPPORTUNITY_PART_EXCLUSION_REASONS,
+  analyseRequestOpportunities,
+  emptyOccurrenceRefusalCounts,
+  emptyPartExclusionCounts,
+} from './opportunity.js';
+import type {
+  OpportunityLimits,
+  OpportunityOccurrenceRefusalReason,
+  OpportunityPartExclusionReason,
+  RequestOpportunityAnalysis,
+} from './opportunity.js';
 import { READ_IDENTITY_SCHEME, READ_TOOL_ID, identifyReadRequest } from './read.js';
 import { createSummaryFileSink, isUsableSummaryPath, resolveEnvironmentSink } from './sink.js';
 import {
@@ -22,6 +36,8 @@ import {
   OBSERVER_DIAGNOSTIC_LEVELS,
   OBSERVER_DIAGNOSTIC_MESSAGES,
   OBSERVER_DISABLE_ENV_VAR,
+  SAFE_MODE_ENV_VAR,
+  SAFE_MODE_OBSERVATION_NOTES,
   USAGE_FIELDS,
 } from './types.js';
 import type {
@@ -42,6 +58,8 @@ import type {
   OpenCodeToolExecuteBeforeOutput,
   ReadObservationSummary,
   ProjectScopeVerification,
+  SafeModeMode,
+  SafeModeOpportunitySummary,
   SessionLifecycleSummary,
   SourceReportedUsageSummary,
   SessionObservationCounts,
@@ -107,6 +125,75 @@ export function isDisabledByEnvironment(
 ): boolean {
   const value = env[OBSERVER_DISABLE_ENV_VAR];
   return typeof value === 'string' && DISABLE_VALUES.includes(value.trim().toLowerCase());
+}
+
+/** Values of the Safe Mode switch that leave it off. */
+const SAFE_MODE_OFF_VALUES: readonly string[] = DISABLE_VALUES;
+/** Values of the Safe Mode switch that enable observation. */
+const SAFE_MODE_OBSERVE_VALUES: readonly string[] = ['observe', 'on', 'true', '1', 'yes'];
+
+/**
+ * Resolve the Safe Mode M1 setting from an explicit option or the environment.
+ *
+ * Exported because the parsed semantics are part of the documented opt-in
+ * contract — in particular the deliberate downgrade: `apply` is not implemented
+ * in this revision, so it is *reported* (`applyRequested: true`) and resolved to
+ * `observe`, because observation is the only Safe Mode behaviour that exists and
+ * it modifies nothing. An unusable value is reported as `ignored` and leaves
+ * Safe Mode off; it is never guessed at.
+ */
+export function resolveSafeModeSetting(
+  explicit: unknown,
+  env: Readonly<Record<string, string | undefined>>,
+): { readonly mode: SafeModeMode; readonly applyRequested: boolean; readonly ignored: boolean } {
+  const fromEnvironment = env[SAFE_MODE_ENV_VAR];
+  const raw = explicit !== undefined ? explicit : fromEnvironment;
+  if (raw === undefined) {
+    return { mode: 'off', applyRequested: false, ignored: false };
+  }
+  if (typeof raw !== 'string') {
+    return { mode: 'off', applyRequested: false, ignored: true };
+  }
+  const value = raw.trim().toLowerCase();
+  if (value === '' || SAFE_MODE_OFF_VALUES.includes(value)) {
+    return { mode: 'off', applyRequested: false, ignored: false };
+  }
+  if (SAFE_MODE_OBSERVE_VALUES.includes(value)) {
+    return { mode: 'observe', applyRequested: false, ignored: false };
+  }
+  if (value === 'apply') {
+    return { mode: 'observe', applyRequested: true, ignored: false };
+  }
+  return { mode: 'off', applyRequested: false, ignored: true };
+}
+
+function resolveOpportunityLimits(
+  overrides: Partial<OpportunityLimits> | undefined,
+): OpportunityLimits {
+  const provided = overrides ?? {};
+  return {
+    maxMessages: toPositiveInteger(provided.maxMessages, DEFAULT_OPPORTUNITY_LIMITS.maxMessages),
+    maxPartsPerMessage: toPositiveInteger(
+      provided.maxPartsPerMessage,
+      DEFAULT_OPPORTUNITY_LIMITS.maxPartsPerMessage,
+    ),
+    maxToolResultParts: toPositiveInteger(
+      provided.maxToolResultParts,
+      DEFAULT_OPPORTUNITY_LIMITS.maxToolResultParts,
+    ),
+    maxCharactersPerToolResult: toPositiveInteger(
+      provided.maxCharactersPerToolResult,
+      DEFAULT_OPPORTUNITY_LIMITS.maxCharactersPerToolResult,
+    ),
+    maxCharactersPerRequest: toPositiveInteger(
+      provided.maxCharactersPerRequest,
+      DEFAULT_OPPORTUNITY_LIMITS.maxCharactersPerRequest,
+    ),
+    minEligibleCharacters: toPositiveInteger(
+      provided.minEligibleCharacters,
+      DEFAULT_OPPORTUNITY_LIMITS.minEligibleCharacters,
+    ),
+  };
 }
 
 function readProcessEnv(): Readonly<Record<string, string | undefined>> {
@@ -379,9 +466,63 @@ interface SessionState {
   readonly sourceUsage: SourceUsageState;
   /** What the runtime declared about this session's project, if anything. */
   readonly project: SessionProjectState;
+  /** Safe Mode M1 opportunity counters, folded from analysed requests. */
+  readonly opportunities: OpportunityState;
   createdEvents: number;
   idleEvents: number;
   compactedEvents: number;
+}
+
+/**
+ * Mutable Safe Mode M1 counters for one session.
+ *
+ * Every field is a count of something that was seen; nothing here is derived
+ * from tool content, and none of it is a token figure.
+ */
+interface OpportunityState {
+  requestsObserved: number;
+  requestsUnusable: number;
+  requestsWithoutDuplicates: number;
+  requestsWithMarkerCollision: number;
+  requestsBounded: number;
+  messagesExamined: number;
+  partsExamined: number;
+  toolResultPartsExamined: number;
+  comparedToolResultParts: number;
+  duplicateGroups: number;
+  duplicateOccurrences: number;
+  eligibleGroups: number;
+  eligibleOccurrences: number;
+  duplicateCharacters: number;
+  duplicateBytes: number;
+  candidateCharacters: number;
+  candidateBytes: number;
+  readonly excludedParts: Record<OpportunityPartExclusionReason, number>;
+  readonly refusedOccurrences: Record<OpportunityOccurrenceRefusalReason, number>;
+}
+
+function createOpportunityState(): OpportunityState {
+  return {
+    requestsObserved: 0,
+    requestsUnusable: 0,
+    requestsWithoutDuplicates: 0,
+    requestsWithMarkerCollision: 0,
+    requestsBounded: 0,
+    messagesExamined: 0,
+    partsExamined: 0,
+    toolResultPartsExamined: 0,
+    comparedToolResultParts: 0,
+    duplicateGroups: 0,
+    duplicateOccurrences: 0,
+    eligibleGroups: 0,
+    eligibleOccurrences: 0,
+    duplicateCharacters: 0,
+    duplicateBytes: 0,
+    candidateCharacters: 0,
+    candidateBytes: 0,
+    excludedParts: emptyPartExclusionCounts(),
+    refusedOccurrences: emptyOccurrenceRefusalCounts(),
+  };
 }
 
 /** Mutable tracking for the V2 source-reported usage series of one session. */
@@ -431,6 +572,7 @@ function createSessionState(sessionId: string, at: number): SessionState {
       monotonicNonDecreasing: true,
       decreasesObserved: 0,
     },
+    opportunities: createOpportunityState(),
     project: {
       projectId: undefined,
       workspaceId: undefined,
@@ -486,6 +628,10 @@ export class OpenCodeObserver {
   /** The project this instance belongs to, when the host declared one. */
   #expectedProject: ObserverExpectedProject | undefined;
   #enabled: boolean;
+  /** Safe Mode M1 mode: `off` unless explicitly opted in. */
+  #safeMode: SafeModeMode;
+  /** Effective bounds for the opportunity analyzer. */
+  #opportunityLimits: OpportunityLimits;
   #disposed = false;
   #internalErrors = 0;
   #eventsObserved = 0;
@@ -512,11 +658,32 @@ export class OpenCodeObserver {
     const env = options.env ?? readProcessEnv();
     this.#sink = options.sink ?? resolveEnvironmentSink(env);
     this.#enabled = options.enabled ?? !isDisabledByEnvironment(env);
+    this.#opportunityLimits = resolveOpportunityLimits(options.opportunityLimits);
+    const safeMode = resolveSafeModeSetting(options.safeMode, env);
+    this.#safeMode = safeMode.mode;
+    if (safeMode.applyRequested) {
+      // Apply is part of the design and deliberately not implemented here. The
+      // request is reported rather than silently obeyed or silently dropped.
+      this.#diagnose('safe-mode-apply-unavailable');
+    }
+    if (safeMode.ignored) {
+      this.#diagnose('safe-mode-setting-ignored');
+    }
   }
 
   /** Whether observation is currently enabled. */
   isEnabled(): boolean {
     return this.#enabled;
+  }
+
+  /**
+   * Whether Safe Mode M1 opportunity observation is active.
+   *
+   * The V2 adapter registers the request-context hook only when this is `true`,
+   * so a default installation keeps exactly its previous host surface.
+   */
+  isSafeModeObserving(): boolean {
+    return this.#safeMode === 'observe';
   }
 
   /**
@@ -578,10 +745,11 @@ export class OpenCodeObserver {
   /**
    * Apply the options OpenCode passes to a plugin (`PluginOptions`).
    *
-   * Recognised keys are `enabled` (boolean) and `summaryFile` (string path);
-   * anything else is ignored with a content-free diagnostic. A sink configured
-   * in code always wins over `summaryFile`, so an explicit `sink` cannot be
-   * replaced by configuration.
+   * Recognised keys are `enabled` (boolean), `summaryFile` (string path) and
+   * `safeMode` (Safe Mode M1 observation, `off` | `observe`; `apply` is reported
+   * as not implemented); anything else is ignored with a content-free
+   * diagnostic. A sink configured in code always wins over `summaryFile`, so an
+   * explicit `sink` cannot be replaced by configuration.
    */
   applyPluginOptions(options: Readonly<Record<string, unknown>> | undefined): void {
     if (options === undefined || options === null) {
@@ -592,6 +760,19 @@ export class OpenCodeObserver {
       this.setEnabled(enabled);
     } else if (enabled !== undefined) {
       this.#diagnose('plugin-options-ignored');
+    }
+
+    const safeMode = options['safeMode'];
+    if (safeMode !== undefined) {
+      const resolved = resolveSafeModeSetting(safeMode, {});
+      if (resolved.ignored) {
+        this.#diagnose('safe-mode-setting-ignored');
+      } else {
+        this.#safeMode = resolved.mode;
+        if (resolved.applyRequested) {
+          this.#diagnose('safe-mode-apply-unavailable');
+        }
+      }
     }
 
     const summaryFile = options['summaryFile'];
@@ -763,6 +944,27 @@ export class OpenCodeObserver {
         return;
       }
       await this.#handleEvent(input);
+    } catch {
+      this.noteInternalFailure();
+    }
+  }
+
+  /**
+   * `session.hook("context")` — Safe Mode M1 observation of one assembled
+   * request.
+   *
+   * Observation only: the payload is passed to a pure analyzer that reads it and
+   * returns counts, and nothing on this path assigns to any argument. The
+   * request content, tool outputs, instructions, permissions and model settings
+   * are not modified — and the hook contract has no return-value channel in any
+   * case. A no-op when Safe Mode observation is off or the observer is bypassed.
+   */
+  observeRequestContext(input: unknown): void {
+    try {
+      if (!this.#canObserve() || this.#safeMode !== 'observe') {
+        return;
+      }
+      this.#requestContext(input);
     } catch {
       this.noteInternalFailure();
     }
@@ -1083,6 +1285,84 @@ export class OpenCodeObserver {
     // counted twice when both hooks fired.
     if (completedTool === READ_TOOL_ID && pending === undefined) {
       this.#accountReadRequest(state, callId, asRecord(inputRecord?.['args']));
+    }
+    this.#markDirty(state);
+  }
+
+  /**
+   * Record one request-assembly observation.
+   *
+   * The published V2 contract delivers the `SessionContext` itself; a payload
+   * that carries it under a `context` member is accepted too, because Stage 1P
+   * tolerated both shapes while validating delivery. A payload with no usable
+   * session id cannot be attributed to a session and is counted as ignored, not
+   * assigned to an arbitrary one.
+   */
+  #requestContext(input: unknown): void {
+    const outer = asRecord(input);
+    if (outer === undefined) {
+      this.#eventsIgnored += 1;
+      this.#diagnose('safe-mode-request-unusable');
+      return;
+    }
+    const candidate = asRecord(outer['context']) ?? outer;
+    const sessionId = readIdentifier(candidate['sessionID']);
+    if (sessionId === undefined) {
+      this.#eventsIgnored += 1;
+      this.#diagnose('safe-mode-request-unusable');
+      return;
+    }
+    this.#eventsObserved += 1;
+
+    if (this.#dropIfInactive(sessionId)) {
+      return;
+    }
+    const state = this.#session(sessionId);
+    this.#touch(state);
+
+    const analysis = analyseRequestOpportunities(candidate, this.#opportunityLimits);
+    if (analysis === undefined) {
+      // Counted, never guessed: an unanalysable request is recorded as such
+      // instead of being folded in as an all-zero reading.
+      state.opportunities.requestsObserved += 1;
+      state.opportunities.requestsUnusable += 1;
+      this.#diagnose('safe-mode-request-unusable');
+      this.#markDirty(state);
+      return;
+    }
+    this.#recordOpportunityAnalysis(state, analysis);
+  }
+
+  /** Fold one content-free request analysis into the session's counters. */
+  #recordOpportunityAnalysis(state: SessionState, analysis: RequestOpportunityAnalysis): void {
+    const opportunities = state.opportunities;
+    opportunities.requestsObserved += 1;
+    if (analysis.duplicateOccurrences === 0) {
+      opportunities.requestsWithoutDuplicates += 1;
+    }
+    if (analysis.markerCollision) {
+      opportunities.requestsWithMarkerCollision += 1;
+    }
+    if (analysis.bounded) {
+      opportunities.requestsBounded += 1;
+    }
+    opportunities.messagesExamined += analysis.messagesExamined;
+    opportunities.partsExamined += analysis.partsExamined;
+    opportunities.toolResultPartsExamined += analysis.toolResultParts;
+    opportunities.comparedToolResultParts += analysis.comparedToolResultParts;
+    opportunities.duplicateGroups += analysis.duplicateGroups;
+    opportunities.duplicateOccurrences += analysis.duplicateOccurrences;
+    opportunities.eligibleGroups += analysis.eligibleGroups;
+    opportunities.eligibleOccurrences += analysis.eligibleOccurrences;
+    opportunities.duplicateCharacters += analysis.duplicateCharacters;
+    opportunities.duplicateBytes += analysis.duplicateBytes;
+    opportunities.candidateCharacters += analysis.candidateCharacters;
+    opportunities.candidateBytes += analysis.candidateBytes;
+    for (const reason of OPPORTUNITY_PART_EXCLUSION_REASONS) {
+      opportunities.excludedParts[reason] += analysis.excludedParts[reason];
+    }
+    for (const reason of OPPORTUNITY_OCCURRENCE_REFUSAL_REASONS) {
+      opportunities.refusedOccurrences[reason] += analysis.refusedOccurrences[reason];
     }
     this.#markDirty(state);
   }
@@ -1663,6 +1943,37 @@ export class OpenCodeObserver {
       totalTokens: unavailable(NOTE_TOTAL_TOKENS_NOT_DERIVED),
     };
 
+    // Safe Mode M1 observation is reported only while it is active for this
+    // instance; a default installation's summary shape (and every existing
+    // assertion about it) is unchanged.
+    const safeMode: SafeModeOpportunitySummary | undefined =
+      this.#safeMode === 'observe'
+        ? {
+            mode: 'observe',
+            requestsObserved: state.opportunities.requestsObserved,
+            requestsUnusable: state.opportunities.requestsUnusable,
+            requestsWithoutDuplicates: state.opportunities.requestsWithoutDuplicates,
+            requestsWithMarkerCollision: state.opportunities.requestsWithMarkerCollision,
+            requestsBounded: state.opportunities.requestsBounded,
+            messagesExamined: state.opportunities.messagesExamined,
+            partsExamined: state.opportunities.partsExamined,
+            toolResultPartsExamined: state.opportunities.toolResultPartsExamined,
+            comparedToolResultParts: state.opportunities.comparedToolResultParts,
+            duplicateGroups: state.opportunities.duplicateGroups,
+            duplicateOccurrences: state.opportunities.duplicateOccurrences,
+            eligibleGroups: state.opportunities.eligibleGroups,
+            eligibleOccurrences: state.opportunities.eligibleOccurrences,
+            duplicateCharacters: state.opportunities.duplicateCharacters,
+            duplicateBytes: state.opportunities.duplicateBytes,
+            candidateCharacters: state.opportunities.candidateCharacters,
+            candidateBytes: state.opportunities.candidateBytes,
+            excludedParts: { ...state.opportunities.excludedParts },
+            refusedOccurrences: { ...state.opportunities.refusedOccurrences },
+            minimumEligibleCharacters: this.#opportunityLimits.minEligibleCharacters,
+            notes: [...SAFE_MODE_OBSERVATION_NOTES],
+          }
+        : undefined;
+
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       adapter: this.#adapterIdentity(),
@@ -1676,6 +1987,7 @@ export class OpenCodeObserver {
       lifecycle,
       project,
       measurements,
+      ...(safeMode === undefined ? {} : { safeMode }),
       notes: [
         ...OBSERVATION_NOTES,
         ...(counts.toolStartsObserved === 0 ? [NOTE_NO_TOOL_ACTIVITY] : []),

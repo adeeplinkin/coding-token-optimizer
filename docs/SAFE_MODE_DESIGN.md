@@ -3,7 +3,7 @@
 **Status:** design only. **No Safe Mode transformation is implemented, enabled or benchmarked.**
 **Scope of this stage:** pick the first Safe Mode strategy, prove that the harnesses can support it,
 and specify how it will be measured — or reject it and say why.
-**Related:** [docs/OPENCODE_REQUEST_HOOK_VALIDATION.md](OPENCODE_REQUEST_HOOK_VALIDATION.md) (Stage 1P runtime validation of the hook this design depends on) · [docs/BENCHMARKING.md](BENCHMARKING.md) · [docs/CODEX_VALIDATION.md](CODEX_VALIDATION.md) ·
+**Related:** [docs/OPENCODE_REQUEST_HOOK_VALIDATION.md](OPENCODE_REQUEST_HOOK_VALIDATION.md) (Stage 1P runtime validation of the hook this design depends on) · [docs/SAFE_MODE_M1_OBSERVATION.md](SAFE_MODE_M1_OBSERVATION.md) (Stage 1Q: the M1 observation-only opportunity analyzer) · [docs/BENCHMARKING.md](BENCHMARKING.md) · [docs/CODEX_VALIDATION.md](CODEX_VALIDATION.md) ·
 [docs/CODEX_OBSERVER.md](CODEX_OBSERVER.md) · [docs/OPENCODE_OBSERVER.md](OPENCODE_OBSERVER.md) ·
 [docs/adr/0003-safe-mode-strategy.md](adr/0003-safe-mode-strategy.md) ·
 [docs/adr/0001-opencode-integration.md](adr/0001-opencode-integration.md) ·
@@ -597,7 +597,7 @@ There is no persistent Safe Mode state to clean up: no cache, no database, no da
 
 | Milestone | Deliverable | Gate to pass |
 | --- | --- | --- |
-| **M1 — observe only** | OpenCode V2 adapter builds a `RequestView` from `session.hook("context")` in `mode: "observe"`, records would-elide decisions, and measures the true sent size via `session.hook("http.request")` | (a) and a first instance of (b) are **already proven** — Stage 1P runtime-verified delivery, timing, the complete-request payload and one live byte-identical duplicate pair. M1 must still measure how often duplicates occur in **real** work and establish (c) a wire baseline. **No mutation** |
+| **M1 — observe only** — ✅ **implemented (Stage 1Q)** | OpenCode V2 adapter builds a request view from `session.hook("context")` in observe mode and records content-free would-elide decisions; see [docs/SAFE_MODE_M1_OBSERVATION.md](SAFE_MODE_M1_OBSERVATION.md) | Recorded Stage 1P evidence replayed offline: every count reproduced, and the one live duplicate (135 chars) is correctly classified *ineligible* against the 400-char threshold. Still open: duplicate rates in **real** work, the (c) wire baseline, and E8's primary-only gate (not observable at this hook). **No mutation** |
 | **M2 — apply behind an opt-in flag** | The transformation runs in `mode: "apply"`; the wire check proves the body shrank by the recorded amount and retained parts are unchanged | Mechanism proven end-to-end before any benchmark |
 | **M3 — the correctness gate** | Level 1 harness (§6.2) in CI, including the independent preservation checker and the refusal cases | All Level 1 assertions pass; failing rejects the strategy |
 | **M4 — benchmark schema** | Declared single-axis variant in provenance + comparability rule (§6.4) | A control/treatment pair compares as `unavailable`/`benchmark-verified`, never `invalid` |

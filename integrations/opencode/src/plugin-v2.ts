@@ -19,6 +19,8 @@ import type {
   OpenCodeV2Plugin,
   OpenCodeV2PluginContext,
   OpenCodeV2Registration,
+  OpenCodeV2SessionContext,
+  OpenCodeV2SessionDomain,
   OpenCodeV2ToolDomain,
   OpenCodeV2ToolExecuteAfterEvent,
   OpenCodeV2ToolExecuteBeforeEvent,
@@ -42,6 +44,14 @@ import type {
  * calls `ctx.tool.transform`, never touches `ctx.storage`, never asks for
  * permissions, and never reads tool results into state. V2 delivers one mutable
  * event object per hook call; nothing here assigns to it.
+ *
+ * One more observation channel exists and is **opt-in**: when Safe Mode M1
+ * observation is enabled (`DR_TOKEN_SAFE_MODE=observe` or the `safeMode` plugin
+ * option), the adapter also registers `session.hook("context")`, the
+ * request-assembly hook Stage 1P validated, and feeds a content-free duplicate
+ * analysis into the observer. That hook is read-only like everything else: its
+ * callback returns nothing, the payload is never assigned to, and with the
+ * setting off `ctx.session` is not touched at all.
  *
  * Fail-open. Every hook body is wrapped, and a failure is reported as a
  * content-free diagnostic instead of being thrown into OpenCode. `setup` itself
@@ -252,6 +262,18 @@ export function createOpenCodeObserverV2(
         if (abortEvents === undefined) {
           noteMissing(observer);
         }
+
+        // Safe Mode M1 observation is opt-in. When it is off, `ctx.session` is
+        // never read: a default installation's registered surface stays exactly
+        // the two tool hooks plus the event subscription.
+        if (observer.isSafeModeObserving()) {
+          const session: OpenCodeV2SessionDomain | undefined = context?.session;
+          if (typeof session?.hook !== 'function') {
+            noteMissing(observer);
+          } else {
+            registerSessionContextHook(observer, session, registrations);
+          }
+        }
       }
 
       // Cleanup is synchronous to hand back, and releases everything asynchronous
@@ -297,6 +319,47 @@ function registerToolHook(
       observer.observeToolAfter(mapped.input, mapped.output);
     }),
   );
+}
+
+/** Register the Safe Mode request-assembly hook, containing every failure. */
+function registerSessionContextHook(
+  observer: OpenCodeObserver,
+  session: OpenCodeV2SessionDomain,
+  registrations: OpenCodeV2Registration[],
+): void {
+  void hookSessionContext(
+    session,
+    registrations,
+    observer,
+    guarded(observer, (context: OpenCodeV2SessionContext) => {
+      observer.observeRequestContext(context);
+    }),
+  );
+}
+
+/**
+ * Call `ctx.session.hook("context")` and remember the registration.
+ *
+ * Contained exactly like the tool registrations: a host that rejects the hook
+ * name, or a registration promise that rejects, is recorded as a missing
+ * capability and the rest of the adapter keeps working. The callback itself is
+ * wrapped twice (observer and adapter) so nothing it does can reach the host's
+ * request assembler.
+ */
+async function hookSessionContext(
+  session: OpenCodeV2SessionDomain,
+  registrations: OpenCodeV2Registration[],
+  observer: OpenCodeObserver,
+  callback: (context: OpenCodeV2SessionContext) => Promise<void>,
+): Promise<void> {
+  try {
+    const registration = await session.hook('context', callback);
+    if (registration !== undefined && typeof registration.dispose === 'function') {
+      registrations.push(registration);
+    }
+  } catch {
+    noteMissing(observer);
+  }
 }
 
 /**

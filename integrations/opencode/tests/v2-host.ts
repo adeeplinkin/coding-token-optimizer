@@ -7,6 +7,8 @@ import type {
   OpenCodeV2Registration,
   OpenCodeV2SessionCreatedData,
   OpenCodeV2SessionDeletedData,
+  OpenCodeV2SessionDomain,
+  OpenCodeV2SessionHookSpec,
   OpenCodeV2SessionMovedData,
   OpenCodeV2ToolHookSpec,
 } from '../src/index.js';
@@ -38,8 +40,12 @@ export interface V2Host {
   readonly push: (event: unknown) => void;
   /** Invoke a registered tool hook by name, as the host's tool pipeline would. */
   readonly tool: (name: string, payload: unknown) => Promise<void>;
+  /** Invoke a registered session hook by name, as the host's request assembler would. */
+  readonly session: (name: string, payload: unknown) => Promise<void>;
   /** Names of the tool hooks the adapter actually registered. */
   readonly registeredHooks: () => readonly string[];
+  /** Names of the session hooks the adapter actually registered. */
+  readonly registeredSessionHooks: () => readonly string[];
   /** Whether the adapter aborted its event subscription. */
   readonly aborted: () => boolean;
   /** Wait until every pushed event has been processed by the observer. */
@@ -58,6 +64,11 @@ export interface V2HostEnvironment {
   readonly location?: unknown;
   /** Options the host passes as `ctx.options` on the first `setup` call. */
   readonly pluginOptions?: Readonly<Record<string, unknown>>;
+  /**
+   * Simulate a host that exposes no `ctx.session` at all. Off by default: the
+   * real 2.0.24 context carries the session domain.
+   */
+  readonly omitSessionDomain?: boolean;
 }
 
 /** A runtime-shaped V2 envelope, exactly as the 2.0.24 server delivers it. */
@@ -171,6 +182,7 @@ export async function createV2Host(
     },
   });
   const callbacks = new Map<string, (event: unknown) => unknown>();
+  const sessionCallbacks = new Map<string, (context: unknown) => unknown>();
   const buffer: unknown[] = [];
   let closed = false;
   let aborted = false;
@@ -217,6 +229,21 @@ export async function createV2Host(
     };
   };
 
+  // The real 2.0.24 host exposes `ctx.session`; the session hook is only
+  // registered by the adapter when Safe Mode M1 observation is enabled.
+  const sessionHook = async <Name extends keyof OpenCodeV2SessionHookSpec>(
+    name: Name,
+    callback: (context: OpenCodeV2SessionHookSpec[Name]) => Promise<void> | void,
+  ): Promise<OpenCodeV2Registration> => {
+    sessionCallbacks.set(name, callback as unknown as (context: unknown) => unknown);
+    return {
+      dispose: async () => {
+        sessionCallbacks.delete(name);
+      },
+    };
+  };
+  const sessionDomain: OpenCodeV2SessionDomain = { hook: sessionHook };
+
   const context: OpenCodeV2PluginContext = {
     tool: { hook },
     event: {
@@ -229,6 +256,7 @@ export async function createV2Host(
         return iterable;
       },
     },
+    ...(environment.omitSessionDomain === true ? {} : { session: sessionDomain }),
     // A host that declares no location is simulated by omitting the member
     // entirely, exactly as `exactOptionalPropertyTypes` models the real contract.
     ...(environment.location === undefined
@@ -243,6 +271,12 @@ export async function createV2Host(
     // The adapter registers tool hooks without blocking `setup`; wait for them so
     // a test can invoke them immediately afterwards.
     await waitUntil(() => callbacks.size >= IMPLEMENTED_V2_TOOL_HOOKS.length || aborted);
+    // Safe Mode observation is registered only when opted in; wait for it so a
+    // test can deliver a request immediately. A host without the domain cannot
+    // register it, and the adapter reports that instead.
+    if (created.observer.isSafeModeObserving() && environment.omitSessionDomain !== true) {
+      await waitUntil(() => sessionCallbacks.has('context') || aborted);
+    }
   };
 
   // A host always runs `setup` before it can deliver anything, so the harness does
@@ -265,7 +299,15 @@ export async function createV2Host(
       }
       await callback(payload);
     },
+    async session(name, payload) {
+      const callback = sessionCallbacks.get(name);
+      if (callback === undefined) {
+        throw new Error(`the adapter did not register session hook ${name}`);
+      }
+      await callback(payload);
+    },
     registeredHooks: () => [...callbacks.keys()],
+    registeredSessionHooks: () => [...sessionCallbacks.keys()],
     aborted: () => aborted,
     async settle() {
       await waitUntil(

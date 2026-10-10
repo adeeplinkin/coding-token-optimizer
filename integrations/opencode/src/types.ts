@@ -68,6 +68,11 @@
  * `tests/fixtures/opencode-plugin-v1.contract.ts` so `npm run typecheck` fails if this adapter
  * drifts from the contract it claims to implement.
  */
+import type {
+  OpportunityLimits,
+  OpportunityOccurrenceRefusalReason,
+  OpportunityPartExclusionReason,
+} from './opportunity.js';
 
 /** Version of the observation summary schema. */
 export const OBSERVATION_SCHEMA_VERSION = 1;
@@ -138,6 +143,24 @@ export const OBSERVER_DISABLE_ENV_VAR = 'DR_TOKEN_OPENCODE_OBSERVER';
 
 /** Environment switch pointing at an opt-in JSON Lines summary file. */
 export const OBSERVER_SUMMARY_FILE_ENV_VAR = 'DR_TOKEN_OBSERVER_SUMMARY_FILE';
+
+/**
+ * Environment switch that opts into Safe Mode **M1** opportunity observation.
+ *
+ * `observe` enables it; `off` (or unset) keeps it disabled. `apply` is part of
+ * the Stage 1O design but is not implemented in this revision: requesting it
+ * records a diagnostic and observes, because observation is the only Safe Mode
+ * behaviour that exists and it modifies nothing.
+ */
+export const SAFE_MODE_ENV_VAR = 'DR_TOKEN_SAFE_MODE';
+
+/**
+ * Safe Mode modes this revision implements.
+ *
+ * There is deliberately no `apply`: no transformation exists anywhere in this
+ * package, and the type says so rather than carrying a value that cannot run.
+ */
+export type SafeModeMode = 'off' | 'observe';
 
 /* -------------------------------------------------------------------------- */
 /* OpenCode V1 hook contracts (structural subset, see the header above)        */
@@ -541,6 +564,57 @@ export interface SessionObservationMeasurements {
 }
 
 /**
+ * Per-session Safe Mode **M1** opportunity observation, present only while the
+ * opt-in observation mode is active.
+ *
+ * It counts what was seen in the assembled requests this session produced —
+ * never what was changed, because nothing is ever changed. Two semantics matter
+ * when reading it:
+ *
+ * - **One context invocation is one counted request assembly.** Runtime retries
+ *   re-invoke the hook and are counted again; two plugin instances observing the
+ *   same request each count it. These counts are *not* deduplicated request
+ *   identities, and the notes say so.
+ * - **Candidate characters/bytes are not savings.** They measure duplicate text
+ *   in the request; no token figure is inferred from them.
+ */
+export interface SafeModeOpportunitySummary {
+  readonly mode: 'observe';
+  /** Context-hook invocations attributed to this session (retries re-count). */
+  readonly requestsObserved: number;
+  /** Observed requests whose payload was not analysable; counted, never guessed. */
+  readonly requestsUnusable: number;
+  /** Analysed requests that contained no duplicate occurrence (no-opportunity). */
+  readonly requestsWithoutDuplicates: number;
+  /** Requests where some examined part already carried the marker prefix (E7). */
+  readonly requestsWithMarkerCollision: number;
+  /** Requests whose scan hit a processing bound (E9). */
+  readonly requestsBounded: number;
+  readonly messagesExamined: number;
+  readonly partsExamined: number;
+  readonly toolResultPartsExamined: number;
+  readonly comparedToolResultParts: number;
+  readonly duplicateGroups: number;
+  readonly duplicateOccurrences: number;
+  readonly eligibleGroups: number;
+  readonly eligibleOccurrences: number;
+  /** Sum over ALL detected occurrences of UTF-16 string length. Never "tokens". */
+  readonly duplicateCharacters: number;
+  /** Sum over ALL detected occurrences of UTF-8 byte length. Never "tokens". */
+  readonly duplicateBytes: number;
+  /** Sum over eligible (would-elide) occurrences of UTF-16 string length. Never "tokens". */
+  readonly candidateCharacters: number;
+  /** Sum over eligible occurrences of UTF-8 byte length. Never "tokens". */
+  readonly candidateBytes: number;
+  readonly excludedParts: Readonly<Record<OpportunityPartExclusionReason, number>>;
+  readonly refusedOccurrences: Readonly<Record<OpportunityOccurrenceRefusalReason, number>>;
+  /** The effective E6 threshold, so refusal counts can be interpreted. */
+  readonly minimumEligibleCharacters: number;
+  /** Static, content-free caveats that apply to this section. */
+  readonly notes: readonly string[];
+}
+
+/**
  * A structured, content-free summary of one OpenCode session.
  *
  * It contains counts, hashed read identities, timestamps, and static notes. It
@@ -564,6 +638,11 @@ export interface SessionObservationSummary {
   /** Project attribution learned from the runtime, or an explicit absence. */
   readonly project: SessionProjectScope;
   readonly measurements: SessionObservationMeasurements;
+  /**
+   * Safe Mode M1 opportunity observation, present only when the opt-in
+   * observation mode is active for this observer instance. Absent by default.
+   */
+  readonly safeMode?: SafeModeOpportunitySummary;
   /** Static, content-free caveats that apply to this summary. */
   readonly notes: readonly string[];
 }
@@ -638,6 +717,9 @@ export type ObserverDiagnosticCode =
   | 'plugin-options-ignored'
   | 'sink-failed'
   | 'unsupported-plugin-capability'
+  | 'safe-mode-apply-unavailable'
+  | 'safe-mode-setting-ignored'
+  | 'safe-mode-request-unusable'
   | 'internal-failure';
 
 /** Static, content-free text for every diagnostic code. */
@@ -664,6 +746,12 @@ export const OBSERVER_DIAGNOSTIC_MESSAGES: Readonly<Record<ObserverDiagnosticCod
   'sink-failed': 'The configured summary sink failed; the failure was contained.',
   'unsupported-plugin-capability':
     'The runtime did not expose a plugin capability this adapter needs; the affected observation is reported as unavailable rather than invented.',
+  'safe-mode-apply-unavailable':
+    'Safe Mode apply mode is not implemented in this revision; nothing was modified and observation remains enabled.',
+  'safe-mode-setting-ignored':
+    'A Safe Mode setting was not usable and was ignored; Safe Mode stays off.',
+  'safe-mode-request-unusable':
+    'A Safe Mode request observation was not analysable; it was counted and not inspected further.',
   'internal-failure': 'An internal observer failure was contained; OpenCode behavior is unaffected.',
 };
 
@@ -701,6 +789,9 @@ export const OBSERVER_DIAGNOSTIC_LEVELS: Readonly<Record<ObserverDiagnosticCode,
     'plugin-options-ignored': 'warn',
     'sink-failed': 'warn',
     'unsupported-plugin-capability': 'warn',
+    'safe-mode-apply-unavailable': 'warn',
+    'safe-mode-setting-ignored': 'warn',
+    'safe-mode-request-unusable': 'warn',
     'internal-failure': 'warn',
   };
 
@@ -730,6 +821,16 @@ export interface ObserverOptions {
   /** Recorded in summaries; defaults to the package revision. */
   readonly adapterRevision?: string;
   /**
+   * Safe Mode M1 observation. `observe` registers the request-context hook and
+   * records content-free opportunity counts; `off` (the default) registers
+   * nothing and changes no behaviour. When unset, the environment switch
+   * `DR_TOKEN_SAFE_MODE` is consulted. `apply` is not implemented: requesting it
+   * records a diagnostic and observes.
+   */
+  readonly safeMode?: SafeModeMode;
+  /** Overrides for the opportunity analyzer's processing and memory bounds. */
+  readonly opportunityLimits?: Partial<OpportunityLimits>;
+  /**
    * Which OpenCode plugin API line this observer was attached to.
    * Defaults to V1, so an existing caller's summaries are unchanged.
    */
@@ -748,4 +849,13 @@ export const OBSERVATION_NOTES: readonly string[] = [
   'Observation only: this summary describes recorded activity and does not prove that any token saving was achieved.',
   'Repeated reads are potentially redundant requests inferred from identical (file identity, offset, limit) keys, not measured savings.',
   'Token and cost values come from OpenCode usage records when the provider supplies them; a session total is never invented.',
+];
+
+/** Static caveats attached to the Safe Mode opportunity section. */
+export const SAFE_MODE_OBSERVATION_NOTES: readonly string[] = [
+  'Safe Mode observation only: this section counts duplicate tool results that could be elided. Nothing in any request was modified, and no token saving is achieved or claimed.',
+  'Duplicate and candidate characters/bytes are properties of the assembled request, not saved tokens; no token figure is derived from them. "Duplicate" counts every detected occurrence, "candidate" only those eligible for the v1 elision.',
+  'Each context invocation is one counted request assembly. Runtime retries re-invoke the hook and are counted again, and two plugin instances observing one request each count it, so these counts are not deduplicated request identities.',
+  'The request kind (primary, compaction, title, generate) is not carried by the context-hook payload; eligibility recorded here is content-level, and the primary-only gate is enforced where the kind is observable.',
+  'Detection compares exact model-visible text (string equality, not hashes) and requires the earlier identical copy to be present in the same request. Error, malformed, oversized and unsupported results are excluded, never guessed at.',
 ];
