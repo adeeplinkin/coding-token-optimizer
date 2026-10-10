@@ -167,12 +167,20 @@ export interface OpenCodeV2ToolDomain {
  * One server-sent event, after defensive normalisation.
  *
  * Fields are optional because the concrete V2 event union is **not** verified for
- * this install; the adapter reads `type`/`properties` only when they are actually
- * present and never trusts either.
+ * this install; the adapter reads `type`, `properties` and `data` only when they
+ * are actually present and never trusts any of them.
+ *
+ * `data` matters: **V2 delivers an event body under `data`**, while V1 uses
+ * `properties`. Runtime-confirmed on OpenCode Desktop 2.0.24 (Stage 1G captured
+ * `{ id, created, type, data }` envelopes; Stage 1H showed that an adapter which
+ * forwards `properties` alone receives every V2 event with an empty payload, so
+ * this field must be preserved across normalisation). Both are kept — when a host
+ * sent both, the observer prefers `properties` so V1 behaviour is unchanged.
  */
 export interface OpenCodeV2Event {
   readonly type?: string;
   readonly properties?: unknown;
+  readonly data?: unknown;
 }
 
 /**

@@ -1,12 +1,21 @@
 import { defaultHash } from './hash.js';
 import { READ_IDENTITY_SCHEME, READ_TOOL_ID, identifyReadRequest } from './read.js';
 import { createSummaryFileSink, isUsableSummaryPath, resolveEnvironmentSink } from './sink.js';
-import { extractAssistantUsage, mergeUsageSnapshots } from './usage.js';
-import type { MessageUsageSnapshot } from './usage.js';
 import {
+  compareSessionUsage,
+  extractAssistantUsage,
+  extractSessionUsage,
+  mergeUsageSnapshots,
+  sessionUsageFields,
+} from './usage.js';
+import type { MessageUsageSnapshot, SessionUsageSnapshot } from './usage.js';
+import {
+  DEFAULT_CHECKPOINT_INTERVAL_MS,
   DEFAULT_OBSERVATION_LIMITS,
   DEFAULT_OBSERVER_PLUGIN_API,
   OBSERVATION_NOTES,
+  OPENCODE_V2_EXECUTION_SUCCEEDED_EVENT_TYPE,
+  OPENCODE_V2_USAGE_EVENT_TYPE,
   OBSERVATION_SCHEMA_VERSION,
   OBSERVER_ADAPTER_NAME,
   OBSERVER_ADAPTER_REVISION,
@@ -32,6 +41,7 @@ import type {
   OpenCodeToolExecuteBeforeOutput,
   ReadObservationSummary,
   SessionLifecycleSummary,
+  SourceReportedUsageSummary,
   SessionObservationCounts,
   SessionObservationMeasurements,
   SessionObservationSummary,
@@ -44,6 +54,16 @@ import type {
  * Static, content-free notes. Every one of these must stay free of paths,
  * prompts, identifiers and tool content, because they ship inside summaries.
  */
+/**
+ * Used when the runtime reported V2 usage snapshots that are not aggregated.
+ *
+ * The numbers are preserved in `usage.sourceReported`; this explains why no
+ * session aggregate is derived from them, and states the one thing that was
+ * measured about the series so a reader is not left guessing.
+ */
+const NOTE_SOURCE_REPORTED_NOT_AGGREGATED =
+  'The runtime reported session usage snapshots. No session aggregate is derived from them: whether a snapshot is an increment, a running total or a per-request value is not a published contract. In the one session measured so far the series behaved like a running session total, and its last snapshot equalled the totals the runtime itself stored for that session. The numbers are preserved as reported under usage.sourceReported.';
+
 const NOTE_NO_TOOL_ACTIVITY =
   'No tool execution was observed for this session; counts exclude any work that happened before the plugin was loaded.';
 const NOTE_NO_READS = 'No read request was observed for this session.';
@@ -154,6 +174,41 @@ function emptyUsageFieldCounts(): Record<UsageField, number> {
   return { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
 }
 
+function emptyUsageFieldValues(): Record<UsageField, number | undefined> {
+  return {
+    input: undefined,
+    output: undefined,
+    reasoning: undefined,
+    cacheRead: undefined,
+    cacheWrite: undefined,
+    cost: undefined,
+  };
+}
+
+/**
+ * Build one token/cost measurement from per-message records and V2 snapshots.
+ *
+ * - per-message records exist -> the sum of them, classified `calculated`
+ *   (an aggregate of measurements, never a direct reading);
+ * - no records but V2 snapshots exist -> `unavailable`, explaining that the
+ *   reported snapshots are preserved but not aggregated;
+ * - nothing at all -> `unavailable` with the caller's note (or the shared one).
+ */
+function tokenMeasurement(
+  reportedMessages: number,
+  summed: number,
+  sourceReported: SourceReportedUsageSummary | undefined,
+  emptyNote: string = NOTE_NO_USAGE_FIELD,
+): ObservationMeasurement<number> {
+  if (reportedMessages > 0) {
+    return calculated(summed);
+  }
+  if (sourceReported !== undefined && sourceReported.usableEvents > 0) {
+    return unavailable(NOTE_SOURCE_REPORTED_NOT_AGGREGATED);
+  }
+  return unavailable(emptyNote);
+}
+
 /** A tool call that started but whose completion has not been observed yet. */
 interface PendingCall {
   readonly tool: string;
@@ -186,9 +241,28 @@ interface SessionState {
   usageRegressionsObserved: number;
   messagesWithoutUsage: number;
   stepFinishPartsObserved: number;
+  /**
+   * V2 source-reported usage, preserved as reported and never accumulated.
+   *
+   * Kept separate from `usage` (the per-message map) because a V2 snapshot has no
+   * message identifier, so folding it into the message map would invent an
+   * attribution the source did not provide.
+   */
+  readonly sourceUsage: SourceUsageState;
   createdEvents: number;
   idleEvents: number;
   compactedEvents: number;
+}
+
+/** Mutable tracking for the V2 source-reported usage series of one session. */
+interface SourceUsageState {
+  events: number;
+  usableEvents: number;
+  readonly reportedByField: Record<UsageField, number>;
+  latest: SessionUsageSnapshot | undefined;
+  latestAt: number;
+  monotonicNonDecreasing: boolean;
+  decreasesObserved: number;
 }
 
 function createSessionState(sessionId: string, at: number): SessionState {
@@ -218,6 +292,15 @@ function createSessionState(sessionId: string, at: number): SessionState {
     usageRegressionsObserved: 0,
     messagesWithoutUsage: 0,
     stepFinishPartsObserved: 0,
+    sourceUsage: {
+      events: 0,
+      usableEvents: 0,
+      reportedByField: emptyUsageFieldCounts(),
+      latest: undefined,
+      latestAt: 0,
+      monotonicNonDecreasing: true,
+      decreasesObserved: 0,
+    },
     createdEvents: 0,
     idleEvents: 0,
     compactedEvents: 0,
@@ -242,8 +325,14 @@ export class OpenCodeObserver {
   readonly #onDiagnostic: ((diagnostic: ObserverDiagnostic) => void) | undefined;
   readonly #adapterRevision: string;
   readonly #pluginApi: ObserverPluginApiIdentity;
+  readonly #checkpointIntervalMs: number;
   readonly #sessions = new Map<string, SessionState>();
   readonly #recentDiagnostics: ObserverDiagnostic[] = [];
+  /** Sessions changed since their last write, awaiting a checkpoint. */
+  readonly #dirtySessions = new Set<string>();
+  #checkpointTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Serializes sink writes so append order matches schedule order. */
+  #writeChain: Promise<void> = Promise.resolve();
   #sink: ObservationSink | undefined;
   #enabled: boolean;
   #disposed = false;
@@ -261,6 +350,11 @@ export class OpenCodeObserver {
     this.#hash = options.hash ?? defaultHash;
     this.#adapterRevision = options.adapterRevision ?? OBSERVER_ADAPTER_REVISION;
     this.#pluginApi = { ...(options.pluginApi ?? DEFAULT_OBSERVER_PLUGIN_API) };
+    const interval = options.checkpointIntervalMs;
+    this.#checkpointIntervalMs =
+      typeof interval === 'number' && Number.isInteger(interval) && interval >= 0
+        ? interval
+        : DEFAULT_CHECKPOINT_INTERVAL_MS;
 
     const env = options.env ?? readProcessEnv();
     this.#sink = options.sink ?? resolveEnvironmentSink(env);
@@ -384,6 +478,8 @@ export class OpenCodeObserver {
   /** Forget all retained state without disposing the observer. */
   clear(): void {
     this.#sessions.clear();
+    this.#dirtySessions.clear();
+    this.#clearCheckpointTimer();
   }
 
   /**
@@ -395,17 +491,22 @@ export class OpenCodeObserver {
     if (this.#disposed) {
       return;
     }
+    this.#clearCheckpointTimer();
+    this.#disposed = true;
     const pending = [...this.#sessions.values()];
     try {
       for (const state of pending) {
         await this.#flush(state);
       }
+      // Wait for every queued write, so a caller that awaits dispose() knows the
+      // summaries have actually reached the sink.
+      await this.#writeChain;
     } catch {
       this.noteInternalFailure();
     }
     this.#sessionsClosed += pending.length;
     this.#sessions.clear();
-    this.#disposed = true;
+    this.#dirtySessions.clear();
     this.#diagnose('observer-disposed');
   }
 
@@ -605,6 +706,7 @@ export class OpenCodeObserver {
     state.pending.set(callId, { tool });
     bump(state.toolStarted, tool);
     this.#trimPendingCalls(state);
+    this.#markDirty(state);
   }
 
   #trimPendingCalls(state: SessionState): void {
@@ -658,6 +760,7 @@ export class OpenCodeObserver {
     if (completedTool === READ_TOOL_ID && pending === undefined) {
       this.#accountReadRequest(state, callId, asRecord(inputRecord?.['args']));
     }
+    this.#markDirty(state);
   }
 
   #accountReadRequest(state: SessionState, callId: string, args: unknown): void {
@@ -711,6 +814,7 @@ export class OpenCodeObserver {
         this.#diagnose('message-usage-limit-reached');
       }
       state.usage.set(snapshot.messageId, snapshot);
+      this.#markDirty(state);
       return;
     }
     const merged = mergeUsageSnapshots(previous, snapshot);
@@ -719,6 +823,7 @@ export class OpenCodeObserver {
       state.usageRegressionsObserved += 1;
       this.#diagnose('usage-update-regression');
     }
+    this.#markDirty(state);
   }
 
   async #handleEvent(input: unknown): Promise<void> {
@@ -729,7 +834,10 @@ export class OpenCodeObserver {
       return;
     }
     this.#eventsObserved += 1;
-    const properties = asRecord(event['properties']);
+    // V1 delivers event payloads under `properties`; V2 delivers them under `data`
+    // (runtime-confirmed in Stage 1G). `properties` wins when both are present so
+    // V1 behaviour is bit-for-bit unchanged.
+    const properties = asRecord(event['properties']) ?? asRecord(event['data']);
 
     switch (type) {
       case 'message.updated': {
@@ -751,6 +859,40 @@ export class OpenCodeObserver {
           return;
         }
         this.#eventsIgnored += 1;
+        return;
+      }
+      case OPENCODE_V2_USAGE_EVENT_TYPE: {
+        const extraction = extractSessionUsage(properties);
+        if (extraction.kind === 'ignored') {
+          const sessionId = readIdentifier(properties?.['sessionID']);
+          const state = sessionId === undefined ? undefined : this.#session(sessionId);
+          if (state !== undefined && extraction.reason === 'no-usage-fields') {
+            this.#touch(state);
+            state.sourceUsage.events += 1;
+            state.usageUpdatesIgnored += 1;
+            this.#diagnose('usage-update-ignored');
+            this.#markDirty(state);
+            return;
+          }
+          this.#eventsIgnored += 1;
+          return;
+        }
+        const state = this.#session(extraction.snapshot.sessionId);
+        this.#touch(state);
+        this.#recordSourceUsage(state, extraction.snapshot);
+        return;
+      }
+      case OPENCODE_V2_EXECUTION_SUCCEEDED_EVENT_TYPE: {
+        // A flush trigger only: writing a summary makes no behavioural claim, and
+        // this event is deliberately not counted as a V1 `session.idle`.
+        const sessionId = readIdentifier(properties?.['sessionID']);
+        const state = sessionId === undefined ? undefined : this.#sessions.get(sessionId);
+        if (state === undefined) {
+          this.#eventsIgnored += 1;
+          return;
+        }
+        this.#touch(state);
+        await this.#flush(state);
         return;
       }
       case 'message.part.updated': {
@@ -821,6 +963,7 @@ export class OpenCodeObserver {
         }
         this.#touch(state);
         state.compactedEvents += 1;
+        this.#markDirty(state);
         return;
       }
       case 'session.deleted': {
@@ -847,15 +990,140 @@ export class OpenCodeObserver {
     }
   }
 
+  /**
+   * Write one session summary to the sink, serialized behind earlier writes.
+   *
+   * Serializing keeps append order equal to schedule order, so a consumer that
+   * takes the last line per session can never see a stale summary win a race. A
+   * failure is contained and reported as `sink-failed`.
+   */
   async #flush(state: SessionState): Promise<void> {
     const sink = this.#sink;
     if (sink === undefined) {
       return;
     }
+    this.#dirtySessions.delete(state.sessionId);
+    const write = async (): Promise<void> => {
+      try {
+        await sink(this.#summarizeState(state));
+      } catch {
+        this.#diagnose('sink-failed');
+      }
+    };
+    const chained = this.#writeChain.then(write, write);
+    this.#writeChain = chained.catch(() => undefined);
+    await chained;
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Checkpoint persistence                                                */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Remember that a session changed since its last write.
+   *
+   * Does nothing when no sink is configured: with no sink the observer writes
+   * nothing at all, which is the default and must stay true.
+   */
+  #markDirty(state: SessionState): void {
+    if (this.#sink === undefined || this.#disposed) {
+      return;
+    }
+    this.#dirtySessions.add(state.sessionId);
+    this.#scheduleCheckpoint();
+  }
+
+  /**
+   * Schedule the next checkpoint write.
+   *
+   * A one-shot OpenCode session can be terminated before any unload path runs, so
+   * waiting for lifecycle events or `dispose()` would lose the summary entirely
+   * (observed in Stage 1G). One timer per interval, only while a session is
+   * dirty, keeps the write rate bounded regardless of how busy the session is.
+   */
+  #scheduleCheckpoint(): void {
+    if (this.#checkpointTimer !== undefined || this.#checkpointIntervalMs === 0) {
+      return;
+    }
     try {
-      await sink(this.#summarizeState(state));
+      const timer = setTimeout(() => {
+        this.#checkpointTimer = undefined;
+        void this.#checkpoint();
+      }, this.#checkpointIntervalMs);
+      // Never keep the host process alive just to checkpoint.
+      (timer as { unref?: () => void }).unref?.();
+      this.#checkpointTimer = timer;
     } catch {
-      this.#diagnose('sink-failed');
+      // A host without timers simply gets flush-on-lifecycle behaviour.
+      this.#checkpointTimer = undefined;
+    }
+  }
+
+  #clearCheckpointTimer(): void {
+    const timer = this.#checkpointTimer;
+    if (timer === undefined) {
+      return;
+    }
+    this.#checkpointTimer = undefined;
+    try {
+      clearTimeout(timer);
+    } catch {
+      // Ignore: clearing a timer is best effort.
+    }
+  }
+
+  /** Write every changed session, then stop. Never throws. */
+  async #checkpoint(): Promise<void> {
+    if (this.#sink === undefined) {
+      return;
+    }
+    const ids = [...this.#dirtySessions];
+    for (const sessionId of ids) {
+      const state = this.#sessions.get(sessionId);
+      if (state === undefined) {
+        this.#dirtySessions.delete(sessionId);
+        continue;
+      }
+      try {
+        await this.#flush(state);
+      } catch {
+        this.noteInternalFailure();
+      }
+    }
+    if (this.#dirtySessions.size > 0) {
+      this.#scheduleCheckpoint();
+    }
+  }
+
+  /** Record a V2 source-reported usage snapshot. Never accumulates. */
+  #recordSourceUsage(state: SessionState, snapshot: SessionUsageSnapshot): void {
+    const tracking = state.sourceUsage;
+    tracking.events += 1;
+    tracking.usableEvents += 1;
+    for (const field of USAGE_FIELDS) {
+      if (snapshot[field] !== undefined) {
+        tracking.reportedByField[field] += 1;
+      }
+    }
+    const previous = tracking.latest;
+    if (previous !== undefined) {
+      const comparison = compareSessionUsage(previous, snapshot);
+      if (comparison.decreasedFields > 0) {
+        tracking.decreasesObserved += comparison.decreasedFields;
+        tracking.monotonicNonDecreasing = false;
+        this.#diagnose('usage-update-regression');
+      }
+    }
+    tracking.latest = snapshot;
+    tracking.latestAt = this.#timestamp();
+    this.#markDirty(state);
+    // Usage arrives about once per model step — low frequency, and the most
+    // valuable thing a summary carries. Waiting for the next checkpoint interval
+    // loses it whenever the host is terminated first, which is exactly what a
+    // one-shot `run` does (observed in Stage 1H). The write is queued and never
+    // awaited into the event path, so the host pays no latency for it.
+    if (this.#sink !== undefined && !this.#disposed) {
+      void this.#flush(state);
     }
   }
 
@@ -904,6 +1172,24 @@ export class OpenCodeObserver {
       }
     }
 
+    const sourceUsage = state.sourceUsage;
+    const sourceReported: SourceReportedUsageSummary | undefined =
+      sourceUsage.events === 0
+        ? undefined
+        : {
+            events: sourceUsage.events,
+            usableEvents: sourceUsage.usableEvents,
+            reportedByField: { ...sourceUsage.reportedByField },
+            latest:
+              sourceUsage.latest === undefined
+                ? emptyUsageFieldValues()
+                : sessionUsageFields(sourceUsage.latest),
+            latestObservedAt: sourceUsage.latestAt === 0 ? 'never' : this.#isoAt(sourceUsage.latestAt),
+            aggregation: 'unverified',
+            monotonicNonDecreasing: sourceUsage.monotonicNonDecreasing,
+            decreasesObserved: sourceUsage.decreasesObserved,
+          };
+
     const usage: UsageObservationSummary = {
       messagesWithUsage: state.usage.size,
       messagesWithoutUsage: state.messagesWithoutUsage,
@@ -912,6 +1198,7 @@ export class OpenCodeObserver {
       usageRegressionsObserved: state.usageRegressionsObserved,
       stepFinishPartsObserved: state.stepFinishPartsObserved,
       reportedByField,
+      sourceReported,
     };
 
     const counts: SessionObservationCounts = {
@@ -940,27 +1227,37 @@ export class OpenCodeObserver {
       distinctReadTargets: calculated(reads.distinctTargets),
       repeatedReadTargets: calculated(reads.repeatedTargets),
       repeatedFileReads: calculated(reads.repeatedRequests),
-      inputTokens:
-        reportedByField.input > 0
-          ? calculated(summedByField.input)
-          : unavailable(NOTE_NO_USAGE_FIELD),
-      outputTokens:
-        reportedByField.output > 0
-          ? calculated(summedByField.output)
-          : unavailable(NOTE_NO_USAGE_FIELD),
-      reasoningTokens:
-        reportedByField.reasoning > 0
-          ? calculated(summedByField.reasoning)
-          : unavailable(NOTE_NO_USAGE_FIELD),
-      cacheReadTokens:
-        reportedByField.cacheRead > 0
-          ? calculated(summedByField.cacheRead)
-          : unavailable(NOTE_NO_USAGE_FIELD),
-      cacheWriteTokens:
-        reportedByField.cacheWrite > 0
-          ? calculated(summedByField.cacheWrite)
-          : unavailable(NOTE_NO_USAGE_FIELD),
-      cost: reportedByField.cost > 0 ? calculated(summedByField.cost) : unavailable(NOTE_COST_NOT_REPORTED),
+      // A session aggregate is only ever the sum of *per-message* records. When
+      // the runtime reported V2 session snapshots instead, no aggregate is
+      // derived from them: the meaning of the series is unverified, so the
+      // numbers stay available only as reported snapshots (usage.sourceReported)
+      // and the metrics say so rather than being promoted.
+      inputTokens: tokenMeasurement(
+        reportedByField.input,
+        summedByField.input,
+        sourceReported,
+      ),
+      outputTokens: tokenMeasurement(
+        reportedByField.output,
+        summedByField.output,
+        sourceReported,
+      ),
+      reasoningTokens: tokenMeasurement(
+        reportedByField.reasoning,
+        summedByField.reasoning,
+        sourceReported,
+      ),
+      cacheReadTokens: tokenMeasurement(
+        reportedByField.cacheRead,
+        summedByField.cacheRead,
+        sourceReported,
+      ),
+      cacheWriteTokens: tokenMeasurement(
+        reportedByField.cacheWrite,
+        summedByField.cacheWrite,
+        sourceReported,
+      ),
+      cost: tokenMeasurement(reportedByField.cost, summedByField.cost, sourceReported, NOTE_COST_NOT_REPORTED),
       totalTokens: unavailable(NOTE_TOTAL_TOKENS_NOT_DERIVED),
     };
 

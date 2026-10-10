@@ -84,10 +84,20 @@ export {
   isUsableSummaryPath,
   resolveEnvironmentSink,
 } from './sink.js';
+export { compareSessionUsage, extractSessionUsage, sessionUsageFields } from './usage.js';
+export type {
+  SessionUsageComparison,
+  SessionUsageExtraction,
+  SessionUsageIgnoredReason,
+  SessionUsageSnapshot,
+} from './usage.js';
 export {
+  DEFAULT_CHECKPOINT_INTERVAL_MS,
   DEFAULT_OBSERVATION_LIMITS,
   DEFAULT_OBSERVER_PLUGIN_API,
   IMPLEMENTED_HOOKS,
+  OPENCODE_V2_EXECUTION_SUCCEEDED_EVENT_TYPE,
+  OPENCODE_V2_USAGE_EVENT_TYPE,
   OBSERVATION_NOTES,
   OBSERVATION_SCHEMA_VERSION,
   OBSERVER_ADAPTER_NAME,
@@ -143,7 +153,9 @@ export type {
   SessionObservationCounts,
   SessionObservationMeasurements,
   SessionObservationSummary,
+  SourceReportedUsageSummary,
   ToolFrequencyEntry,
+  UsageAggregationSemantics,
   UsageField,
   UsageObservationSummary,
 } from './types.js';

@@ -59,6 +59,11 @@ export interface ObservationHarness {
     result?: { readonly title?: string; readonly output?: string; readonly metadata?: unknown },
   ) => Promise<void>;
   readonly event: (type: string, properties?: unknown) => Promise<void>;
+  /**
+   * Deliver a V2-shaped event, whose payload lives under `data` rather than
+   * `properties` (runtime-confirmed in Stage 1G).
+   */
+  readonly v2Event: (type: string, data?: unknown) => Promise<void>;
   readonly summary: (sessionID: string) => SessionObservationSummary;
 }
 
@@ -110,6 +115,7 @@ export async function createObservationHarness(
         },
       ),
     event: (type, properties) => hooks.event({ event: { type, properties } }),
+    v2Event: (type, data) => hooks.event({ event: { type, data } }),
     summary,
   };
 }

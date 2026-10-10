@@ -1,10 +1,11 @@
-# OpenCode Desktop validation (Stage 1E → Stage 1G)
+# OpenCode Desktop validation (Stage 1E → Stage 1H)
 
-**Status (Stage 1G, 2026-10-10): LIVE HOOK VALIDATION COMPLETED.** The V2 adapter added in Stage 1F
-(the V2 line) was loaded by the real OpenCode Desktop 2.0.24 runtime and its tool hooks **fired on real
-tool executions**. Two genuine V2-vs-V1 differences were found; one is fixed and re-validated live, the
-other is documented but not implemented. §1–§14 below are the Stage 1E record, kept as written (they
-remain accurate for the V1 adapter that stage could not load); **§15 is the Stage 1G live result.**
+**Status (Stage 1H, 2026-10-10): LIVE HOOK, USAGE AND ONE-SHOT-PERSISTENCE VALIDATION COMPLETED.** The
+V2 adapter was loaded by the real OpenCode Desktop 2.0.24 runtime; its tool hooks fired on real tool
+executions, and it now also **records the runtime's own token/cost snapshots** and **persists a summary
+during a one-shot session**. §1–§14 are the Stage 1E record, kept as written (they remain accurate for
+the V1 adapter that stage could not load); **§15 is the Stage 1G live result** and **§16 is the Stage 1H
+live result**, which also found and fixed the reason Stage 1G saw no usage data at all.
 
 **Date:** 2026-10-10 · **Platform:** Windows 11 · **Stage 1D base commit:** `3bb0943` · **Stage 1F commit:** `e7e0f89`
 
@@ -443,3 +444,181 @@ models listed as **Free** in OpenCode's published Console pricing, in a disposab
 synthetic files. One transient auto-generated server password was printed to this session's log when a
 private `serve` was started for diagnosis; that server is stopped, the value was never used, and it is
 not reproduced here. **No token saving is claimed, and none was measured.**
+
+---
+
+## 16. Stage 1H — V2 usage events and reliable summary persistence (runtime-tested)
+
+Stage 1H set out to close the two deficiencies Stage 1G left open: the adapter did not consume
+`session.usage.updated`, and the opt-in summary sink could lose everything in a one-shot session.
+Both are fixed, and both fixes are **runtime-validated** on OpenCode Desktop 2.0.24.
+
+### 16.1 Root causes
+
+1. **Every V2 event arrived empty.** `asRuntimeEvent` in
+   [`src/plugin-v2.ts`](../integrations/opencode/src/plugin-v2.ts) forwarded `type` and
+   `properties` and **dropped `data`** — and V2 delivers an event body under `data`. The observer's
+   `session.usage.updated` handler was correct all along; it never received a payload. Stage 1G
+   missed it because both its tests and its live harness handed events to the observer's *V1-shaped*
+   hook and skipped the normaliser entirely.
+2. **The tail of a one-shot session was lost.** The only durability path was a periodic checkpoint
+   (default 1000 ms) plus unload, and a one-shot host is killed before unload runs. In Stage 1G's
+   run the last write preceded the usage events, so the session's only numbers never reached disk.
+3. **Found while fixing (runtime):** with `data` preserved, `session.created`/`session.deleted` are
+   delivered but still do not map, because V2 does not use the V1 `properties.info.id` layout
+   (§16.7). The payload now arrives; the mapping is the next step.
+
+### 16.2 The change set
+
+| File | Change |
+| --- | --- |
+| [`src/types-v2.ts`](../integrations/opencode/src/types-v2.ts) | `OpenCodeV2Event` declares `data`; the V1/V2 payload-carrier difference is documented on the type |
+| [`src/plugin-v2.ts`](../integrations/opencode/src/plugin-v2.ts) | `asRuntimeEvent` preserves `data` **and** `properties` (precedence decided downstream, V1 first) |
+| [`src/observer.ts`](../integrations/opencode/src/observer.ts) | A `session.usage.updated` snapshot is flushed immediately (queued, never awaited into the event path), on top of the existing periodic checkpoint |
+| [`src/sink.ts`](../integrations/opencode/src/sink.ts) | The JSONL sink closes a torn final record before appending, so an interrupted write cannot corrupt the next one; the append-only contract is kept (no temp-file rename) |
+
+No optimisation, rewriting, compression or telemetry was added. Nothing in the observation path can
+change what OpenCode does: writes are `void`-scheduled behind the existing serialising write chain and
+every failure is contained as a `sink-failed` diagnostic.
+
+### 16.3 The live run
+
+One synthetic session, in the disposable project, driven by the bundled CLI:
+
+```
+opencode-cli.exe run --standalone --print-logs --auto --title "Dr. Token Stage 1H validation" \
+  -m opencode/longcat-2.5-preview-free \
+  "Use the read tool to read the file fixtures/repeated-content.json twice with the default range.\n   Do not summarise the file. Then reply exactly: DONE."
+```
+
+Result: exit **0**, reply **`DONE.`**, host log `→ Read fixtures/repeated-content.json` **twice**.
+The title was supplied explicitly so OpenCode's own title generation could not make a second call.
+
+### 16.4 Observed results
+
+| Check | Observed |
+| --- | --- |
+| Plugin instance per process | `setup:start` ×1, `registered:execute.before` ×1, `registered:execute.after` ×1, `subscribed:events` ×1 |
+| Hooks fire on real tool calls | `FIRED:execute.before tool=read` ×2, `FIRED:execute.after tool=read status=completed` ×2 |
+| Correlation | `toolStartsObserved 2, toolCompletionsObserved 2, correlatedCompletions 2, pendingCalls 0` |
+| Repeated read | `requests 2, identifiedRequests 2, unidentifiedRequests 0, distinctTargets 1, repeatedTargets 1, repeatedRequests 1` |
+| **V2 usage recorded** | `usage.sourceReported.events 2`, `usableEvents 2`, `latest {input 849, output 45, reasoning 94, cacheRead 8960, cacheWrite 0, cost 0}` |
+| Evidence class | `inputTokens … evidence "unavailable"` with the source-reported note; `totalTokens` `unavailable`; **no aggregate derived** |
+| `latest` vs the runtime's own record | the last snapshot **equals** the session export's totals exactly (all five fields) |
+| Fail-open | `internalErrors 0`; the unobserved V2 vocabulary (`session.step.*`, `session.tool.*`, …) is ignored |
+| One-shot persistence | **3 summary lines on disk** for that session, written while it ran, with `cleanup:start` never logged |
+
+### 16.5 Aggregation semantics: what is now known
+
+The event series is a **running session total**, not a per-request increment:
+
+| Session | Last snapshot | Runtime's stored totals | Sum of final per-message records |
+| --- | --- | --- | --- |
+| Stage 1H (LongCat, 2 events) | 849 / 45 / 94 / 8960 | 849 / 45 / 94 / 8960 | 849 / 45 / 94 / 8960 |
+| Stage 1G (3 events) | 897 / 84 / 176 / 9472 | 897 / 84 / 176 / 9472 | 857 / 78 / 102 / 8960 |
+
+Under an increment reading the final event would be one step's delta, not the whole session. In both
+sessions the last event equalled the totals the runtime itself stored; in the Stage 1G session those
+totals also **exceed** the sum of the retained per-message records, so the running total counts more
+than the final messages.
+
+This is an observation of two sessions on one host version, **not a published contract**, so the
+adapter still emits `aggregation: "unverified"`, still preserves only the source's own numbers under
+`usage.sourceReported.latest`, and still derives **no** session aggregate from them. `monotonicNonDecreasing`
+and `decreasesObserved` remain the in-band evidence a consumer can rely on.
+
+### 16.6 One-shot persistence: the live proof
+
+`observations.jsonl` after the run (one session, `ses_eda6b294…`):
+
+| Line | Written by | `sourceReported.events` | `latest.input` |
+| --- | --- | --- | --- |
+| 1 | immediate flush on usage event 1 | 1 | 296 |
+| 2 | immediate flush on usage event 2 | 2 | **849** |
+| 3 | the periodic checkpoint, still running | 2 | 849 |
+
+The host process was terminated **without ever running the plugin's cleanup** (`cleanup:start` is
+absent from the marker file), which is exactly the case Stage 1G lost. The file ends with a newline
+and every line parses as JSON. Line 2 is the whole point: durability no longer depends on unload, and
+the last numbers reached disk within the session itself.
+
+`checkpointIntervalMs: 0` disables the periodic timer only — an arriving usage snapshot is still
+written. That is deliberate and pinned by a test.
+
+### 16.7 V2 event vocabulary and remaining mapping gaps
+
+A zero-cost window against the same host (a plugin instance loaded by the Desktop background service)
+recorded event **names** and **payload key names only** — never a value:
+
+| Event | `data` keys | Adapter |
+| --- | --- | --- |
+| `session.usage.updated` | `cost, sessionID, tokens` | **consumed** (validated) |
+| `session.step.ended` | `assistantMessageID, cost, finish, rawFinish, sessionID, tokens` | ignored (per-step usage; would double count if pooled) |
+| `session.tool.called`, `session.tool.success` | `assistantMessageID, executed, id, input, sessionID, …` | ignored — the V2-native tool signal, not used |
+| `session.execution.started` | `sessionID` | ignored |
+| `session.created`, `session.deleted` | *(not captured — see below)* | **received but unmapped** |
+| `model/provider/agent/command/skill/reference/plugin/websearch/integration.updated` | `{}` | ignored (correct: nothing to read) |
+
+`session.created` was delivered with its payload under `data` and produced a `hook-input-unusable`
+diagnostic: it does not carry the V1 `info.id` layout the handler reads, so no session was registered
+from it. `session.deleted` was counted as ignored for the same reason. Both are genuinely received now
+(the Stage 1H fix) — only the field mapping is open, and it is left unmapped rather than guessed.
+
+Also observed: **`session.execution.succeeded` was not delivered** in the one-shot run (only
+`session.execution.started`), so the flush trigger registered for it did not fire. Durability in that
+run came from the usage-snapshot flush and the interval checkpoint — which is why the tail survived a
+host that never unloaded.
+
+### 16.8 The reported duplicate plugin entry
+
+Investigated because duplicate registration would double-count everything. **No duplicate is
+reproducible:**
+
+- `opencode plugin list` and `plugin list --builtin` each show **exactly one** `dr-token-observer`
+  row; running the same command from the repository root reports `No plugins found`.
+- Per process, the marker file shows **one** `setup:start`, **one** registration per hook name and
+  **one** `subscribed:events`. Two `setup` sequences exist only across *different pids* — a private
+  one-shot server and the Desktop background service, each loading its own project plugin.
+- Counts were checked against the host's own record: `toolStartsObserved 2` for the host's two read
+  calls, and the 2 usage events on disk for the 2 captured. The observer's `eventsObserved` (55 at the
+dump instant) counts subscription events **and** tool-hook calls — 52 + 4 minus one event still in
+  flight — so the two counters reconcile exactly with no double delivery.
+- The only place two plugin *files* exist in the disposable project is `.opencode/plugins-disabled/`
+  (Stage 1G's negative control), which is not a discovery path.
+
+Residual possibility, stated rather than dismissed: the Desktop **GUI's** plugin view may list one row
+per loaded instance (one per process), which would look like the same file twice. The CLI's list does
+not, and nothing is double-counted. Unrelated but adjacent: `opencode auth list` prints
+"OpenCode Console Personal" twice in this environment; that is a credential-store entry, untouched here.
+
+### 16.9 Blocked, and stopped deliberately
+
+A zero-cost attempt to drive lifecycle events through the already-running Desktop background service
+was **abandoned after the isolation check failed**. `api session.create` resolved the new session to
+`C:\Users\adeep`, not the disposable project, even though the command ran with the project as its
+working directory; the condition was therefore not met under which the work was authorized. Exactly
+that one session was deleted (`session.get` then returned `SessionNotFoundError`), and the disposable
+project's own session list was unchanged at 14 entries. The zero-cost evidence in §16.7 came from the
+service instance's own passive observation, not from that attempt.
+
+### 16.10 Still not runtime-verified
+
+- **V2 session lifecycle mapping** (§16.7) — the concrete next action is to capture the `data` key
+  names for `session.created`/`session.deleted` and map them; a session created through the service
+  produced both events once, which is the cheapest way to capture them.
+- **Session separation across concurrent sessions.** Still blocked: a shared server requires the
+  password it auto-generates, and handling a service password is out of scope. Unit-tested only.
+- **GUI-driven sessions**, V2 read *range* parameter names, `id` stability across very long
+  sequences, and the mapping of `session.step.ended` usage (deliberately not pooled).
+- **Bypass** (`enabled:false` / `DR_TOKEN_OPENCODE_OBSERVER=off`) remains unit-tested only; no live
+disabled comparison was repeated in Stage 1H, and no code path that could affect execution changed.
+
+### 16.11 Security and cost
+
+One model call, on `opencode/longcat-2.5-preview-free`, verified **still listed Free**
+(input/output/cached-read = Free) from the published Console pricing immediately before the run, with
+its zero-retention / no-training note. No paid model was used; no credential, prompt, conversation or
+file content was read; global configuration was not modified; the Desktop service was not restarted or
+reconfigured. The two diagnostic servers started on loopback ports 4571/4572 (with a password supplied
+by this session's own environment, not the host's generated one) were stopped, and the log containing a
+transient auto-generated password was deleted. **No token saving is claimed, and none was measured.**

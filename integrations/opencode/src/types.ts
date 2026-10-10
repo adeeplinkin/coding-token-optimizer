@@ -103,6 +103,31 @@ export const IMPLEMENTED_HOOKS = [
 export type ImplementedHook = (typeof IMPLEMENTED_HOOKS)[number];
 
 /**
+ * V2 event carrying a session usage snapshot (observed in OpenCode 2.0.24).
+ *
+ * The payload is under `event.data`; V1 delivers usage under `event.properties`.
+ */
+export const OPENCODE_V2_USAGE_EVENT_TYPE = 'session.usage.updated';
+
+/**
+ * V2 event indicating a session execution finished (observed in OpenCode 2.0.24).
+ *
+ * Used only as a **flush trigger** so a summary reaches the sink promptly. It is
+ * deliberately not counted or classified: it is not known to be equivalent to
+ * V1's `session.idle`, and a write is not a claim about behaviour.
+ */
+export const OPENCODE_V2_EXECUTION_SUCCEEDED_EVENT_TYPE = 'session.execution.succeeded';
+
+/**
+ * Default interval between checkpoint writes when a sink is configured.
+ *
+ * A one-shot `run` session can be terminated before any unload path runs, so the
+ * observer also persists changed sessions periodically instead of relying on
+ * cleanup. `0` disables checkpointing and restores flush-on-lifecycle only.
+ */
+export const DEFAULT_CHECKPOINT_INTERVAL_MS = 1000;
+
+/**
  * Environment switch that disables the observer.
  *
  * Any of `off`, `false`, `0`, `no` or `disabled` (case-insensitive) disables
@@ -163,6 +188,13 @@ export interface OpenCodeToolExecuteAfterOutput {
 export interface OpenCodeRuntimeEvent {
   readonly type?: string;
   readonly properties?: unknown;
+  /**
+   * V2 event payload envelope, runtime-confirmed in Stage 1G.
+   *
+   * V1 delivers payloads under `properties`; V2 delivers them under `data`. Only
+   * one of the two is present on any given event.
+   */
+  readonly data?: unknown;
 }
 
 /** The `event` hook receives a single wrapper object. */
@@ -357,6 +389,50 @@ export interface ReadObservationSummary {
   readonly identityScheme: string;
 }
 
+/**
+ * How a V2 source-reported usage series may be interpreted.
+ *
+ * `unverified` is the only value this adapter currently emits.
+ */
+export type UsageAggregationSemantics = 'unverified';
+
+/**
+ * V2 source-reported usage for one session, preserved exactly as the source
+ * reported it.
+ *
+ * Stage 1G observed OpenCode 2.0.24 emitting `session.usage.updated` with
+ * `{ sessionID, cost, tokens: { input, output, reasoning, cache: { read, write } } }`
+ * under `event.data`. The payload carries no message identifier, so it cannot be
+ * attributed to a message the way a V1 `message.updated` record can, and it is
+ * not accumulated into any session aggregate: whether each event is an
+ * increment, a cumulative total, or a per-request snapshot is **unverified**.
+ *
+ * `latest` therefore holds the most recent numbers exactly as reported — it is a
+ * snapshot, not a total — and `aggregation` says so explicitly.
+ */
+export interface SourceReportedUsageSummary {
+  /** `session.usage.updated` events observed for this session. */
+  readonly events: number;
+  /** Of those, how many carried at least one usable field. */
+  readonly usableEvents: number;
+  /** Events reporting a usable value for each field. */
+  readonly reportedByField: Readonly<Record<UsageField, number>>;
+  /** The most recent reported value per field; `undefined` when absent. */
+  readonly latest: Readonly<Record<UsageField, number | undefined>>;
+  /** ISO timestamp of the most recent usable snapshot, or `never` if none. */
+  readonly latestObservedAt: string;
+  /** Static: the meaning of the series is not established. */
+  readonly aggregation: UsageAggregationSemantics;
+  /**
+   * True while no field has ever reported a lower value than an earlier
+   * snapshot. A decrease is evidence *against* cumulative semantics; the
+   * absence of one does not prove cumulative semantics.
+   */
+  readonly monotonicNonDecreasing: boolean;
+  /** How many field-level decreases were observed. */
+  readonly decreasesObserved: number;
+}
+
 /** Usage counters for a session. */
 export interface UsageObservationSummary {
   /** Distinct assistant message ids with a recorded usage record. */
@@ -373,6 +449,8 @@ export interface UsageObservationSummary {
   readonly stepFinishPartsObserved: number;
   /** Messages reporting a usable value for each field. */
   readonly reportedByField: Readonly<Record<UsageField, number>>;
+  /** V2 source-reported usage, or `undefined` when the runtime reported none. */
+  readonly sourceReported: SourceReportedUsageSummary | undefined;
 }
 
 /** Session lifecycle counters relevant to interpreting the other numbers. */
@@ -587,6 +665,13 @@ export interface ObserverOptions {
    * Defaults to V1, so an existing caller's summaries are unchanged.
    */
   readonly pluginApi?: ObserverPluginApiIdentity;
+  /**
+   * Milliseconds between checkpoint writes of changed sessions, when a sink is
+   * configured. Defaults to {@link DEFAULT_CHECKPOINT_INTERVAL_MS}; `0` disables
+   * checkpointing. Ignored entirely when no sink is configured, because the
+   * observer then writes nothing at all.
+   */
+  readonly checkpointIntervalMs?: number;
 }
 
 /** Static caveats attached to every observation summary. */

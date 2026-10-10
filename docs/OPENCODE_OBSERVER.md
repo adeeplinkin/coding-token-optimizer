@@ -349,23 +349,35 @@ npx vitest run --project opencode          # (not configured) — use the worksp
 cd integrations/opencode && npx vitest run # observer package only
 ```
 
-The observer suite has **159 tests** in 8 files:
+The observer suite has **257 tests** in 14 files:
 
 | File | Tests | Covers |
 | --- | --- | --- |
 | `tests/observer.test.ts` | 77 | hooks, correlation, frequency, repeats, sessions, duplicates, malformed input, usage, bypass, fail-open, immutability, cleanup, bounds, privacy |
-| `tests/read.test.ts` | 19 | read identity, ranges, normalization, malformed arguments, hashing |
-| `tests/usage.test.ts` | 15 | usage extraction, validation, merge semantics |
+| `tests/read.test.ts` | 26 | read identity, ranges (V1 and V2 argument names), normalization, malformed arguments, hashing |
+| `tests/plugin-v2-events.test.ts` | 19 | the **real V2 plugin** driven by a minimal V2 host: raw `{id, created, type, data}` envelopes, `data` payload preservation, session association, tool hooks, abort/cleanup, one-shot writes |
+| `tests/plugin-v2.test.ts` | 18 | V2 tool-hook translation, capability handling, containment |
+| `tests/usage.test.ts` | 15 | V1 usage extraction, validation, merge semantics |
+| `tests/benchmark-integration.test.ts` | 15 | Stage 1B metric mapping and comparison behaviour |
+| `tests/checkpoint.test.ts` | 15 | persistence during observation, bounded write rate, torn-tail repair, failing sink, unwritable path |
+| `tests/usage-v2.test.ts` | 14 | V2 snapshot extraction, numeric rules, series comparison |
 | `tests/plugin.test.ts` | 13 | entry point, `opencode.json` options, containment |
+| `tests/observer-v2-usage.test.ts` | 12 | V2 usage at the observer level: identity, duplicates, decreases, no fabricated totals |
 | `tests/source-guard.test.ts` | 10 | no network/logging/subprocess/fs, dependency hygiene |
-| `tests/benchmark-integration.test.ts` | 9 | Stage 1B metric mapping and comparison behaviour |
 | `tests/plugin-api-contract.test.ts` | 8 | compiled contract check against the published V1 types |
 | `tests/sink.test.ts` | 8 | opt-in sink behaviour and failure containment |
+| `tests/plugin-v2.contract.test.ts` | 7 | compiled contract check against the published V2 types |
 
 Every observer test drives the adapter through the **real plugin hooks** (the interface
 OpenCode calls), with deterministic mocked events, a fixed clock and an isolated
 environment. No test performs a network request, a model call, or a write outside a
 temporary directory.
+
+One lesson is deliberately encoded in that table. Stage 1G's tests (and its live harness)
+handed events to the observer's **V1-shaped** hook, so they never exercised the V2
+normaliser — and the dropped `data` payload survived them all. `tests/plugin-v2-events.test.ts`
+closes that layer: it builds a V2 host (`tests/v2-host.ts`), runs the adapter's real `setup`,
+and pushes runtime-shaped envelopes through the same subscription the server uses.
 
 ## 12. How to inspect observation results
 
@@ -477,7 +489,7 @@ when quoting it.
   exceptions (so hooks must never throw).
 - That the V2 plugin API is a different, unreleased contract.
 
-### Unit-tested adapter behaviour (`npm test`, 159 tests)
+### Unit-tested adapter behaviour (`npm test`, 257 observer tests in `integrations/opencode`)
 
 - Plugin initialization and hook surface; tool execution counting; before/after
   correlation; tool frequency; repeated identical reads; different ranges; separate
@@ -485,7 +497,14 @@ when quoting it.
   `message.updated` snapshots; missing cost/token data; measured-versus-calculated
   labelling; bypass; internal failure handling; non-modification of hook inputs and
   outputs; session cleanup and bounds; sensitive-data exclusion.
-- Compile-time satisfaction of the published V1 types (vendored contract fixture).
+- V2 event handling end-to-end through the real plugin: payloads carried under `data`, usage
+  snapshots routed to the session in the payload, V1 payloads still preferred when both are present,
+  hostile payloads contained, unknown event types ignored.
+- One-shot summary persistence: a summary reaches the sink while a session runs, with no dispose and
+  no lifecycle event, and a usage snapshot is written on arrival even with the periodic timer disabled.
+- Filesystem behaviour: torn-tail repair after an interrupted write, append-only JSONL integrity,
+  failing and unwritable sinks reported as `sink-failed` without breaking observation.
+- Compile-time satisfaction of the published V1 **and** V2 types (vendored contract fixtures).
 - Source-level absence of network, logging, subprocess and filesystem paths.
 
 ### Runtime-tested OpenCode behaviour
@@ -504,18 +523,35 @@ absent installation. Stage 1D's own packaging was validated in the Desktop runti
 `dist/index.js` imported cleanly as ESM in Node, exposed all four V1 hook keys and has zero
 dependencies. Full evidence, procedures and limitations: [docs/OPENCODE_DESKTOP_VALIDATION.md](OPENCODE_DESKTOP_VALIDATION.md).
 
-Not yet observed, and treated as unverified:
+**Stage 1G/1H update (2026-10-10): it ran in a real runtime.** The V2 adapter was loaded by the
+Desktop's own bundled CLI 2.0.24, its tool hooks fired on real tool executions, and its observations
+matched the host's own record; since Stage 1H it also **records the runtime's own token/cost
+snapshots** and **writes a summary during a one-shot session that never unloads**. The live runs found
+two real defects that no unit test had caught (the V2 read argument name, and the dropped `data`
+payload), both fixed and re-validated live — see
+[§15](OPENCODE_DESKTOP_VALIDATION.md#15-stage-1g--live-v2-validation-runtime-tested) and
+[§16](OPENCODE_DESKTOP_VALIDATION.md#16-stage-1h--v2-usage-events-and-reliable-summary-persistence-runtime-tested).
+Still nothing is optimised, and no saving is claimed.
 
-- that OpenCode loads this plugin at all, and in which order relative to other plugins;
-- that the hook payloads match the published types in practice (in particular that a
-  `tool.execute.before` payload always carries `output.args`);
-- which providers populate `reasoning` and `cache.*`, and whether the message-level
-  token fields are cumulative across steps;
-- whether aborted or errored requests still publish final token counts;
-- whether the plugin observes only sessions belonging to its own project, or sessions
-  from other projects and other server clients (per-session keying is implemented, but
-  directory-level scoping is not);
-- real-world repeated-read rates and tool-call distributions.
+What was listed as unverified here is now partly settled, and partly superseded:
+
+- **Plugin loading and order** — observed: OpenCode loads it per process (one `setup`, one
+  registration per hook, one event subscription), and Stage 1G's live run recorded the host's own
+  `loading plugin … role=server` log line.
+- **Hook payloads in practice** — observed: `execute.before/after` carry `tool`, `sessionID`, `id`,
+  `input` and the completion `status`, with `input.path` as the read argument (not V1's `filePath`).
+- **Message-level cumulative token fields** — superseded: V2 delivers no `message.updated` events at
+  all. It publishes a session-level series (`session.usage.updated`) plus per-step
+  (`session.step.ended`) values; only the session series is consumed, and it was measured to behave
+  like a running session total (§18.6).
+- **Aborted or errored requests** — still unverified, and now known to matter: the flush trigger
+  registered for `session.execution.succeeded` **did not fire** in the live one-shot run, so no
+  durability guarantee rests on it (the usage-snapshot write and the periodic checkpoint carried it).
+- **Sessions from other projects** — still unverified. Per-session keying is implemented; directory
+  scoping is not, and the V2 lifecycle payload layout that would register a session is not yet mapped
+  (§18.7).
+- **Real-world repeated-read rates and tool-call distributions** — still unverified; the live samples
+  are a handful of synthetic two-read sessions.
 
 ### Unverified compatibility summary
 
@@ -688,8 +724,10 @@ Bypass is unchanged: `{ "enabled": false }` or `DR_TOKEN_OPENCODE_OBSERVER=off`.
 
 ### 18.5 V2 compatibility status
 
-Updated by Stage 1G, which exercised the adapter in the real OpenCode Desktop 2.0.24 bundled CLI
-([full record](OPENCODE_DESKTOP_VALIDATION.md#15-stage-1g--live-v2-validation-runtime-tested)).
+Updated by Stage 1G (live hooks) and Stage 1H (live usage + one-shot persistence) against the real
+OpenCode Desktop 2.0.24 bundled CLI
+([Stage 1G record](OPENCODE_DESKTOP_VALIDATION.md#15-stage-1g--live-v2-validation-runtime-tested),
+[Stage 1H record](OPENCODE_DESKTOP_VALIDATION.md#16-stage-1h--v2-usage-events-and-reliable-summary-persistence-runtime-tested)).
 
 | Capability | Source-confirmed | Unit-tested | Runtime-tested |
 | --- | --- | --- | --- |
@@ -697,28 +735,92 @@ Updated by Stage 1G, which exercised the adapter in the real OpenCode Desktop 2.
 | `ctx.tool.hook` registration + payload fields | ✅ (published d.ts) | ✅ | ✅ |
 | Tool-call observation and correlation | ✅ | ✅ | ✅ (2/2 correlated) |
 | Repeated-read identity and counting | ✅ | ✅ | ✅ (after the `path` fix below) |
-| Cleanup / registration disposal | ✅ | ✅ | ✅ |
+| Cleanup / registration disposal | ✅ | ✅ | ✅ (dispose on demand; a one-shot host is killed before it runs) |
 | Fail-open containment | ✅ | ✅ | ✅ (0 internal errors) |
-| `ctx.event.subscribe` item shape | ⚠️ docs only | ✅ (defensive) | ✅ (stream open, 40 events) |
+| `ctx.event.subscribe` item shape (payload under `data`) | ✅ | ✅ | ✅ (55 events delivered in one run) |
+| **V2 usage snapshots (`session.usage.updated`)** | ✅ | ✅ | ✅ (2 events, exact values, correct session) |
+| **One-shot summary persistence** (no unload required) | ✅ | ✅ | ✅ (final snapshot on disk, cleanup never ran) |
+| V2 session **lifecycle** mapping (`session.created`/`session.deleted`) | ⚠️ received, layout unknown | ❌ | ❌ received, unmapped — see §18.7 |
 | Bypass (`enabled:false` / env) | ✅ | ✅ | ❌ (unit-tested only) |
-| Token/usage fields in V2 | ✅ **now known** | ❌ not consumed | ❌ not consumed |
 
-Two V2-vs-V1 differences were found live:
+Three V2-vs-V1 differences were found live:
 
-1. **The read tool's path argument is `path`, not `filePath`** (runtime-confirmed). Fixed in
+1. **The read tool's path argument is `path`, not `filePath`** (Stage 1G, runtime-confirmed). Fixed in
    [`src/read.ts`](../integrations/opencode/src/read.ts) with regression tests; before the fix every V2
    read was counted as unidentified and repeated-read detection silently never fired.
-2. **V2 usage arrives as `session.usage.updated` with the payload under `data`, not `properties`.**
-   Token and cost fields exist with V1's names (`cost`, `tokens.input/output/reasoning`,
-   `tokens.cache.read/write`) but the observer matches V1 event names, so **V2 sessions currently
-   report no token data** — the fields stay `unavailable` and are never estimated. Mapping them is
-   Stage 1H work; the verified payload path is recorded in the validation doc.
+2. **V2 delivers an event body under `data`; V1 uses `properties`** (Stage 1H, runtime-confirmed —
+   and the reason Stage 1G saw no usage at all). `asRuntimeEvent` now preserves **both**, and the
+   observer prefers `properties`, so V1 behaviour is unchanged.
+3. **V2's lifecycle vocabulary is not V1's.** `session.created`/`session.deleted` are delivered with a
+   `data` payload that does not carry V1's `info.id` layout, so the counters stay at zero rather than
+   being guessed at (§18.7).
 
 V2 also emits an entirely different event vocabulary (`session.step.started`, `session.tool.called`,
-`session.reasoning.delta`, …), none of which overlaps V1. Unrecognised events are ignored, which is
-the intended fail-safe.
+`session.reasoning.delta`, `session.inbox.*`, `session.execution.*`, …), none of which overlaps V1.
+Unrecognised events are ignored, which is the intended fail-safe: they are counted and diagnosed, never
+mistaken for a token reading.
 
-### 18.6 Reproducing the live validation
+### 18.6 V2 usage events (implemented in Stage 1H)
+
+`session.usage.updated` carries `{ sessionID, cost, tokens: { input, output, reasoning, cache: { read,
+write } } }` under `event.data` — runtime-confirmed, and consumed from Stage 1H on.
+
+What the adapter does with it:
+
+- validates each value with the **same** rule the V1 path uses (finite, non-negative), so both lines
+  behave identically;
+- routes it to the session named by the payload, never to another session;
+- keeps it **separate** from the per-message usage map, because a session snapshot has no message
+  identifier and folding it in would invent an attribution;
+- preserves the numbers **as reported** in `usage.sourceReported` (`events`, `usableEvents`,
+  `reportedByField`, `latest`, `latestObservedAt`, `monotonicNonDecreasing`, `decreasesObserved`);
+- derives **no** session aggregate from them. `inputTokens`/`outputTokens`/… stay `unavailable` with a
+  note, and `totalTokens` is never derived, so a snapshot can never be promoted to a measurement;
+- writes the snapshot immediately when a sink is configured (§18.8).
+
+**Aggregation semantics.** Two live sessions showed the series behaving like a running session total:
+in both, the last snapshot equalled the totals the runtime itself stored for the session, which a
+per-request increment could not be. That is evidence, not a published contract, so `aggregation` stays
+`"unverified"` and only the source's own numbers are kept.
+
+### 18.7 Not implemented: V2 lifecycle and per-step usage
+
+- `session.created` / `session.deleted` are now **received** (their payload is under `data`), but the
+  layout does not match V1's `properties.info.id`, so the summary's lifecycle counters remain zero and
+  the event is diagnosed instead of guessed at. Capturing those key names is the concrete next step.
+- `session.step.ended` carries per-step `cost`/`tokens` and `session.tool.called`/`session.tool.success`
+  carry V2-native tool data. Neither is consumed: pooling per-step usage beside the session snapshot
+  would double count, and the tool hooks already provide the same observations.
+- `session.execution.succeeded` is registered as a flush trigger, but it was **not delivered** in the
+  live one-shot run, so no durability guarantee depends on it.
+
+### 18.8 Summary persistence (implemented in Stage 1H)
+
+A one-shot OpenCode session is killed before any unload path runs, so Stage 1G's summary never reached
+disk. With a sink configured, the observer now writes:
+
+| Trigger | Behaviour |
+| --- | --- |
+| A `session.usage.updated` snapshot | written **immediately** (queued, never awaited into the event path) — low frequency, highest-value content |
+| A dirty session + a timer | periodic checkpoint, `checkpointIntervalMs` (default 1000 ms, `unref`'d so it never keeps the host alive) — bounded write rate for busy tool traffic |
+| `session.idle` (V1) / `session.execution.succeeded` (V2, when delivered) | flush |
+| `session.deleted`, `dispose()` | flush, then release state |
+
+The JSONL sink appends one newline-terminated record per write, serialised behind a single write chain
+so the last complete line is always the newest summary. On its first write of a process it checks
+whether an earlier process was killed mid-record and closes that fragment with a newline first, so a
+torn write cannot corrupt the next record. This keeps the append-only contract: a temp-file-and-rename
+scheme would discard earlier sessions and, on Windows, fail when a reader holds the destination open.
+
+`checkpointIntervalMs: 0` disables the periodic timer only; arriving usage snapshots and unload still
+write. With no `summaryFile`, no `DR_TOKEN_OBSERVER_SUMMARY_FILE` and no injected sink, **no write path
+exists at all**.
+
+Residual limitation, measured rather than assumed: if a session's **last** change is a tool call and the
+host is killed inside the checkpoint interval, that tail is not written. The live run lost nothing
+because its final change was a usage snapshot, which is written on arrival.
+
+### 18.9 Reproducing the live validation
 
 ```sh
 CLI="$APPDATA/ai.opencode.desktop/cli/2.0.24/opencode-cli.exe"
@@ -730,12 +832,19 @@ cd <disposable-project>
 # 2. load + registration + cleanup (no model call)
 "$CLI" reload
 
-# 3. one minimal synthetic session on a FREE model
-"$CLI" run --standalone --auto --model opencode/big-pickle \
-  "Read notes.txt using the read tool. Then read notes.txt again using the read tool with the same default range. Then reply with exactly: DONE."
+# 3. one minimal synthetic session on a FREE model (check the model is still Free first)
+"$CLI" run --standalone --print-logs --auto --title "synthetic probe" \
+  --model opencode/longcat-2.5-preview-free \
+  "Use the read tool to read fixtures/repeated-content.json twice with the default range. Do not summarise the file. Then reply exactly: DONE."
 ```
 
-Use `--standalone` for a private server: connecting to the background service instead runs the
-session outside this project's plugin scope, and `--format json` hangs in these headless runs. A
-two-read session must report `toolStartsObserved: 2`, `correlatedCompletions: 2`,
-`reads.identifiedRequests: 2`, `reads.repeatedTargets: 1` and `adapter.pluginApi.line: "v2"`.
+Use `--standalone` for a private server: connecting to the background service instead runs the session
+outside this project's plugin scope, `--format json` produced no output in these headless runs, and a
+private `serve`/`api --standalone` server does **not** load project plugins at all — only a real prompt
+pipeline does. Pass `--title` so OpenCode's own title generation cannot make a second model call.
+
+A two-read session must report `toolStartsObserved: 2`, `correlatedCompletions: 2`,
+`reads.identifiedRequests: 2`, `reads.repeatedTargets: 1`, `adapter.pluginApi.line: "v2"`, and — since
+Stage 1H — a `usage.sourceReported` block with real numbers in it. To check persistence, watch the
+configured `observations.jsonl` **while the session runs**: it must already contain a line whose
+`sourceReported.latest` matches the session export's own totals, even though the host never unloads.

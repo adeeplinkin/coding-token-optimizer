@@ -76,7 +76,13 @@ function noteMissing(observer: OpenCodeObserver): void {
 }
 
 /**
- * Normalise an iterated event into the two fields the observer understands.
+ * Normalise an iterated event into the fields the observer understands.
+ *
+ * Both payload carriers are preserved, because the two API lines do not use the
+ * same one: V1 puts an event body under `properties`, **V2 puts it under `data`**.
+ * Stage 1H's live run showed the cost of forwarding only `properties` — every V2
+ * event arrived empty, and the observer silently observed nothing while its unit
+ * tests, which delivered V1-shaped events, kept passing.
  *
  * Anything that is not an object with a string `type` is passed through as an
  * event without a type, which the observer records as ignored (`event-ignored`)
@@ -86,12 +92,16 @@ export function asRuntimeEvent(value: unknown): OpenCodeV2Event {
   if (typeof value !== 'object' || value === null) {
     return {};
   }
-  const record = value as { readonly type?: unknown; readonly properties?: unknown };
+  const record = value as {
+    readonly type?: unknown;
+    readonly properties?: unknown;
+    readonly data?: unknown;
+  };
   // `exactOptionalPropertyTypes` is on: an absent `type` must be omitted, not set
   // to `undefined`.
   return typeof record.type === 'string'
-    ? { type: record.type, properties: record.properties }
-    : { properties: record.properties };
+    ? { type: record.type, properties: record.properties, data: record.data }
+    : { properties: record.properties, data: record.data };
 }
 
 /** Translate a V2 `execute.before` payload into the observer's V1-shaped input. */

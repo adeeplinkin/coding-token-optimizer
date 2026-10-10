@@ -1,4 +1,5 @@
 import { USAGE_FIELDS } from './types.js';
+import type { UsageField } from './types.js';
 
 /**
  * Token and cost observation for OpenCode assistant messages.
@@ -16,7 +17,9 @@ import { USAGE_FIELDS } from './types.js';
  *   document; an invented total would be a fabricated measurement.
  */
 
-/** A validated usage record for one assistant message. Absent fields are `undefined`. */
+/**
+ * A validated usage record for one assistant message. Absent fields are `undefined`.
+ */
 export interface MessageUsageSnapshot {
   readonly messageId: string;
   readonly sessionId: string;
@@ -139,6 +142,145 @@ function pickHigher(a: number | undefined, b: number | undefined): number | unde
 
 function isLower(next: number | undefined, previous: number | undefined): boolean {
   return next !== undefined && previous !== undefined && next < previous;
+}
+
+/* -------------------------------------------------------------------------- */
+/* V2 usage events                                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A validated **V2 session usage snapshot**, exactly as the source reported it.
+ *
+ * Stage 1G observed this payload in OpenCode Desktop 2.0.24 for the
+ * `session.usage.updated` event, delivered under `event.data` (V1 uses
+ * `event.properties`):
+ *
+ *   { id, created, type, data: { sessionID, cost,
+ *       tokens: { input, output, reasoning, cache: { read, write } } } }
+ *
+ * The payload carries **no message identifier**, so it cannot be attributed to a
+ * single assistant message the way a V1 `message.updated` record can.
+ *
+ * Aggregation semantics are **unverified**: nothing observed so far establishes
+ * whether each event carries an increment, a cumulative session total, or a
+ * per-request snapshot. This type therefore preserves the source's numbers and
+ * makes no claim about what they are, and no code path sums them.
+ */
+export interface SessionUsageSnapshot {
+  readonly sessionId: string;
+  readonly input: number | undefined;
+  readonly output: number | undefined;
+  readonly reasoning: number | undefined;
+  readonly cacheRead: number | undefined;
+  readonly cacheWrite: number | undefined;
+  readonly cost: number | undefined;
+}
+
+/** Why a V2 `session.usage.updated` event produced no snapshot. */
+export type SessionUsageIgnoredReason = 'missing-identifier' | 'no-usage-fields';
+
+export type SessionUsageExtraction =
+  | { readonly kind: 'recorded'; readonly snapshot: SessionUsageSnapshot }
+  | { readonly kind: 'ignored'; readonly reason: SessionUsageIgnoredReason };
+
+/** The six usage fields of a V2 snapshot, keyed by the shared field names. */
+export function sessionUsageFields(
+  snapshot: SessionUsageSnapshot,
+): Readonly<Record<UsageField, number | undefined>> {
+  return {
+    input: snapshot.input,
+    output: snapshot.output,
+    reasoning: snapshot.reasoning,
+    cacheRead: snapshot.cacheRead,
+    cacheWrite: snapshot.cacheWrite,
+    cost: snapshot.cost,
+  };
+}
+
+/** What comparing two consecutive V2 snapshots establishes. */
+export interface SessionUsageComparison {
+  /** Fields that reported a lower value than the previous snapshot. */
+  readonly decreasedFields: number;
+  /** A field reported a value while the previous snapshot did not. */
+  readonly reportedNewFields: number;
+}
+
+/**
+ * Compare a newer V2 snapshot with the previous one.
+ *
+ * This is **evidence gathering, not aggregation**. A field that decreases is
+ * evidence against "each event carries a cumulative session total"; fields that
+ * only ever grow are consistent with it but do not prove it (per-request
+ * increments after the first are also non-negative). Nothing here adds values
+ * together, and the result is only used to label uncertainty honestly.
+ *
+ * A field absent from either snapshot is skipped: silence is not a decrease.
+ */
+export function compareSessionUsage(
+  previous: SessionUsageSnapshot,
+  incoming: SessionUsageSnapshot,
+): SessionUsageComparison {
+  let decreasedFields = 0;
+  let reportedNewFields = 0;
+  for (const field of USAGE_FIELDS) {
+    const before = previous[field];
+    const after = incoming[field];
+    if (after === undefined) {
+      continue;
+    }
+    if (before === undefined) {
+      reportedNewFields += 1;
+      continue;
+    }
+    if (after < before) {
+      decreasedFields += 1;
+    }
+  }
+  return { decreasedFields, reportedNewFields };
+}
+
+/**
+ * Extract a V2 session usage snapshot from an event payload.
+ *
+ * Only the six documented fields are read, and each must be a finite,
+ * non-negative number to count — the same rule the V1 path applies, reused so
+ * both lines validate identically. A value is never guessed, an unsupported
+ * field is never read, and no unrelated event content is retained.
+ */
+export function extractSessionUsage(payload: unknown): SessionUsageExtraction {
+  if (!isRecord(payload)) {
+    return { kind: 'ignored', reason: 'missing-identifier' };
+  }
+  const sessionId = payload['sessionID'];
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    return { kind: 'ignored', reason: 'missing-identifier' };
+  }
+
+  const tokens = isRecord(payload['tokens']) ? payload['tokens'] : undefined;
+  const cache = tokens !== undefined && isRecord(tokens['cache']) ? tokens['cache'] : undefined;
+
+  const input = readField(tokens, 'input');
+  const output = readField(tokens, 'output');
+  const reasoning = readField(tokens, 'reasoning');
+  const cacheRead = readField(cache, 'read');
+  const cacheWrite = readField(cache, 'write');
+  const cost = readUsageNumber(payload['cost']);
+
+  if (
+    input === undefined &&
+    output === undefined &&
+    reasoning === undefined &&
+    cacheRead === undefined &&
+    cacheWrite === undefined &&
+    cost === undefined
+  ) {
+    return { kind: 'ignored', reason: 'no-usage-fields' };
+  }
+
+  return {
+    kind: 'recorded',
+    snapshot: { sessionId, input, output, reasoning, cacheRead, cacheWrite, cost },
+  };
 }
 
 /**
