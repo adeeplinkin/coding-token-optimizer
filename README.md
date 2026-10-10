@@ -6,6 +6,8 @@ Dr. Token aims to reduce unnecessary token usage during autonomous coding work *
 
 > **Development status: Planning / early setup.** Dr. Token is not yet a working optimizer. There is no installer or verified token-savings benchmark available yet.
 
+> **Current stage (Stage 1A):** the shared TypeScript workspace, optimizer contracts and a verified pass-through engine exist. No optimization mode, benchmark, integration or desktop application is implemented yet.
+
 ## Planned integrations
 
 The initial target harnesses are:
@@ -75,9 +77,36 @@ Any savings claim should be based on controlled comparisons with an unoptimized 
 - [ ] Investigate and integrate Freebuff, Codex, and Claude Code as their interfaces permit
 - [ ] Prepare an installer, documentation, and public release
 
-## Installation and development
+## Development setup (contributors)
 
-**Not available yet.** Setup instructions will be published after a working build and its prerequisites are verified.
+**No end-user installer exists yet.** Stage 1A provides contributor setup for the shared core only.
+
+Requirements: Node.js 22.12 or newer (Vitest 5 supports `^22.12.0`, `^24.0.0` and `>=26.0.0`) and npm.
+
+```sh
+npm install        # install development dependencies (workspace root)
+npm run typecheck  # strict TypeScript type-checking (core and tests)
+npm run build      # compile the shared core to packages/core/dist
+npm test           # run the automated test suite (Vitest)
+npm run verify     # typecheck, build and tests in one command
+```
+
+### What Stage 1A implements
+
+- An npm workspaces layout containing the shared core package (`packages/core`)
+- A strict TypeScript configuration and a minimal toolchain (TypeScript and Vitest)
+- Typed contracts: `OptimizationRequest`, `OptimizationResult`, `OptimizationMode`, `OptimizerPass` and `OptimizationDecision`
+- A pass-through optimizer engine that returns the original context exactly as received, respects the global bypass switch, records a structured decision for every request, and falls back to the original context if a future pass ever fails
+- Automated tests covering pass-through, bypass, all three mode identifiers, whitespace/Unicode/code preservation and failure fallback
+
+The optimizer never writes to disk: it only transforms the context it is given, in memory, and it never logs prompts, secrets or source code.
+
+### What is not implemented yet
+
+- No optimization pass of any kind (Safe, Aggressive or Balanced)
+- No token counting, token estimates, benchmarks or verified savings claims
+- No harness integrations (OpenCode, Freebuff, OpenAI Codex, Claude Code)
+- No SQLite persistence, desktop application (Tauri, Rust, React) or Windows installer
 
 ## Contributing
 
