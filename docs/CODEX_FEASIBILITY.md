@@ -1,7 +1,9 @@
 # Codex integration feasibility
 
-**Status:** research and isolated runtime probing complete; **no Codex adapter implemented**
-**Research date:** 2026-10-10
+**Status:** research and isolated runtime probing complete; **observation-only Codex adapter implemented
+(Stage 1L) and its hook registration runtime-verified**; hook delivery and tool observation still
+unverified
+**Research date:** 2026-10-10 (updated 2026-10-10, Stage 1L — see §15)
 **Author:** Dr. Token development (Stage 1K)
 **Related:** [docs/adr/0002-codex-integration.md](adr/0002-codex-integration.md) ·
 [docs/OPENCODE_FEASIBILITY.md](OPENCODE_FEASIBILITY.md) ·
@@ -590,3 +592,72 @@ Because delivery, influence fidelity, and desktop-app hook execution were **not*
 this stage, every transformation claim remains pending §11's authorized experiment. The recommended
 next stage is therefore an **observation-only Codex adapter** (hooks that record and return nothing),
 followed by a controlled single-turn validation, before any optimization is enabled.
+
+That recommended stage was then executed — see §15.
+
+---
+
+## 15. Stage 1L update — observation-only adapter, and hook registration now runtime-verified
+
+Stage 1L built exactly the observation-only adapter §14 called for, in `integrations/codex`
+(`@dr-token/codex-observer`), and pushed the verification ladder one rung further: **Codex now
+enumerates Dr. Token's hooks from Dr. Token's own configuration.** Nothing in §1–§14 above is
+withdrawn; the additions and the one changed classification are recorded here.
+
+**New runtime-verified evidence (reproducible with no model call)**
+
+In an isolated `CODEX_HOME` under `%TEMP%` (the user's `%USERPROFILE%\.codex` was never written), the
+installed `codex-cli 0.162.0-alpha.17.2` was driven over the documented `stdio://` app-server
+transport with the `initialize`/`initialized` handshake, then asked for `hooks/list`. Result:
+
+- **all 12 hooks were discovered**, one per documentation-listed lifecycle event, each reporting
+  `handlerType: "command"`, `enabled: true`, `isManaged: false`, `source: "user"`;
+- each definition's command resolved to the built adapter entry point (`dist/entry.js`), and the
+  Windows command form (`commandWindows`) was resolved against the current platform;
+- every definition reported **`trustStatus: "untrusted"`** with a `currentHash` — i.e. Codex's
+  review-before-run gate applies to Dr. Token exactly as §10 predicted, and Dr. Token does not bypass
+  it (`--dangerously-bypass-hook-trust` is absent from every procedure and product path).
+
+That moves **hook registration/discovery** from *unverified* to **runtime-verified**. It does **not**
+move hook execution: the check sent no `turn/start`, so **no model call was made and no hook body was
+executed by Codex**. §6's `hooks/list` findings are unchanged and consistent with this probe.
+
+**What the adapter is (and is not)**
+
+- Registers exactly the 12 documented events; records content-free counters, tool names/ids, JSON
+  *kinds* of tool responses, and one-way hashed read/directory identities.
+- **Writes nothing to stdout and always exits 0** — verified by tests that spawn the real entry point —
+  so it cannot inject context, rewrite tool arguments, block a tool or reject a prompt. This is a
+  stronger statement than §9's "documented influence only": influence is not merely unused, it is
+  unreachable.
+- Uses **no app-server/rollout/OTel measurement path** yet: every usage measurement is reported as
+  `unavailable`, with the §5.1/§6 sources named as the future provenance options. Nothing is derived
+  from text length.
+- Persists across the **process boundary** that §9 item 3 anticipated (one process per hook): an
+  append-only per-session journal plus an atomically-written compacted snapshot under
+  `<temp>/dr-token-codex-observer`, with bounds, a stale-lock rule and a sweep for sessions that never
+  ended. No database, no daemon.
+
+**Newly classified evidence**
+
+| Capability | Stage 1K | Stage 1L |
+| --- | --- | --- |
+| Hook event set / payload fields | Contract-confirmed | Contract-confirmed (vendored fixture; `typecheck` fails on drift) |
+| Hook registration & trust status | Runtime-verified (probe hooks) | **Runtime-verified for Dr. Token's own hooks (all 12)** |
+| Adapter module loading under Node | — | Unit-tested + entry-point process tests |
+| Cross-process observation state | — | Unit-tested, including concurrent hook processes |
+| Hook execution during a turn | Unverified | **Still unverified** (needs an authorized turn; §11 item 1) |
+| Tool observation on the live path | Unverified | Unverified (parser/accumulator unit-tested against documented payloads) |
+| Desktop-app delivery (§11 item 2) | Unverified | **Still unverified** |
+| Token/cost measurement | Unsupported | Unsupported; reported `unavailable` |
+
+**Updated open questions.** §13 item 1 (desktop-app delivery) and items 2–3 (sandbox/PATH,
+`transcript_path`) remain open and are now the *only* blockers to a live observation claim. Added in
+Stage 1L: which read-like tools a real Codex session actually calls (the adapter refuses to guess, so
+expecting `unidentifiedRequests > 0` on real sessions is correct behaviour, not a defect), and whether
+any of them reports read ranges.
+
+**Recommendation.** The next Codex stage should be §11 items 1–4 under an explicit, scoped
+authorization — one small turn in a disposable home, plus fail-open injection — rather than any
+optimization work. Details, installation, removal and the exact procedure:
+[docs/CODEX_OBSERVER.md](CODEX_OBSERVER.md).

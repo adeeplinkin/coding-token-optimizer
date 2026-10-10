@@ -1,10 +1,13 @@
 # ADR 0002 — Codex integration approach
 
-- **Status:** Proposed (awaiting runtime validation)
+- **Status:** Accepted for the observation-only step (Stage 1L implemented it; hook registration is
+  runtime-verified, hook execution is not). Influence, usage measurement and plugin packaging remain
+  proposed and unvalidated.
 - **Date:** 2026-10-10
-- **Stage:** 1K (Codex integration feasibility)
+- **Stage:** 1K (feasibility) · **1L** (observation-only implementation)
 - **Deciders:** Dr. Token maintainers
 - **Related:** [`docs/CODEX_FEASIBILITY.md`](../CODEX_FEASIBILITY.md) ·
+  [`docs/CODEX_OBSERVER.md`](../CODEX_OBSERVER.md) ·
   [`docs/adr/0001-opencode-integration.md`](0001-opencode-integration.md)
 
 ## Context
@@ -143,3 +146,32 @@ Adopt an **opt-in Codex plugin that bundles lifecycle hooks as the single interc
 
 These must be answered by the runtime validation procedure in
 [`docs/CODEX_FEASIBILITY.md`](../CODEX_FEASIBILITY.md) §11 before any optimization is enabled on Codex.
+
+## Implementation note (Stage 1L)
+
+Stage 1L delivered the **observation-only** part of this decision and no more:
+
+- `integrations/codex` (`@dr-token/codex-observer`) is a thin hook entry point that records
+  content-free observations and **returns nothing** — it writes no stdout and always exits 0, so the
+  influence surfaces listed in the decision (`additionalContext`, `updatedInput`, `decision`,
+  `continue`) are not merely unused but unreachable.
+- **Hook registration and trust are runtime-verified.** In an isolated `CODEX_HOME`, the installed
+  `codex-cli 0.162.0-alpha.17.2` returned all 12 hooks from `hooks/list` as `command` handlers with
+  `enabled: true` and **`trustStatus: "untrusted"`** — the user's own review gate, which Dr. Token
+  keeps intact. Hook *execution* during a turn is still **unverified**; no model call was authorized.
+- **Packaging deviates, deliberately.** The adapter ships as a hook program plus a reviewable
+  `codex-hooks.example.json` the user merges into a documented hook location (user, project, or
+  plugin), rather than as a marketplace plugin. The rationale in the decision (plugin-bundled hooks
+  are the single interception boundary) still stands for the *optimizing* stage; for an observation
+  stage, a mergeable configuration is smaller, auditable, and touches the user's Codex home not at all.
+  Plugin packaging is deferred until influence is actually implemented.
+- **Cross-process state, not in-memory state.** Codex runs each command hook as its own process, so
+  the "bounded, flushed and released on `SessionEnd`" discipline is implemented on disk (append-only
+  journal + atomic compacted snapshot + sweep) instead of in memory, as §8 anticipated. No database
+  and no background service were introduced.
+- **Usage is untouched.** No app-server, rollout, `exec --json` or OTel reader exists yet; every usage
+  measurement is reported as `unavailable` with the verified sources named. This keeps the decision's
+  ordering: observation, then validated measurement, then optimization.
+
+Still outstanding from this decision: the single-turn delivery validation (including the desktop
+app), influence fidelity, usage provenance, and any savings experiment.

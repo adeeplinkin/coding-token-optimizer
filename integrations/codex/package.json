@@ -1,0 +1,32 @@
+{
+  "name": "@dr-token/codex-observer",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Observation-only OpenAI Codex hook adapter for Dr. Token. Records tool activity, repeated reads and session lifecycle from Codex lifecycle hooks; it never modifies prompts, tool inputs, tool results or agent behavior.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./entry": {
+      "types": "./dist/entry.d.ts",
+      "import": "./dist/entry.js"
+    }
+  },
+  "files": [
+    "dist",
+    "codex-hooks.example.json"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "npm run build && vitest run"
+  },
+  "devDependencies": {
+    "@dr-token/benchmarks": "*"
+  }
+}

@@ -1,0 +1,150 @@
+{
+  "description": "Dr. Token Codex observer — observation only. Replace <DR-TOKEN-PACKAGE> with the absolute path of this package (for example C:\\\\path\\\\to\\\\dr-token\\\\integrations\\\\codex), then merge these entries into ~/.codex/hooks.json or into a plugin's hooks/hooks.json. Non-managed hooks must be reviewed and trusted in Codex (/hooks) before they run. Dr. Token never writes this file or your Codex configuration for you; removing these entries — or setting DR_TOKEN_CODEX_OBSERVER=off — disables observation. Every handler type is `command`, every command is the same read-only entry point, and no handler returns a decision, permission decision, updated input, additional context or continuation, so this configuration cannot change what Codex does.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<DR-TOKEN-PACKAGE>/dist/entry.js\"",
+            "commandWindows": "node \"<DR-TOKEN-PACKAGE>\\dist\\entry.js\"",
+            "timeout": 10,
+            "statusMessage": "Dr. Token observing session start"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<DR-TOKEN-PACKAGE>/dist/entry.js\"",
+            "commandWindows": "node \"<DR-TOKEN-PACKAGE>\\dist\\entry.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<DR-TOKEN-PACKAGE>/dist/entry.js\"",
+            "commandWindows": "node \"<DR-TOKEN-PACKAGE>\\dist\\entry.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<DR-TOKEN-PACKAGE>/dist/entry.js\"",
+            "commandWindows": "node \"<DR-TOKEN-PACKAGE>\\dist\\entry.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<DR-TOKEN-PACKAGE>/dist/entry.js\"",
+            "commandWindows": "node \"<DR-TOKEN-PACKAGE>\\dist\\entry.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<DR-TOKEN-PACKAGE>/dist/entry.js\"",
+            "commandWindows": "node \"<DR-TOKEN-PACKAGE>\\dist\\entry.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<DR-TOKEN-PACKAGE>/dist/entry.js\"",
+            "commandWindows": "node \"<DR-TOKEN-PACKAGE>\\dist\\entry.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<DR-TOKEN-PACKAGE>/dist/entry.js\"",
+            "commandWindows": "node \"<DR-TOKEN-PACKAGE>\\dist\\entry.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<DR-TOKEN-PACKAGE>/dist/entry.js\"",
+            "commandWindows": "node \"<DR-TOKEN-PACKAGE>\\dist\\entry.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<DR-TOKEN-PACKAGE>/dist/entry.js\"",
+            "commandWindows": "node \"<DR-TOKEN-PACKAGE>\\dist\\entry.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Interrupt": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<DR-TOKEN-PACKAGE>/dist/entry.js\"",
+            "commandWindows": "node \"<DR-TOKEN-PACKAGE>\\dist\\entry.js\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<DR-TOKEN-PACKAGE>/dist/entry.js\"",
+            "commandWindows": "node \"<DR-TOKEN-PACKAGE>\\dist\\entry.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
