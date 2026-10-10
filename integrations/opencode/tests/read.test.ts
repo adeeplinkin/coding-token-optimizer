@@ -180,3 +180,69 @@ describe('read identity privacy', () => {
     expect(b).not.toBe(a);
   });
 });
+
+/**
+ * V2 argument name.
+ *
+ * Stage 1G observed, in the real OpenCode Desktop 2.0.24 runtime, that the V2 `read`
+ * tool delivers its path as `path` (`inputKeys=path` on every `tool.execute.before`),
+ * while V1 names it `filePath`. Before the fix, every V2 read was counted as
+ * unidentified, so repeated-read detection never fired. These tests pin the aliasing.
+ */
+describe('read tool recognition across API lines', () => {
+  it('identifies a read from the V2 `path` argument', () => {
+    const result = identified({ path: 'src/v2.ts' });
+
+    expect(result.targetId).toBe(identified({ filePath: 'src/v2.ts' }).targetId);
+    expect(result.offset).toBe(DEFAULT_READ_OFFSET);
+    expect(result.limit).toBe(DEFAULT_READ_LIMIT);
+  });
+
+  it('treats the V1 and V2 names as the same target and range', () => {
+    const v1 = identified({ filePath: 'a/b.ts', offset: 1, limit: 2000 });
+    const v2 = identified({ path: 'a/b.ts', offset: 1, limit: 2000 });
+
+    expect(v2.key).toBe(v1.key);
+  });
+
+  it('detects a repeated read expressed with the V2 name', () => {
+    const first = identified({ path: 'notes.txt' });
+    const second = identified({ path: 'notes.txt' });
+
+    expect(second.key).toBe(first.key);
+  });
+
+  it('distinguishes different files and ranges given by the V2 name', () => {
+    expect(identified({ path: 'a.txt' }).key).not.toBe(identified({ path: 'b.txt' }).key);
+    expect(identified({ path: 'a.txt', offset: 1, limit: 10 }).key).not.toBe(
+      identified({ path: 'a.txt', offset: 11, limit: 10 }).key,
+    );
+  });
+
+  it('prefers the V1 name when both are present', () => {
+    const both = identified({ filePath: 'v1.txt', path: 'v2.txt' });
+
+    expect(both.targetId).toBe(identified({ filePath: 'v1.txt' }).targetId);
+  });
+
+  it('still reports an unidentified read when neither name is usable', () => {
+    expect(identifyReadRequest({ path: '   ' }, hash)).toEqual({
+      identified: false,
+      reason: 'missing-path',
+    });
+    expect(identifyReadRequest({ path: 42 }, hash)).toEqual({
+      identified: false,
+      reason: 'missing-path',
+    });
+    expect(identifyReadRequest({}, hash)).toEqual({ identified: false, reason: 'missing-path' });
+  });
+
+  it('applies documented defaults to a V2 read that carries no range', () => {
+    // Stage 1G observed V2 reads with only `path`; no range parameter names are
+    // verified for V2, so the documented defaults must be applied, not guessed.
+    const result = identified({ path: 'notes.txt' });
+
+    expect(result.malformed).toBe(false);
+    expect(result.key.endsWith(':1:2000')).toBe(true);
+  });
+});

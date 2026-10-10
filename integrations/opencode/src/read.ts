@@ -9,6 +9,16 @@ import { READ_TARGET_ID_LENGTH } from './hash.js';
  * documented default limit is 2000. The adapter applies those defaults so an
  * explicit `offset: 1` and an omitted offset are treated as the same request.
  *
+ * **V2 difference, runtime-confirmed in Stage 1G** (OpenCode Desktop 2.0.24, via
+ * `tool.execute.before`): the V2 read tool delivers its path argument as **`path`**,
+ * not `filePath`. Stage 1G observed `tool=read inputKeys=path` on every real read, and
+ * — before this fix — every V2 read was counted as `unidentifiedRequests`, so
+ * repeated-read detection never fired. Both names are therefore accepted.
+ *
+ * Still unverified for V2: which range parameter names (if any) it uses. A read that
+ * carries no usable range keeps the documented defaults rather than guessing, and a
+ * future rename degrades to `unidentifiedRequests` — never to a wrong identity.
+ *
  * This module is pure: it computes an identity, it never reads a file, never
  * caches content, and never holds the raw path.
  */
@@ -51,6 +61,21 @@ export type ReadRequestIdentification = IdentifiedReadRequest | UnidentifiedRead
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The read tool's path argument, under either API line's name.
+ *
+ * `filePath` is the V1 name (source-confirmed); `path` is the V2 name
+ * (runtime-confirmed in Stage 1G). The V1 name wins when both are present, so a
+ * V2 release that adds `filePath` cannot change an existing identity.
+ */
+function pickPathArgument(args: Record<string, unknown>): unknown {
+  const v1 = args['filePath'];
+  if (typeof v1 === 'string' && v1.trim().length > 0) {
+    return v1;
+  }
+  return args['path'];
 }
 
 /**
@@ -99,7 +124,7 @@ export function identifyReadRequest(
   if (!isRecord(args)) {
     return { identified: false, reason: 'missing-path' };
   }
-  const rawPath = args['filePath'];
+  const rawPath = pickPathArgument(args);
   if (typeof rawPath !== 'string' || rawPath.trim().length === 0) {
     return { identified: false, reason: 'missing-path' };
   }

@@ -688,30 +688,54 @@ Bypass is unchanged: `{ "enabled": false }` or `DR_TOKEN_OPENCODE_OBSERVER=off`.
 
 ### 18.5 V2 compatibility status
 
+Updated by Stage 1G, which exercised the adapter in the real OpenCode Desktop 2.0.24 bundled CLI
+([full record](OPENCODE_DESKTOP_VALIDATION.md#15-stage-1g--live-v2-validation-runtime-tested)).
+
 | Capability | Source-confirmed | Unit-tested | Runtime-tested |
 | --- | --- | --- | --- |
-| V2 `Plugin`/`setup`/`Cleanup` shape | ✅ (published d.ts) | ✅ | ❌ |
-| `ctx.tool.hook` registration + payload fields | ✅ (published d.ts) | ✅ | ❌ |
-| Tool-call observation and correlation | ✅ | ✅ | ❌ |
-| Repeated-read identity and counting | ✅ | ✅ | ❌ |
-| Bypass, cleanup, fail-open containment | ✅ | ✅ | ❌ |
-| `ctx.event.subscribe` item shape | ⚠️ docs only | ✅ (defensive) | ❌ |
-| Token/usage fields in V2 | ❌ unverified | ✅ (stays `unavailable`) | ❌ |
+| V2 `Plugin`/`setup`/`Cleanup` shape | ✅ (published d.ts) | ✅ | ✅ |
+| `ctx.tool.hook` registration + payload fields | ✅ (published d.ts) | ✅ | ✅ |
+| Tool-call observation and correlation | ✅ | ✅ | ✅ (2/2 correlated) |
+| Repeated-read identity and counting | ✅ | ✅ | ✅ (after the `path` fix below) |
+| Cleanup / registration disposal | ✅ | ✅ | ✅ |
+| Fail-open containment | ✅ | ✅ | ✅ (0 internal errors) |
+| `ctx.event.subscribe` item shape | ⚠️ docs only | ✅ (defensive) | ✅ (stream open, 40 events) |
+| Bypass (`enabled:false` / env) | ✅ | ✅ | ❌ (unit-tested only) |
+| Token/usage fields in V2 | ✅ **now known** | ❌ not consumed | ❌ not consumed |
 
-**No V2 hook has ever executed in a real OpenCode runtime.** Stage 1F delivers a tested,
-vendored-contract-checked adapter; it does not claim live V2 compatibility. The concrete
-`OpenCodeEvent` union delivered to `subscribe` is unknown, so events are normalised
-defensively and an unrecognised event is recorded as ignored. If V2 exposes no usage
-events to plugins, token fields stay `unavailable` — they are never estimated.
+Two V2-vs-V1 differences were found live:
 
-### 18.6 Runtime validation steps (pending)
+1. **The read tool's path argument is `path`, not `filePath`** (runtime-confirmed). Fixed in
+   [`src/read.ts`](../integrations/opencode/src/read.ts) with regression tests; before the fix every V2
+   read was counted as unidentified and repeated-read detection silently never fired.
+2. **V2 usage arrives as `session.usage.updated` with the payload under `data`, not `properties`.**
+   Token and cost fields exist with V1's names (`cost`, `tokens.input/output/reasoning`,
+   `tokens.cache.read/write`) but the observer matches V1 event names, so **V2 sessions currently
+   report no token data** — the fields stay `unavailable` and are never estimated. Mapping them is
+   Stage 1H work; the verified payload path is recorded in the validation doc.
 
-1. Build: `npm run build` in `integrations/opencode`, then copy `dist/` into a disposable
-   project's `.opencode/vendor/` and add the `.opencode/plugins/dr-token-observer.ts`
-   re-export above.
-2. Open the disposable project in OpenCode Desktop 2.0.24 and run one small session that
-   reads the same file twice with the same range and once with a different range.
-3. Set the `summaryFile` plugin option first; then check `observations.jsonl` for
-   `counts.toolStartsObserved`, `counts.toolCompletionsObserved`, `reads.repeatedRequests`
-   and `adapter.pluginApi.line === 'v2'`.
-4. Report what you observed, including a failure to load. Until then this table stays ❌.
+V2 also emits an entirely different event vocabulary (`session.step.started`, `session.tool.called`,
+`session.reasoning.delta`, …), none of which overlaps V1. Unrecognised events are ignored, which is
+the intended fail-safe.
+
+### 18.6 Reproducing the live validation
+
+```sh
+CLI="$APPDATA/ai.opencode.desktop/cli/2.0.24/opencode-cli.exe"
+cd <disposable-project>
+
+# 1. discovery (no model call)
+"$CLI" plugin list                     # → dr-token-observer  local  ...\.opencode\plugins\dr-token-observer.ts
+
+# 2. load + registration + cleanup (no model call)
+"$CLI" reload
+
+# 3. one minimal synthetic session on a FREE model
+"$CLI" run --standalone --auto --model opencode/big-pickle \
+  "Read notes.txt using the read tool. Then read notes.txt again using the read tool with the same default range. Then reply with exactly: DONE."
+```
+
+Use `--standalone` for a private server: connecting to the background service instead runs the
+session outside this project's plugin scope, and `--format json` hangs in these headless runs. A
+two-read session must report `toolStartsObserved: 2`, `correlatedCompletions: 2`,
+`reads.identifiedRequests: 2`, `reads.repeatedTargets: 1` and `adapter.pluginApi.line: "v2"`.
