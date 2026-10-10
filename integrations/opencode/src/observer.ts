@@ -5,6 +5,7 @@ import { extractAssistantUsage, mergeUsageSnapshots } from './usage.js';
 import type { MessageUsageSnapshot } from './usage.js';
 import {
   DEFAULT_OBSERVATION_LIMITS,
+  DEFAULT_OBSERVER_PLUGIN_API,
   OBSERVATION_NOTES,
   OBSERVATION_SCHEMA_VERSION,
   OBSERVER_ADAPTER_NAME,
@@ -12,8 +13,6 @@ import {
   OBSERVER_DIAGNOSTIC_LEVELS,
   OBSERVER_DIAGNOSTIC_MESSAGES,
   OBSERVER_DISABLE_ENV_VAR,
-  OPENCODE_PLUGIN_PACKAGE,
-  OPENCODE_PLUGIN_VERIFIED_VERSION,
   USAGE_FIELDS,
 } from './types.js';
 import type {
@@ -24,6 +23,7 @@ import type {
   ObserverDiagnostic,
   ObserverDiagnosticCode,
   ObserverOptions,
+  ObserverPluginApiIdentity,
   ObserverSnapshot,
   OpenCodeEventHookInput,
   OpenCodeToolExecuteAfterInput,
@@ -241,6 +241,7 @@ export class OpenCodeObserver {
   readonly #hash: (value: string) => string;
   readonly #onDiagnostic: ((diagnostic: ObserverDiagnostic) => void) | undefined;
   readonly #adapterRevision: string;
+  readonly #pluginApi: ObserverPluginApiIdentity;
   readonly #sessions = new Map<string, SessionState>();
   readonly #recentDiagnostics: ObserverDiagnostic[] = [];
   #sink: ObservationSink | undefined;
@@ -259,6 +260,7 @@ export class OpenCodeObserver {
     this.#now = options.now ?? Date.now;
     this.#hash = options.hash ?? defaultHash;
     this.#adapterRevision = options.adapterRevision ?? OBSERVER_ADAPTER_REVISION;
+    this.#pluginApi = { ...(options.pluginApi ?? DEFAULT_OBSERVER_PLUGIN_API) };
 
     const env = options.env ?? readProcessEnv();
     this.#sink = options.sink ?? resolveEnvironmentSink(env);
@@ -417,6 +419,17 @@ export class OpenCodeObserver {
     this.#diagnose('internal-failure');
   }
 
+  /**
+   * Record that the runtime did not expose a capability the adapter needs.
+   *
+   * Public so an adapter (for example the V2 adapter, whose host may not provide
+   * `ctx.tool` or `ctx.event`) can report the gap without inventing a value. The
+   * affected observations stay `unavailable`.
+   */
+  noteUnsupportedCapability(): void {
+    this.#diagnose('unsupported-plugin-capability');
+  }
+
   /* ---------------------------------------------------------------------- */
   /* Hook entry points                                                      */
   /* ---------------------------------------------------------------------- */
@@ -475,11 +488,7 @@ export class OpenCodeObserver {
     return {
       name: OBSERVER_ADAPTER_NAME,
       revision: this.#adapterRevision,
-      pluginApi: {
-        package: OPENCODE_PLUGIN_PACKAGE,
-        verifiedVersion: OPENCODE_PLUGIN_VERIFIED_VERSION,
-        line: 'v1',
-      },
+      pluginApi: { ...this.#pluginApi },
     };
   }
 

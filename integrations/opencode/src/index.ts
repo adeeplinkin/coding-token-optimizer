@@ -37,6 +37,41 @@ export {
 } from './plugin.js';
 export type { CreatedOpenCodeObserver } from './plugin.js';
 export {
+  DrTokenOpenCodeObserverV2,
+  V2_REQUIRED_CAPABILITIES,
+  asRuntimeEvent,
+  createOpenCodeObserverPluginV2,
+  createOpenCodeObserverV2,
+  toV1ToolAfter,
+  toV1ToolBefore,
+} from './plugin-v2.js';
+export type { CreatedOpenCodeObserverV2 } from './plugin-v2.js';
+export {
+  IMPLEMENTED_V2_TOOL_HOOKS,
+  OBSERVER_V2_PLUGIN_ID,
+  OPENCODE_V2_PLUGIN_PACKAGE,
+  OPENCODE_V2_PLUGIN_VERIFIED_VERSION,
+  defineOpenCodeV2Plugin,
+} from './types-v2.js';
+export type {
+  ImplementedV2ToolHook,
+  OpenCodeV2Cleanup,
+  OpenCodeV2Event,
+  OpenCodeV2EventDomain,
+  OpenCodeV2Plugin,
+  OpenCodeV2PluginContext,
+  OpenCodeV2Registration,
+  OpenCodeV2ToolDomain,
+  OpenCodeV2ToolExecuteAfterEvent,
+  OpenCodeV2ToolExecuteAfterFields,
+  OpenCodeV2ToolExecuteBeforeEvent,
+  OpenCodeV2ToolHookSpec,
+} from './types-v2.js';
+// The default export is the V2 plugin definition, because V2 discovery loads the
+// default export of a project-local plugin file. V1 consumers keep importing the
+// named `DrTokenOpenCodeObserver` plugin function instead.
+export { DrTokenOpenCodeObserverV2 as default } from './plugin-v2.js';
+export {
   DEFAULT_READ_LIMIT,
   DEFAULT_READ_OFFSET,
   READ_IDENTITY_SCHEME,
@@ -51,6 +86,7 @@ export {
 } from './sink.js';
 export {
   DEFAULT_OBSERVATION_LIMITS,
+  DEFAULT_OBSERVER_PLUGIN_API,
   IMPLEMENTED_HOOKS,
   OBSERVATION_NOTES,
   OBSERVATION_SCHEMA_VERSION,
@@ -87,12 +123,14 @@ export type {
   ObservationValue,
   ObserverAdapterIdentity,
   ObserverDiagnostic,
+  ObserverPluginApiIdentity,
   ObserverDiagnosticCode,
   ObserverOptions,
   ObserverSnapshot,
   OpenCodeEventHookInput,
   OpenCodeObserverHooks,
   OpenCodeObserverPlugin,
+  OpenCodePluginApiLine,
   OpenCodePluginInput,
   OpenCodePluginOptions,
   OpenCodeRuntimeEvent,

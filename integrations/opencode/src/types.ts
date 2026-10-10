@@ -281,15 +281,33 @@ export const USAGE_FIELDS: readonly UsageField[] = [
 /* Observation summaries                                                       */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Which OpenCode plugin API line produced an observation.
+ *
+ * A summary must never claim the wrong line: the V1 and V2 contracts are
+ * different, and a reader needs to know which one was loaded.
+ */
+export type OpenCodePluginApiLine = 'v1' | 'v2';
+
+/** The plugin API package and version an observer instance was built against. */
+export interface ObserverPluginApiIdentity {
+  readonly package: string;
+  readonly verifiedVersion: string;
+  readonly line: OpenCodePluginApiLine;
+}
+
+/** Default (V1) plugin API identity, used when no override is supplied. */
+export const DEFAULT_OBSERVER_PLUGIN_API: ObserverPluginApiIdentity = {
+  package: OPENCODE_PLUGIN_PACKAGE,
+  verifiedVersion: OPENCODE_PLUGIN_VERIFIED_VERSION,
+  line: 'v1',
+};
+
 /** Static identity of the adapter that produced a summary. */
 export interface ObserverAdapterIdentity {
   readonly name: typeof OBSERVER_ADAPTER_NAME;
   readonly revision: string;
-  readonly pluginApi: {
-    readonly package: typeof OPENCODE_PLUGIN_PACKAGE;
-    readonly verifiedVersion: typeof OPENCODE_PLUGIN_VERIFIED_VERSION;
-    readonly line: 'v1';
-  };
+  readonly pluginApi: ObserverPluginApiIdentity;
 }
 
 /** One tool id and how often it started and completed. */
@@ -478,6 +496,7 @@ export type ObserverDiagnosticCode =
   | 'event-ignored'
   | 'plugin-options-ignored'
   | 'sink-failed'
+  | 'unsupported-plugin-capability'
   | 'internal-failure';
 
 /** Static, content-free text for every diagnostic code. */
@@ -498,6 +517,8 @@ export const OBSERVER_DIAGNOSTIC_MESSAGES: Readonly<Record<ObserverDiagnosticCod
   'event-ignored': 'The event type is not observed by this adapter.',
   'plugin-options-ignored': 'A plugin option was not usable and was ignored.',
   'sink-failed': 'The configured summary sink failed; the failure was contained.',
+  'unsupported-plugin-capability':
+    'The runtime did not expose a plugin capability this adapter needs; the affected observation is reported as unavailable rather than invented.',
   'internal-failure': 'An internal observer failure was contained; OpenCode behavior is unaffected.',
 };
 
@@ -532,6 +553,7 @@ export const OBSERVER_DIAGNOSTIC_LEVELS: Readonly<Record<ObserverDiagnosticCode,
     'event-ignored': 'debug',
     'plugin-options-ignored': 'warn',
     'sink-failed': 'warn',
+    'unsupported-plugin-capability': 'warn',
     'internal-failure': 'warn',
   };
 
@@ -560,6 +582,11 @@ export interface ObserverOptions {
   readonly env?: Readonly<Record<string, string | undefined>>;
   /** Recorded in summaries; defaults to the package revision. */
   readonly adapterRevision?: string;
+  /**
+   * Which OpenCode plugin API line this observer was attached to.
+   * Defaults to V1, so an existing caller's summaries are unchanged.
+   */
+  readonly pluginApi?: ObserverPluginApiIdentity;
 }
 
 /** Static caveats attached to every observation summary. */

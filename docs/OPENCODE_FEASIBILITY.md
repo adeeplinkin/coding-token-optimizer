@@ -355,3 +355,20 @@ Proceed with OpenCode as the first integration target, **observer-first**:
 
 **Runtime validation is outstanding.** No hook was executed during this stage, so every capability
 above is classified as source/documentation-confirmed rather than runtime-confirmed.
+
+## 15. Stage 1E outcome (2026-10-10)
+
+Stage 1E located the user's existing OpenCode Desktop installation and probed it read-only. It reports
+**OpenCode 2.0.24** (Electron shell plus a bundled single-file CLI at
+`%APPDATA%\ai.opencode.desktop\cli\2.0.24\opencode-cli.exe`), and that binary implements the **V2**
+plugin API: `@opencode/plugin`, `ctx.tool`, `execute.before`/`execute.after`, `event.subscribe` are
+present, while `tool.execute.before`, `tool.execute.after`, `chat.message`, the `experimental.*` hooks
+and the string `@opencode-ai/plugin` appear **zero** times. OpenCode's V2 migration guide states that V1
+plugin implementations do not run in V2.
+
+The Stage 1D observer therefore could **not** be live-validated on this installation. Its packaging was
+validated in the Desktop runtime instead (the built ESM bundle imports cleanly, exposes the four V1 hook
+keys and has no dependencies), but no hook was executed, no session ran and no token field was observed.
+No code was changed for this conclusion: bridging the gap is a V2 port (a different registration API),
+not a packaging fix. Full evidence, procedures, security checks and limitations:
+[docs/OPENCODE_DESKTOP_VALIDATION.md](OPENCODE_DESKTOP_VALIDATION.md).

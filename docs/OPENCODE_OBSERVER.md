@@ -2,8 +2,12 @@
 
 **Package:** `@dr-token/opencode-observer` (workspace `integrations/opencode`)
 **Status:** implemented and unit-tested; **observation only** — no optimization
-**Target API:** `@opencode-ai/plugin` **1.18.35** (V1 `Hooks` contract)
-**Runtime validation:** **not performed** — no OpenCode installation was available (see §12)
+**Target APIs:** `@opencode-ai/plugin` **1.18.35** (V1 `Hooks` contract) **and** `@opencode/plugin`
+**2.0.24** (V2 `Plugin.define({ id, setup })` contract — see §18)
+**Runtime validation:** **attempted, blocked** — Stage 1E found the installed OpenCode Desktop
+**2.0.24** implements the **V2** plugin API, so this V1 adapter cannot load there (see
+[docs/OPENCODE_DESKTOP_VALIDATION.md](OPENCODE_DESKTOP_VALIDATION.md) and §14). This adapter remains
+valid for a V1-line OpenCode (`1.18.x`); a V2 port is future work.
 
 > Dr. Token must prove it can observe agent activity correctly before attempting to
 > optimize it. This stage does the proving; it does not optimize.
@@ -44,7 +48,7 @@ service.
 | Verified version | **1.18.35** (npm `latest`) |
 | SDK package | `@opencode-ai/sdk` **1.18.35** |
 | API line | **V1** (`Hooks` interface, `Plugin = (input, options?) => Promise<Hooks>`) |
-| Not targeted | the unreleased **V2** plugin API (`Plugin.define({ id, setup })`) |
+| Not targeted | the **V2** plugin API (`@opencode/plugin`, `Plugin.define({ id, setup })` / `ctx.tool.hook(...)`) — **required** for the OpenCode Desktop 2.0.24 installed on the Stage 1E machine (see [docs/OPENCODE_DESKTOP_VALIDATION.md](OPENCODE_DESKTOP_VALIDATION.md)) |
 
 Verification method: the published tarballs were downloaded with `npm pack` and the
 shipped declarations read directly (2026-10-10), not taken from memory:
@@ -491,6 +495,15 @@ when quoting it.
 server**. Every behaviour above is verified against the *published contract* and by
 deterministic mocked events — not by a running agent.
 
+**Stage 1E update (2026-10-10).** A Desktop installation *was* subsequently located and probed. It
+ships CLI **2.0.24**, whose runtime contains the V2 plugin surface (`@opencode/plugin`, `ctx.tool`,
+`event.subscribe`, `execute.before/after`) and **none** of the V1 hook names this adapter registers.
+OpenCode's V2 migration guide states V1 plugin implementations do not run in V2. So no hook executed
+there either, and the row below stays ❌ — this time for a *verified API-line mismatch* rather than an
+absent installation. Stage 1D's own packaging was validated in the Desktop runtime: the built
+`dist/index.js` imported cleanly as ESM in Node, exposed all four V1 hook keys and has zero
+dependencies. Full evidence, procedures and limitations: [docs/OPENCODE_DESKTOP_VALIDATION.md](OPENCODE_DESKTOP_VALIDATION.md).
+
 Not yet observed, and treated as unverified:
 
 - that OpenCode loads this plugin at all, and in which order relative to other plugins;
@@ -513,7 +526,7 @@ Not yet observed, and treated as unverified:
 | Repeated-read identity & counting | ✅ (`read` args) | ✅ | ❌ |
 | Usage/cost field extraction | ✅ | ✅ | ❌ |
 | Non-modification guarantee | ✅ (by construction) | ✅ | ❌ |
-| Loading by OpenCode | — | ❌ | ❌ |
+| Loading by OpenCode | — | ❌ | ❌ on Desktop 2.0.24 (V2-only runtime; source-confirmed mismatch, [Stage 1E](OPENCODE_DESKTOP_VALIDATION.md)) |
 | Provider field coverage | — | ❌ | ❌ |
 
 **No claim in this repository says the observer reduces real-world token usage, and
@@ -582,6 +595,123 @@ tool calls ran and which reads repeated — and nothing more.
 | [`src/hash.ts`](../integrations/opencode/src/hash.ts) | default SHA-256 read-target digest |
 | [`src/observer.ts`](../integrations/opencode/src/observer.ts) | session state, counters, summaries, bypass, bounds, fail-open |
 | [`src/plugin.ts`](../integrations/opencode/src/plugin.ts) | V1 plugin function and hook containment |
+| [`src/types-v2.ts`](../integrations/opencode/src/types-v2.ts) | verified V2 contracts, plugin id, implemented V2 hook list |
+| [`src/plugin-v2.ts`](../integrations/opencode/src/plugin-v2.ts) | V2 plugin definition, payload translation, event subscription, cleanup |
 | [`src/sink.ts`](../integrations/opencode/src/sink.ts) | opt-in summary sink (nothing by default) |
 | [`src/benchmark-adapter.ts`](../integrations/opencode/src/benchmark-adapter.ts) | Stage 1B metric mapping |
-| [`src/index.ts`](../integrations/opencode/src/index.ts) | public API |
+| [`src/index.ts`](../integrations/opencode/src/index.ts) | public API; its **default export** is the V2 plugin definition |
+
+## 18. OpenCode V2 adapter (Stage 1F)
+
+Stage 1E established that the OpenCode Desktop installed on the development machine runs
+CLI **2.0.24**, which implements the **V2** plugin API. This stage adds a second adapter
+for that contract. The V1 adapter is unchanged and still targets `@opencode-ai/plugin`
+1.18.35.
+
+### 18.1 Verified V2 contract
+
+| Item | Value |
+| --- | --- |
+| Plugin package | `@opencode/plugin` |
+| Verified version | **2.0.24** (matches the bundled Desktop CLI) |
+| Authoring shape | `import { Plugin } from '@opencode/plugin'`; **`export default Plugin.define({ id, setup })`** |
+| Lifecycle | `setup(ctx)` may return a cleanup function that runs on unload |
+| Tool hooks | `await ctx.tool.hook('execute.before' \| 'execute.after', cb)` → `Promise<Registration>` with `dispose()` |
+| Events | `ctx.event.subscribe({ signal })` → `AsyncIterable`; abort the signal on cleanup |
+
+Verification method (2026-10-10): `npm pack @opencode/plugin@2.0.24` and read the shipped
+declarations. Recorded digests:
+
+```
+dist/promise/plugin.d.ts        ad8e00e94b4c94587800db750132a44754f42fe322d5cfb6da9fb0168ced09f1
+dist/promise/tool.d.ts          14ead93a2c03136af9768f9f02447c5fb357d1bce12a4b38a5e9fe31a0e91eff
+dist/promise/registration.d.ts  16436600a035f85d035e3baebb8412084119f620ee4eafc9feba1c7438f6f5ff
+dist/promise/event.d.ts         7e8549dc513c83bd3fcf7cd1b36bcd66b137fac5384f2ac65850b56c0ebcddad
+```
+
+The published signatures are vendored in
+[`tests/fixtures/opencode-plugin-v2.contract.ts`](../integrations/opencode/tests/fixtures/opencode-plugin-v2.contract.ts)
+and `plugin-v2.contract.test.ts` assigns the real adapter to them, so `npm run typecheck`
+fails if the adapter drifts from the contract it claims to implement.
+
+### 18.2 Differences from V1
+
+| Concern | V1 | V2 |
+| --- | --- | --- |
+| Entry point | `Plugin = (input, options?) => Promise<Hooks>` | `Plugin.define({ id, setup })`, **default export** |
+| Hook registration | returned `Hooks` object | `await ctx.tool.hook(name, cb)` |
+| Tool start payload | `input {tool, sessionID, callID}` + `output {args}` | one event `{tool, sessionID, agent, messageID, id, input}` |
+| Tool completion payload | `input {…, args}` + `output {title, output, metadata}` | one event, plus `status: 'completed'`/`'error'` and `result`/`error` |
+| Call correlation | `callID` | `id` (`Tool.CallID`) — mapped to the observer's `callID` |
+| Events | `event` hook, one event per call | `ctx.event.subscribe()` async iterable, aborted on cleanup |
+| Disposal | returned `dispose` hook | cleanup function returned from `setup` |
+| Unload of registrations | n/a | `Registration.dispose()` per registration |
+
+### 18.3 What is shared, and what is new
+
+Only translation is new. `observer.ts`, `read.ts`, `usage.ts`, `hash.ts`, `sink.ts` and
+`benchmark-adapter.ts` are untouched by Stage 1F, so every count, bound, privacy rule,
+evidence class and sink behaviour is the same in both adapters. `plugin-v2.ts` translates a
+V2 payload into the V1-shaped input the observer already accepts, registers the two
+tool hooks, subscribes to events, and on cleanup disposes every registration, aborts the
+subscription and disposes the observer.
+
+Observation-only guarantees hold identically: no write to the V2 event object, no
+`ctx.tool.transform`, no `ctx.storage`, no permission requests, no tool-result content in
+state. Tool results are never passed through — the completion payload is mapped to empty
+placeholders, and only `tool`, `sessionID`, `id` and `input` are read.
+
+A summary now records which API line produced it
+(`adapter.pluginApi = { package: '@opencode/plugin', verifiedVersion: '2.0.24', line: 'v2' }`),
+so a V2 observation can never be mistaken for a V1 one. The V1 default is unchanged.
+
+### 18.4 Installing the V2 adapter
+
+V2 discovers project-local plugins in `.opencode/plugin/` and `.opencode/plugins/` and
+loads the **default export**. Build once, then point a project file at the built package:
+
+```ts
+// <project>/.opencode/plugins/dr-token-observer.ts
+export { DrTokenOpenCodeObserverV2 as default } from '@dr-token/opencode-observer';
+```
+
+or declare it explicitly (a path to the built directory also works):
+
+```jsonc
+// <project>/opencode.json
+{ "plugins": [["<path-to>/integrations/opencode", { "summaryFile": "./observations.jsonl" }]] }
+```
+
+Never install it globally, and never in a project holding real credentials. With no
+`summaryFile` option and no `DR_TOKEN_OBSERVER_SUMMARY_FILE`, the observer writes nothing.
+Bypass is unchanged: `{ "enabled": false }` or `DR_TOKEN_OPENCODE_OBSERVER=off`.
+
+### 18.5 V2 compatibility status
+
+| Capability | Source-confirmed | Unit-tested | Runtime-tested |
+| --- | --- | --- | --- |
+| V2 `Plugin`/`setup`/`Cleanup` shape | ✅ (published d.ts) | ✅ | ❌ |
+| `ctx.tool.hook` registration + payload fields | ✅ (published d.ts) | ✅ | ❌ |
+| Tool-call observation and correlation | ✅ | ✅ | ❌ |
+| Repeated-read identity and counting | ✅ | ✅ | ❌ |
+| Bypass, cleanup, fail-open containment | ✅ | ✅ | ❌ |
+| `ctx.event.subscribe` item shape | ⚠️ docs only | ✅ (defensive) | ❌ |
+| Token/usage fields in V2 | ❌ unverified | ✅ (stays `unavailable`) | ❌ |
+
+**No V2 hook has ever executed in a real OpenCode runtime.** Stage 1F delivers a tested,
+vendored-contract-checked adapter; it does not claim live V2 compatibility. The concrete
+`OpenCodeEvent` union delivered to `subscribe` is unknown, so events are normalised
+defensively and an unrecognised event is recorded as ignored. If V2 exposes no usage
+events to plugins, token fields stay `unavailable` — they are never estimated.
+
+### 18.6 Runtime validation steps (pending)
+
+1. Build: `npm run build` in `integrations/opencode`, then copy `dist/` into a disposable
+   project's `.opencode/vendor/` and add the `.opencode/plugins/dr-token-observer.ts`
+   re-export above.
+2. Open the disposable project in OpenCode Desktop 2.0.24 and run one small session that
+   reads the same file twice with the same range and once with a different range.
+3. Set the `summaryFile` plugin option first; then check `observations.jsonl` for
+   `counts.toolStartsObserved`, `counts.toolCompletionsObserved`, `reads.repeatedRequests`
+   and `adapter.pluginApi.line === 'v2'`.
+4. Report what you observed, including a failure to load. Until then this table stays ❌.
