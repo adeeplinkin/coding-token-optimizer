@@ -6,7 +6,7 @@ Dr. Token aims to reduce unnecessary token usage during autonomous coding work *
 
 > **Development status: Planning / early setup.** Dr. Token is not yet a working optimizer. There is no installer or verified token-savings benchmark available yet.
 
-> **Current stage (Stage 1B):** the shared TypeScript core (contracts plus a pass-through engine) and a reproducible benchmark foundation exist. No optimization mode, no real coding-harness integration and no desktop application is implemented yet.
+> **Current stage (Stage 1D):** the shared TypeScript core (contracts plus a pass-through engine), a reproducible benchmark foundation and the first coding-harness adapter exist. The OpenCode adapter **observes only** — it records tool calls, potentially repeated reads and the token usage OpenCode reports, and never modifies model context or agent behavior. No optimization mode, no verified live harness run and no desktop application is implemented yet.
 
 ## Planned integrations
 
@@ -70,7 +70,7 @@ Any savings claim should be based on controlled comparisons with an unoptimized 
 ## Roadmap
 
 - [ ] Establish the TypeScript core, Windows desktop foundation, and tests
-- [ ] Investigate OpenCode integration and record baseline behavior
+- [ ] Record real OpenCode baseline behavior with the Stage 1D observer (the API research and the observation-only adapter are done; no live run has happened yet)
 - [ ] Implement and thoroughly benchmark Safe mode
 - [ ] Implement and benchmark Aggressive mode
 - [ ] Develop and benchmark Balanced mode
@@ -94,23 +94,28 @@ npm run verify     # typecheck, build and tests in one command
 
 The benchmark report is written to `benchmarks/reports/benchmark-report.json` (ignored by Git). See [docs/BENCHMARKING.md](docs/BENCHMARKING.md) for what the framework measures, how runs are compared, and what it cannot measure yet.
 
-### What Stages 1A and 1B implement
+OpenCode work is documented separately: [docs/OPENCODE_OBSERVER.md](docs/OPENCODE_OBSERVER.md) (the Stage 1D observation-only adapter, its privacy rules and its unverified runtime surface) and [docs/OPENCODE_FEASIBILITY.md](docs/OPENCODE_FEASIBILITY.md) plus [docs/adr/0001-opencode-integration.md](docs/adr/0001-opencode-integration.md) (the Stage 1C API research and the architecture decision).
 
-- An npm workspaces layout containing the shared core (`packages/core`) and the benchmark framework (`benchmarks`)
+### What Stages 1A, 1B and 1D implement
+
+- An npm workspaces layout containing the shared core (`packages/core`), the benchmark framework (`benchmarks`) and the OpenCode integration (`integrations/opencode`)
 - A strict TypeScript configuration and a minimal toolchain (TypeScript and Vitest)
 - Typed contracts: `OptimizationRequest`, `OptimizationResult`, `OptimizationMode`, `OptimizerPass` and `OptimizationDecision`
 - A pass-through optimizer engine that returns the original context exactly as received, respects the global bypass switch, records a structured decision for every request, and falls back to the original context if a future pass ever fails
 - A reproducible benchmark foundation: synthetic fixtures, deterministic baseline and candidate runs, correctness checks, provenance tracking, baseline-versus-candidate comparison, and a JSON report
 - Automated tests covering pass-through, bypass, all three mode identifiers, whitespace/Unicode/code preservation, failure fallback, fixture validation, run recording, comparison guards and the benchmark CLI
+- An observation-only OpenCode adapter (`@dr-token/opencode-observer`), verified against the published V1 `@opencode-ai/plugin` 1.18.35 hook contract: it counts tool executions, identifies potentially repeated file reads by a hashed (path, offset, limit) identity, collects only the token and cost fields OpenCode actually reports, keeps state per session and in memory with explicit bounds, exposes a bypass switch, and fails open in every hook. It registers no hook that can change agent behavior and writes nothing at all unless the user explicitly configures a summary file
+- 248 automated tests across the three workspaces (19 core, 70 benchmark, 159 observer)
 
 The optimizer never writes to disk: it only transforms the context it is given, in memory, and it never logs prompts, secrets or source code. Benchmark reports store hashes and labels rather than raw context.
 
 ### What is not implemented yet
 
 - No optimization pass of any kind (Safe, Aggressive or Balanced)
-- No token counting or token estimates; token usage is reported as **unavailable**, never invented
+- No token counting or token estimates in the optimizer or the benchmark framework: where no coding harness reports usage, token metrics stay **unavailable** rather than invented. (The Stage 1D OpenCode observer does read the per-message usage fields OpenCode reports, and still refuses to derive a session total)
 - No verified savings claims of any kind
-- No real coding-harness execution (OpenCode, Freebuff, OpenAI Codex, Claude Code)
+- No verified live coding-harness execution. The Stage 1D OpenCode adapter exists and is tested against deterministic mocked hook events, but it was never loaded by a running OpenCode installation (none was available), so none of its behavior is runtime-confirmed
+- No optimization inside the OpenCode adapter: it observes and never suppresses, rewrites or replaces anything (OpenCode, Freebuff, OpenAI Codex and Claude Code remain unimplemented)
 - No SQLite persistence, desktop application (Tauri, Rust, React) or Windows installer
 
 ## Contributing

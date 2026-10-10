@@ -1,0 +1,35 @@
+{
+  "name": "@dr-token/opencode-observer",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Observation-only OpenCode plugin adapter for Dr. Token. Records tool-call, repeated-read and token-usage observations; it never modifies agent behavior.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.18.35"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@dr-token/benchmarks": "*"
+  }
+}

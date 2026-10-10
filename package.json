@@ -10,7 +10,8 @@
   },
   "workspaces": [
     "packages/*",
-    "benchmarks"
+    "benchmarks",
+    "integrations/*"
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
