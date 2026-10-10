@@ -134,3 +134,33 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# JavaScript / TypeScript
+node_modules/
+dist/
+build/
+coverage/
+
+# Rust / Tauri generated files
+target/
+src-tauri/target/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local application databases
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Logs
+*.log
