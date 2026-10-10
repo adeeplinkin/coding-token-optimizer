@@ -1,0 +1,14 @@
+{
+  "id": "005-unicode-content",
+  "description": "Unicode content with a ZWJ family emoji, a combining accent, CJK, RTL text and astral characters. Escape sequences are used so the exact code points survive any editor or transport normalization.",
+  "category": "unicode",
+  "expectExactPreservation": true,
+  "requiredContent": [
+    { "label": "family-emoji-zwj", "text": "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66" },
+    { "label": "combining-sequence", "text": "e\u0301" },
+    { "label": "cjk-text", "text": "\u65e5\u672c\u8a9e\u306e\u30bd\u30fc\u30b9\u30b3\u30fc\u30c9" },
+    { "label": "rtl-text", "text": "\u0645\u0631\u062d\u0628\u064b\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645" },
+    { "label": "astral-characters", "text": "\ud834\udd1e \ud835\udd4f" }
+  ],
+  "context": "Emoji: \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66\nCombining: e\u0301\nCJK: \u65e5\u672c\u8a9e\u306e\u30bd\u30fc\u30b9\u30b3\u30fc\u30c9\nRTL: \u0645\u0631\u062d\u0628\u064b\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645\nAstral: \ud834\udd1e \ud835\udd4f\nMath: \u2211 \u03bb \u2713\n"
+}

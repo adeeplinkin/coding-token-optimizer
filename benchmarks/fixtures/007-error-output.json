@@ -1,0 +1,12 @@
+{
+  "id": "007-error-output",
+  "description": "A failing test report whose assertion message, stack frame and summary must remain intact.",
+  "category": "error-message",
+  "expectExactPreservation": true,
+  "requiredContent": [
+    { "label": "assertion-message", "text": "AssertionError: expected 3 to be 4" },
+    { "label": "stack-frame", "text": "at src/math.test.ts:12:24" },
+    { "label": "failure-summary", "text": "1 test failed" }
+  ],
+  "context": "$ npm test\nFAIL src/math.test.ts > add > returns the sum of two numbers\nAssertionError: expected 3 to be 4\n  at src/math.test.ts:12:24\n1 test failed\n"
+}

@@ -1,0 +1,11 @@
+{
+  "id": "006-repeated-information",
+  "description": "The same file is read three times in one context. Stage 1B only records that this content is preserved; it performs no deduplication.",
+  "category": "repeated-information",
+  "expectExactPreservation": true,
+  "requiredContent": [
+    { "label": "read-log-line", "text": "[tool] read_file src/config.ts -> 128 lines" },
+    { "label": "repeated-config-line", "text": "export const config = { retries: 3, timeoutMs: 15000 };" }
+  ],
+  "context": "[tool] read_file src/config.ts -> 128 lines\nexport const config = { retries: 3, timeoutMs: 15000 };\n[tool] read_file src/config.ts -> 128 lines\nexport const config = { retries: 3, timeoutMs: 15000 };\n[tool] read_file src/config.ts -> 128 lines\nexport const config = { retries: 3, timeoutMs: 15000 };\n"
+}

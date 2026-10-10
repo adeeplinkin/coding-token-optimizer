@@ -1,0 +1,28 @@
+{
+  "name": "@dr-token/benchmarks",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Reproducible benchmark foundation for Dr. Token. Synthetic fixtures and pass-through baseline/candidate runs only.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "benchmark": "node dist/cli.js"
+  },
+  "dependencies": {
+    "@dr-token/core": "*"
+  }
+}

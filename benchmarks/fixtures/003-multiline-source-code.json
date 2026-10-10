@@ -1,0 +1,12 @@
+{
+  "id": "003-multiline-source-code",
+  "description": "Multiline source code with tab indentation that must be preserved exactly.",
+  "category": "source-code",
+  "expectExactPreservation": true,
+  "requiredContent": [
+    { "label": "function-signature", "text": "export function add(a: number, b: number): number {" },
+    { "label": "guard-clause", "text": "if (!Number.isFinite(a) || !Number.isFinite(b)) {" },
+    { "label": "throw-statement", "text": "throw new Error('add() received a non-finite value');" }
+  ],
+  "context": "/** Adds two finite numbers. */\nexport function add(a: number, b: number): number {\n\tif (!Number.isFinite(a) || !Number.isFinite(b)) {\n\t\tthrow new Error('add() received a non-finite value');\n\t}\n\n\treturn a + b;\n}\n"
+}

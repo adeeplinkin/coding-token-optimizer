@@ -1,0 +1,8 @@
+{
+  "id": "001-empty-context",
+  "description": "An empty context must pass through without error and without inventing content.",
+  "category": "empty-context",
+  "expectExactPreservation": true,
+  "requiredContent": [],
+  "context": ""
+}

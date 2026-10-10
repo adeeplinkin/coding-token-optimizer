@@ -6,7 +6,7 @@ Dr. Token aims to reduce unnecessary token usage during autonomous coding work *
 
 > **Development status: Planning / early setup.** Dr. Token is not yet a working optimizer. There is no installer or verified token-savings benchmark available yet.
 
-> **Current stage (Stage 1A):** the shared TypeScript workspace, optimizer contracts and a verified pass-through engine exist. No optimization mode, benchmark, integration or desktop application is implemented yet.
+> **Current stage (Stage 1B):** the shared TypeScript core (contracts plus a pass-through engine) and a reproducible benchmark foundation exist. No optimization mode, no real coding-harness integration and no desktop application is implemented yet.
 
 ## Planned integrations
 
@@ -79,33 +79,38 @@ Any savings claim should be based on controlled comparisons with an unoptimized 
 
 ## Development setup (contributors)
 
-**No end-user installer exists yet.** Stage 1A provides contributor setup for the shared core only.
+**No end-user installer exists yet.** Contributor setup covers the shared core and the benchmark foundation.
 
 Requirements: Node.js 22.12 or newer (Vitest 5 supports `^22.12.0`, `^24.0.0` and `>=26.0.0`) and npm.
 
 ```sh
 npm install        # install development dependencies (workspace root)
-npm run typecheck  # strict TypeScript type-checking (core and tests)
-npm run build      # compile the shared core to packages/core/dist
-npm test           # run the automated test suite (Vitest)
+npm run typecheck  # strict TypeScript type-checking (core, benchmarks and tests)
+npm run build      # compile the shared core and the benchmark framework
+npm test           # run the automated test suites (Vitest)
+npm run benchmark  # run the synthetic benchmark suite and write a JSON report
 npm run verify     # typecheck, build and tests in one command
 ```
 
-### What Stage 1A implements
+The benchmark report is written to `benchmarks/reports/benchmark-report.json` (ignored by Git). See [docs/BENCHMARKING.md](docs/BENCHMARKING.md) for what the framework measures, how runs are compared, and what it cannot measure yet.
 
-- An npm workspaces layout containing the shared core package (`packages/core`)
+### What Stages 1A and 1B implement
+
+- An npm workspaces layout containing the shared core (`packages/core`) and the benchmark framework (`benchmarks`)
 - A strict TypeScript configuration and a minimal toolchain (TypeScript and Vitest)
 - Typed contracts: `OptimizationRequest`, `OptimizationResult`, `OptimizationMode`, `OptimizerPass` and `OptimizationDecision`
 - A pass-through optimizer engine that returns the original context exactly as received, respects the global bypass switch, records a structured decision for every request, and falls back to the original context if a future pass ever fails
-- Automated tests covering pass-through, bypass, all three mode identifiers, whitespace/Unicode/code preservation and failure fallback
+- A reproducible benchmark foundation: synthetic fixtures, deterministic baseline and candidate runs, correctness checks, provenance tracking, baseline-versus-candidate comparison, and a JSON report
+- Automated tests covering pass-through, bypass, all three mode identifiers, whitespace/Unicode/code preservation, failure fallback, fixture validation, run recording, comparison guards and the benchmark CLI
 
-The optimizer never writes to disk: it only transforms the context it is given, in memory, and it never logs prompts, secrets or source code.
+The optimizer never writes to disk: it only transforms the context it is given, in memory, and it never logs prompts, secrets or source code. Benchmark reports store hashes and labels rather than raw context.
 
 ### What is not implemented yet
 
 - No optimization pass of any kind (Safe, Aggressive or Balanced)
-- No token counting, token estimates, benchmarks or verified savings claims
-- No harness integrations (OpenCode, Freebuff, OpenAI Codex, Claude Code)
+- No token counting or token estimates; token usage is reported as **unavailable**, never invented
+- No verified savings claims of any kind
+- No real coding-harness execution (OpenCode, Freebuff, OpenAI Codex, Claude Code)
 - No SQLite persistence, desktop application (Tauri, Rust, React) or Windows installer
 
 ## Contributing
