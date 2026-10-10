@@ -1,4 +1,4 @@
-# Codex runtime validation report (Stage 1M)
+# Codex runtime validation report (Stages 1M–1N)
 
 **Scope:** prove whether the observation-only Codex adapter actually runs during a real Codex
 session — not merely whether Codex recognises its hook configuration.
@@ -7,16 +7,18 @@ session — not merely whether Codex recognises its hook configuration.
 **Related:** [docs/CODEX_OBSERVER.md](CODEX_OBSERVER.md) · [docs/CODEX_FEASIBILITY.md](CODEX_FEASIBILITY.md) ·
 [docs/adr/0002-codex-integration.md](adr/0002-codex-integration.md)
 
-> **Headline:** hook **delivery is now runtime-verified** — `SessionStart`, `UserPromptSubmit` and
-> `SessionEnd` fired for real and were observed, with their true payload shapes captured. **Tool
-> hooks (`PreToolUse`/`PostToolUse`) remain unverified**, because the one authorized turn failed at
-> the account's usage limit before the model ran, so no tool executed. Two real defects were found and
-> fixed along the way.
+> **Headline (Stage 1N, §14): the tool hooks are now runtime-verified.** One authorized turn ran to
+> completion: **16 hook deliveries**, **6 `PreToolUse` + 6 `PostToolUse`**, all six correlated by
+> `tool_use_id`, and **one exact repeated read identified live**. The mechanical evidence validator
+> returned **PASS, 14/14, exit code `0`**. `PermissionRequest`/compaction/subagent/interrupt paths
+> remain unexercised and the **desktop app's** hook execution is still unverified.
 >
-> **Stage 1N (§13)** re-confirmed everything that needs no model call — hook trust, authentication,
-> the timeout contract, the pinned revision — found the account **still rate-limited until
-> 01:32:37**, and prepared a self-verifying procedure for the tool-hook turn. That turn is still
-> outstanding; this document does not claim it happened.
+> Stage 1M (§1–§12) is the record of the earlier attempt: `SessionStart`, `UserPromptSubmit` and
+> `SessionEnd` fired for real, their payload shapes were captured, and two real defects were found and
+> fixed — but the one authorized turn died at the account's usage limit before the model ran, so no
+> tool executed. Stage 1N (§13) re-confirmed everything that needs no model call, then executed the
+> prepared procedure once the quota rolled over; its results are §14. **No usage figure is ingested
+> by Dr. Token at any point.**
 
 ---
 
@@ -299,8 +301,9 @@ real installation if you do not want payload shapes measured.
 | `SessionEnd` releases session state; summary written to the configured sink | **Runtime-verified** |
 | Multiple handlers on one event all run | **Runtime-verified** |
 | Lifecycle handling, read classification, repeated-read arithmetic, bounds, compaction, concurrency, privacy, fail-open, disable switch | **Automated-tested** (real entry point spawned as a process) |
-| `PreToolUse` / `PostToolUse` delivery, live tool payloads, live read identification | **Blocked** (account usage limit hit before the model ran) |
-| `PermissionRequest`, `PreCompact`, `PostCompact`, `SubagentStart`/`Stop`, `Stop`, `Interrupt` delivery | **Unverified** (not triggered) |
+| `PreToolUse` / `PostToolUse` delivery, live tool payloads, live read identification | **Runtime-verified (Stage 1N §14)** — 6 starts, 6 correlated completions, 1 live repeated read |
+| `Stop` delivery | **Runtime-verified (Stage 1N §14)** |
+| `PermissionRequest`, `PreCompact`, `PostCompact`, `SubagentStart`/`Stop`, `Interrupt` delivery | **Unverified** (not triggered) |
 | Token/cost observation | **Unsupported** — no hook payload carries usage; nothing is derived from text length |
 | Codex Desktop app hook execution | **Unverified** — left out of scope by explicit decision; the Desktop app's configuration was not modified |
 | Any optimization, tool-result replacement, context injection | **Not implemented** — the entry point writes no stdout and always exits 0 |
@@ -317,23 +320,26 @@ Every file the live run wrote was swept for content:
 | Path-like fields | digests + lengths only (`cwd`, `transcript_path`) |
 | Session identity | the host's thread id (opaque, sanitized), plus `cwd` as a hash |
 | Writes outside the disposable environment | none; the repository stayed clean and the user's Codex home untouched |
-| Usage numbers | none reported — every usage measurement is `unavailable` with the verified future sources named |
+| Usage numbers | none **ingested** — the host's own `--json` stream reported this turn's real numbers (`turn.completed.usage`: input 60,884 · cached 57,216 · output 362), and the adapter still records every measurement as `unavailable` with the verified future sources named (§14.7) |
 
 ---
 
 ## 12. Limitations of this report
 
-1. **Tool hooks are unverified** (§8) and remain the single most important gap.
+1. **Tool hooks are now verified** (§14); the remaining delivery gaps are the **desktop app** runtime
+   and the six unexercised events (§14.9).
 2. **One turn only.** No disabled-vs-enabled behavioural comparison was run, so output neutrality rests
    on construction (no stdout on any path, always exit 0, asserted in tests) plus the observation that
    no hook output reached the session stream — not on a controlled A/B run.
 3. **Desktop app untested** by choice.
-4. **`permission_mode: bypassPermissions`** was reported by `exec` mode; whether other modes report a
-   different value is unverified, and the adapter does not persist it either way.
+4. **`permission_mode: bypassPermissions`** was investigated from read-only local sources in §14.6: it is
+   the host's own label for a non-interactive `exec` run, **Dr. Token set no permission setting**, and
+   which internal setting selects that label remains contract-unverified. The adapter does not persist it
+   either way.
 5. **Version scope:** all of this is `0.162.0-alpha.17.2`; the `alpha` line warns that schemas move.
-6. **Two attempts were made, both ended at the account usage limit**, so the record of "a turn ran"
-   means "Codex started a turn, ran the lifecycle hooks and then refused the model call" — never "a
-   model answered".
+6. **Two Stage 1M attempts ended at the account usage limit**, so in §1–§12 the record of "a turn ran"
+   means "Codex started a turn, ran the lifecycle hooks and then refused the model call". Stage 1N's
+   single authorized attempt after the rollover **did** run a model to completion (§14).
 
 ---
 
@@ -496,18 +502,175 @@ evidence, so the instrument cannot silently pass nothing:
 So `exit 3` genuinely means "this run did not exercise tool hooks", and `exit 2` genuinely means the
 evidence contradicts itself or the adapter misbehaved.
 
-### 13.5 What that run will still have to earn
+### 13.5 What that run had to earn — and did (§14)
 
-Still **BLOCKED** (not "verified"): `PreToolUse`/`PostToolUse` delivery, real tool identities and
-correlation, real `tool_input` argument structure for reads, live read classification, live
-repeated-read identification, and any live token/cost figure. Nothing in this document claims them.
+This procedure was executed **once**, under its own authorization. It earned everything listed here as
+outstanding at the time of writing: `PreToolUse`/`PostToolUse` delivery, real tool identities and
+correlation, the real `tool_input` shape for reads, live read classification and live repeated-read
+identification. The one thing it did **not** earn is token/cost **ingestion** — the host reported
+usage in its own `--json` stream, but no hook carries it and the adapter still ingests none. Full
+results: **§14**.
 
 The turn is authorized by the user, one turn per authorization, and nothing in this repository runs it
-automatically — the procedure above is inert until a human executes it.
+automatically — the procedure above stays inert until a human executes it, and is retained as the
+repeatable procedure for a future run.
 
 ---
 
-## 14. Safe logout and disposable-environment cleanup
+## 14. Stage 1N — the tool-hook turn, observed (runtime-verified)
+
+**Outcome: PASS.** One authorized turn ran to completion, `PreToolUse` and `PostToolUse` fired for
+real, six tool calls were correlated six-for-six, and an exact repeated read was identified live. The
+mechanical validator ([`codex-validate-turn-evidence.mjs`](../integrations/codex/scripts/codex-validate-turn-evidence.mjs))
+returned **`VERDICT: PASS`, 14/14 checks, exit code `0`**.
+
+### 14.1 Preflight (both gates re-read immediately before launch)
+
+| Gate | Result |
+| --- | --- |
+| Account quota | `ordinaryUsageAllowed: **true**`, primary window **0% used** at 01:32:51 local (it had read `false` / 100% used until the 01:32:37 rollover) |
+| Hook trust | **24/24 `trusted`, 24/24 `enabled`**, none managed, all `source: user` — re-read by the runtime's own `hooks/list` **inside the wrapper, immediately before launch**, and again in `registration-just-before-turn.json` |
+
+Archive-first discipline was used, not deletion. The Stage 1M copies were **moved** into
+`evidence-1m/` (`shapes-1m.jsonl`, `turn-status-1m.txt`, `turn-status-2-1m.txt`) and the six earlier
+validator self-test records into `evidence-1m/1n-selftest/`. An **abort guard** refused to proceed if
+that archive already existed, so a second run could not fold stale tap records into a fresh verdict.
+Nothing was deleted: every Stage 1M artifact is intact.
+
+### 14.2 The turn
+
+`codex exec` ran **once** (01:33:36 → 01:34:23) with stdin detached, in the same disposable
+`CODEX_HOME`, and **exited 0** — recorded verbatim as `exit=0` in `1n-turn-status.txt`, which is the
+first thing the validator reads. The model's own closing message:
+
+> Read `notes.md` twice using identical commands and added the exported `multiply(a, b)` helper to `src/math.ts`.
+
+The work is real: `%LOCALAPPDATA%\dr-token-stage1m\proj\src\math.ts` now exports `multiply(a, b)`.
+
+### 14.3 Which hooks executed
+
+Sixteen deliveries, with the shape-only tap and the observer's folded summary in exact agreement:
+
+| Hook | Fired | Evidence |
+| --- | --- | --- |
+| `SessionStart` | ✅ | tap record · `sessionStarts: 1` |
+| `UserPromptSubmit` | ✅ | tap record · `promptsSubmitted: 1` |
+| **`PreToolUse`** | ✅ **6×** | tap records · `toolStartsObserved: 6` |
+| **`PostToolUse`** | ✅ **6×** | tap records · `toolCompletionsObserved: 6` |
+| `Stop` | ✅ | tap record · `stopEvents: 1` |
+| `SessionEnd` | ✅ | tap record · `sessionEnds: 1`; state released |
+| `PermissionRequest`, `PreCompact`, `PostCompact`, `SubagentStart`, `SubagentStop`, `Interrupt` | ❌ not exercised | the turn had no occasion to trigger them |
+
+The corrected counter (§6.1) is validated live: **`hookEventsObserved: 16` = `journal.records: 16`**.
+
+### 14.4 `PreToolUse` / `PostToolUse`: delivered, correlated, and their real shape
+
+All six starts and all six completions carried a `tool_use_id`, and every completion matched a start:
+`correlatedCompletions: 6`, `uncorrelatedCompletions: 0`, `duplicateStartsIgnored: 0`,
+`duplicateCompletionsIgnored: 0`, `pendingCalls: 0`, `unusablePayloads: 0`. Tool frequency: `Bash`
+5 started / 5 completed, `apply_patch` 1 / 1.
+
+Two **measured** payload facts, both new:
+
+- **Tool input arrives as `{command}` for `Bash` *and* for `apply_patch`.** All six events reported
+  `toolInputType: object` and `toolInputKeys: ["command"]`. So the adapter's `shell-command` read
+  basis covers Codex's editor tool as well as its shell tool, and the `tool-argument` basis
+  (`filePath`/`path` plus a range) was **never exercised** by this turn.
+- **`permission_mode` is present on tool events and `null` on the others** — `["bypassPermissions", null]`
+  across the stream (§14.6).
+
+### 14.5 Repeated reads, identified live
+
+```text
+requests=5   identified=2   unidentified=3
+malformedArgumentRequests=0   distinctTargets=1
+targetsDropped=0   repeatedTargets=1   repeatedRequests=1
+identityScheme: sha256(normalized file path)[0:16] + read offset + read limit
+```
+
+The live pipeline really does identify a read and really does count an exact repeat: the arithmetic
+invariants (`identified + unidentified = requests`, and `repeatedTargets ≤ distinctTargets ≤ requests`)
+both hold. The three refusals are the **conservative classifier working as designed** — counted, not
+guessed. Read identification and repeated-read identification are no longer merely unit-tested.
+
+### 14.6 Why the payload said `permission_mode: bypassPermissions`
+
+Investigated from local, read-only sources. **No Codex turn was started and no configuration was
+changed** to answer this.
+
+Verified:
+
+1. **Dr. Token set nothing.** The disposable `hooks.json` contains only `type`, `command`,
+   `commandWindows` and `timeout`; a grep for
+   `decision|permission|approval|sandbox|additionalContext|updatedInput|continue` finds **zero** keys.
+   The adapter's only writes to that home's `config.toml` are `[hooks.state.*]` trust records
+   (24 `trusted_hash` entries).
+2. **The disposable home carries no approval setting.** Its `config.toml` holds `[tui]`,
+   `[windows] sandbox = "elevated"` — written by the runtime's own Windows-sandbox setup, since the
+   preparation script writes no config keys at all — and the trust table. There is **no**
+   `approval_policy` key anywhere in it.
+3. **`codex exec` has no approval-policy flag** (`exec --help` lists none), and `-s/--sandbox` selects a
+   *sandbox policy* (`read-only | workspace-write | danger-full-access`), not a permission mode. The
+   authorized procedure passed `-s workspace-write`: the operator's sandbox choice, a separate axis
+   from `permission_mode`.
+4. `bypassPermissions` is one of exactly five documented values of `permission_mode` (`default`,
+   `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions`) — a **host-reported label**, not a permission
+   decision, and not something a hook output can set.
+
+**Not verified:** which internal setting selects that label. The runtime validates the string but does
+not document its provenance, so the mapping is recorded as **contract-unverified**. What can be stated
+exactly is the negative that matters: the label came from Codex's own non-interactive `exec` execution
+mode, and **Dr. Token neither changed nor could change any permission setting**. The adapter does not
+persist `permission_mode` at all.
+
+### 14.7 Runtime usage: reported by the host, not ingested
+
+The host's own `--json` stream carried real figures for this turn — `turn.completed.usage`:
+`input_tokens 60,884 · cached_input_tokens 57,216 · cache_write_input_tokens 0 · output_tokens 362 ·
+reasoning_output_tokens 0`. **Dr. Token ingests none of it**: the Codex adapter still reports every
+token measurement as `unavailable`, because no hook payload carries usage. This is a *verified future
+source*; its classification and privacy trade-offs are worked out in
+[docs/SAFE_MODE_DESIGN.md](SAFE_MODE_DESIGN.md) §7.
+
+### 14.8 Exhaustive verdict
+
+| Check | Result |
+| --- | --- |
+| Turn exit status recorded | PASS (`exit=0`) |
+| Session lifecycle delivered | PASS (SessionStart → … → Stop → SessionEnd) |
+| `PreToolUse` / `PostToolUse` delivered | PASS (6 / 6) |
+| Tool identities present and correlated | PASS (6/6 by `tool_use_id`) |
+| Summary counts match delivered tool events | PASS (6 = 6) |
+| Observed-event counter equals folded journal records | PASS (16 = 16) |
+| Session attribution reported by the host | PASS (`01a1276a-…`, `identity=reported`) |
+| Repeated-read count arithmetically consistent | PASS |
+| A repeated read was actually observed | PASS (1 across 1 target) |
+| State released after `SessionEnd` | PASS (no session state left behind) |
+| No content or absolute path in Dr. Token output | PASS |
+| No hook-configuration diagnostics | PASS |
+| Output neutrality (no hook output reached Codex) | PASS |
+| The turn actually completed | PASS |
+| **Verdict** | **PASS — 14/14, validator exit `0`** |
+
+The falsifiable privacy canary was carried again: the sentinel `notes.md content marker` is present in
+the turn's own input and in **zero** files Dr. Token wrote, and `1n-stderr.txt` holds only Codex's
+benign non-TTY-stdin note. Output neutrality is intact: nothing hook-related appears in Codex's stream.
+
+### 14.9 What Stage 1N still does not claim
+
+1. **Codex Desktop app hook execution remains unverified** — the turn used the CLI bundled by the
+   Desktop app, not the app's own runtime.
+2. **`PermissionRequest`, `PreCompact`, `PostCompact`, `SubagentStart`, `SubagentStop` and `Interrupt`
+   remain unexercised** — no occasion arose, so nothing about them is claimed.
+3. **The `tool-argument` read path is unexercised** — every tool input seen was `{command}` (§14.4).
+4. **No usage is ingested and no optimization was performed**: the adapter still writes nothing to
+   stdout and exits 0 on every path.
+5. **One turn.** Observation fidelity rests on that single turn plus the automated tests; it is not a
+   repeated-trial distribution, and no savings claim of any kind follows from it.
+
+---
+
+## 15. Safe logout and disposable-environment cleanup
 
 None of this has been executed — evidence and credentials are left in place until the user approves
 cleanup.
