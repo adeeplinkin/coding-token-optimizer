@@ -1,8 +1,13 @@
 /**
  * Public contracts for the Dr. Token OpenCode observer adapter (Stage 1D).
  *
- * This adapter is **observation only**. It records what OpenCode did; it never
- * changes model context, tool arguments, tool results, or agent behavior.
+ * This adapter is **observation only** by default. It records what OpenCode did
+ * and never changes model context, tool arguments, tool results or agent
+ * behavior — with exactly one opt-in exception: the V2 Safe Mode *apply* path
+ * (`DR_TOKEN_SAFE_MODE=apply`, or the `safeMode` plugin option), which runs the
+ * documented `safe.exact-duplicate-tool-result-elision` pass on an assembled
+ * request. Nothing on the V1 hook surface transforms anything, and with Safe
+ * Mode off (the default) the V2 surface is unchanged too.
  *
  * =====================================================================
  * VERIFIED OPENCODE PLUGIN API (V1)
@@ -63,11 +68,14 @@
  *   export type EventSessionCreated = { type: "session.created"; properties: { info: Session } };
  *
  * The `types.ts`, `read.ts`, `usage.ts`, `observer.ts` and `plugin.ts` modules implement only the
- * documented V1 hooks above. No `experimental.*` hook is used, and no hook that can mutate model
- * context is implemented. A vendored copy of the exact published signatures is kept in
+ * documented V1 hooks above. No `experimental.*` hook is used, and no V1 hook that can mutate model
+ * context is implemented. (The V2 line's opt-in Safe Mode apply path lives in
+ * `plugin-v2.ts` and `safe-mode-elision.ts`; it is a different API line and a different hook.)
+ * A vendored copy of the exact published signatures is kept in
  * `tests/fixtures/opencode-plugin-v1.contract.ts` so `npm run typecheck` fails if this adapter
  * drifts from the contract it claims to implement.
  */
+import type { SafeModeElisionRefusalReason } from './safe-mode-elision.js';
 import type {
   OpportunityLimits,
   OpportunityOccurrenceRefusalReason,
@@ -145,22 +153,29 @@ export const OBSERVER_DISABLE_ENV_VAR = 'DR_TOKEN_OPENCODE_OBSERVER';
 export const OBSERVER_SUMMARY_FILE_ENV_VAR = 'DR_TOKEN_OBSERVER_SUMMARY_FILE';
 
 /**
- * Environment switch that opts into Safe Mode **M1** opportunity observation.
+ * Environment switch that opts into Safe Mode.
  *
- * `observe` enables it; `off` (or unset) keeps it disabled. `apply` is part of
- * the Stage 1O design but is not implemented in this revision: requesting it
- * records a diagnostic and observes, because observation is the only Safe Mode
- * behaviour that exists and it modifies nothing.
+ * `observe` enables content-free opportunity observation and modifies nothing;
+ * `off` (or unset) keeps Safe Mode inert; `apply` adds the one documented
+ * transformation — `safe.exact-duplicate-tool-result-elision` — on top of
+ * observation. `apply` is never the default, and asking for it while observation
+ * is disabled is reported (`safe-mode-apply-unavailable`) and downgraded rather
+ * than obeyed.
  */
 export const SAFE_MODE_ENV_VAR = 'DR_TOKEN_SAFE_MODE';
 
-/**
- * Safe Mode modes this revision implements.
- *
- * There is deliberately no `apply`: no transformation exists anywhere in this
- * package, and the type says so rather than carrying a value that cannot run.
- */
+/** The Safe Mode behaviour a running observer ends up in. */
 export type SafeModeMode = 'off' | 'observe';
+
+/**
+ * A Safe Mode setting a caller may request.
+ *
+ * `apply` is not a mode of its own: it resolves to the `observe` mode with the
+ * apply switch on, because the pass must not be able to run while the observer
+ * that contains its failures is disabled. The type exists so the opt-in is
+ * explicit and typed instead of an unchecked string.
+ */
+export type SafeModeSetting = SafeModeMode | 'apply';
 
 /* -------------------------------------------------------------------------- */
 /* OpenCode V1 hook contracts (structural subset, see the header above)        */
@@ -564,12 +579,42 @@ export interface SessionObservationMeasurements {
 }
 
 /**
+ * Content-free evidence of one Safe Mode **apply** session.
+ *
+ * Interim surface: the M4/M5 milestones fold these counters into the session
+ * summary schema. Until then this is what a caller can read, and it carries the
+ * same stand-alone notes the pass returns, so no number can be read without the
+ * statement that it is a request-size fact rather than a token measurement.
+ */
+export interface SafeModeApplySummary {
+  readonly mode: 'apply';
+  readonly passId: string;
+  readonly version: number;
+  /** Requests that passed every gate and were scanned. */
+  readonly requestsAttempted: number;
+  /** Requests where at least one marker was written. */
+  readonly requestsApplied: number;
+  /** Occurrences whose text was replaced. */
+  readonly elidedOccurrences: number;
+  /** UTF-16 code units of the replaced text (not tokens). */
+  readonly elidedCharacters: number;
+  /** UTF-8 bytes of the replaced text (not tokens). */
+  readonly elidedBytes: number;
+  /** UTF-8 bytes of the markers written (not tokens). */
+  readonly markerBytes: number;
+  /** Refusals, by reason. */
+  readonly refused: Readonly<Record<SafeModeElisionRefusalReason, number>>;
+  readonly notes: readonly string[];
+}
+
+/**
  * Per-session Safe Mode **M1** opportunity observation, present only while the
  * opt-in observation mode is active.
  *
  * It counts what was seen in the assembled requests this session produced —
- * never what was changed, because nothing is ever changed. Two semantics matter
- * when reading it:
+ * never what was changed: this section is written from the analysis, which runs
+ * before any apply pass and would describe the request the host assembled even
+ * if one ran. Two semantics matter when reading it:
  *
  * - **One context invocation is one counted request assembly.** Runtime retries
  *   re-invoke the hook and are counted again; two plugin instances observing the
@@ -718,6 +763,7 @@ export type ObserverDiagnosticCode =
   | 'sink-failed'
   | 'unsupported-plugin-capability'
   | 'safe-mode-apply-unavailable'
+  | 'safe-mode-apply-plan-mismatch'
   | 'safe-mode-setting-ignored'
   | 'safe-mode-request-unusable'
   | 'internal-failure';
@@ -747,7 +793,9 @@ export const OBSERVER_DIAGNOSTIC_MESSAGES: Readonly<Record<ObserverDiagnosticCod
   'unsupported-plugin-capability':
     'The runtime did not expose a plugin capability this adapter needs; the affected observation is reported as unavailable rather than invented.',
   'safe-mode-apply-unavailable':
-    'Safe Mode apply mode is not implemented in this revision; nothing was modified and observation remains enabled.',
+    'Safe Mode apply was requested while observation is disabled, so no request was modified.',
+  'safe-mode-apply-plan-mismatch':
+    'Safe Mode apply located a different number of eligible duplicates than the analyzer counted, so the request was left unmodified.',
   'safe-mode-setting-ignored':
     'A Safe Mode setting was not usable and was ignored; Safe Mode stays off.',
   'safe-mode-request-unusable':
@@ -790,6 +838,7 @@ export const OBSERVER_DIAGNOSTIC_LEVELS: Readonly<Record<ObserverDiagnosticCode,
     'sink-failed': 'warn',
     'unsupported-plugin-capability': 'warn',
     'safe-mode-apply-unavailable': 'warn',
+    'safe-mode-apply-plan-mismatch': 'warn',
     'safe-mode-setting-ignored': 'warn',
     'safe-mode-request-unusable': 'warn',
     'internal-failure': 'warn',
@@ -821,13 +870,15 @@ export interface ObserverOptions {
   /** Recorded in summaries; defaults to the package revision. */
   readonly adapterRevision?: string;
   /**
-   * Safe Mode M1 observation. `observe` registers the request-context hook and
-   * records content-free opportunity counts; `off` (the default) registers
-   * nothing and changes no behaviour. When unset, the environment switch
-   * `DR_TOKEN_SAFE_MODE` is consulted. `apply` is not implemented: requesting it
-   * records a diagnostic and observes.
+   * Safe Mode. `observe` registers the request-context hook and records
+   * content-free opportunity counts; `off` (the default) registers nothing and
+   * changes no behaviour. `apply` does everything `observe` does and additionally
+   * runs the versioned `safe.exact-duplicate-tool-result-elision` pass on the
+   * assembled request. When unset, the environment switch `DR_TOKEN_SAFE_MODE` is
+   * consulted. Requesting `apply` while observation is disabled (or the observer
+   * is bypassed) is reported and changes nothing.
    */
-  readonly safeMode?: SafeModeMode;
+  readonly safeMode?: SafeModeSetting;
   /** Overrides for the opportunity analyzer's processing and memory bounds. */
   readonly opportunityLimits?: Partial<OpportunityLimits>;
   /**
@@ -853,9 +904,9 @@ export const OBSERVATION_NOTES: readonly string[] = [
 
 /** Static caveats attached to the Safe Mode opportunity section. */
 export const SAFE_MODE_OBSERVATION_NOTES: readonly string[] = [
-  'Safe Mode observation only: this section counts duplicate tool results that could be elided. Nothing in any request was modified, and no token saving is achieved or claimed.',
+  'Safe Mode observation section: these counts describe duplicates that could be elided. When apply mode is off — the default — nothing in any request was modified. In neither mode is a token saving achieved or claimed here.',
   'Duplicate and candidate characters/bytes are properties of the assembled request, not saved tokens; no token figure is derived from them. "Duplicate" counts every detected occurrence, "candidate" only those eligible for the v1 elision.',
   'Each context invocation is one counted request assembly. Runtime retries re-invoke the hook and are counted again, and two plugin instances observing one request each count it, so these counts are not deduplicated request identities.',
-  'The request kind (primary, compaction, title, generate) is not carried by the context-hook payload; eligibility recorded here is content-level, and the primary-only gate is enforced where the kind is observable.',
+  'The request kind (primary, compaction, title, generate) is not carried by the context-hook payload. It does not have to be: Stage 1T measured that the runtime calls the hook named for the kind, so `context` is the primary-request hook (one invocation per `model.request` of kind `primary`; a title request calls `title` and not `context`). Eligibility recorded here is still content-level.',
   'Detection compares exact model-visible text (string equality, not hashes) and requires the earlier identical copy to be present in the same request. Error, malformed, oversized and unsupported results are excluded, never guessed at.',
 ];

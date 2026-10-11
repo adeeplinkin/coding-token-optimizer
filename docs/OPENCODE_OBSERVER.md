@@ -40,8 +40,7 @@ token was saved; the summary says so in its own `notes`.
 Safe/Aggressive/Balanced algorithms · read suppression · source-content caching ·
 context compression · prompt rewriting · tool-output modification · experimental
 whole-context transforms · SQLite · Rust/Tauri · React dashboard · Windows installer ·
-Freebuff, Codex and Claude Code adapters · local AI models · telemetry or any cloud
-service.
+Freebuff and Codex adapters · local AI models · telemetry or any cloud service.
 
 ## 2. Verified OpenCode API version
 

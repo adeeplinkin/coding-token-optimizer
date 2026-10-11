@@ -2,7 +2,7 @@
  * Shared optimizer contracts for Dr. Token.
  *
  * These types define the boundary between the shared engine and future
- * coding-harness adapters (OpenCode, Freebuff, Codex, Claude Code).
+ * coding-harness adapters (OpenCode, Codex, Freebuff).
  *
  * Stage 1A status: contracts and a pass-through engine only. No optimization
  * pass exists yet, no token savings are produced, and none may be claimed.

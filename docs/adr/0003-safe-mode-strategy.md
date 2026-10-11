@@ -154,8 +154,11 @@ Stage 1P did **not** implement the decision; it verified the dependency it rests
   ADR's equivalence precondition (byte-identical content with the earlier copy still present), observed
   on real traffic rather than argued from a declaration.
 
-**Not yet earned:** the *effect* of an elision on task correctness (M3–M5), how often duplicates occur
-in real work (M1), and the compaction/title/generate request kinds. The influence question Stage 1P left
+**Not yet earned:** the *effect* of an elision on task correctness (M3–M5) and how often duplicates occur
+in real work (M1). The request-kind question was resolved in Stage 1T: the runtime maps each kind to its
+own hook name at a single dispatch site (`primary` → `context`; `compaction`/`generate`/`title` → their
+own names), verified in the installed 2.0.24 binary and live, so the pass is primary-only by
+construction ([docs/SAFE_MODE_1T_APPLY_VALIDATION.md](../SAFE_MODE_1T_APPLY_VALIDATION.md) §3). The influence question Stage 1P left
 open was answered in Stage 1R — a mutation reaches the wire. The full record, including two probe defects
 found by its own tests and the Stage 1R influence evidence, is in
 [docs/OPENCODE_REQUEST_HOOK_VALIDATION.md](../OPENCODE_REQUEST_HOOK_VALIDATION.md).

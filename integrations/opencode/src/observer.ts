@@ -1,5 +1,18 @@
 import { defaultHash } from './hash.js';
 import {
+  SAFE_MODE_ELISION_NOTES,
+  SAFE_MODE_ELISION_PASS_ID,
+  SAFE_MODE_ELISION_REFUSAL_REASONS,
+  SAFE_MODE_ELISION_VERSION,
+  applySafeModeElision,
+  emptyElisionRefusals,
+} from './safe-mode-elision.js';
+import type {
+  SafeModeElisionOutcome,
+  SafeModeElisionRefusalReason,
+  SafeModeRequestKindBasis,
+} from './safe-mode-elision.js';
+import {
   DEFAULT_OPPORTUNITY_LIMITS,
   OPPORTUNITY_OCCURRENCE_REFUSAL_REASONS,
   OPPORTUNITY_PART_EXCLUSION_REASONS,
@@ -58,6 +71,7 @@ import type {
   OpenCodeToolExecuteBeforeOutput,
   ReadObservationSummary,
   ProjectScopeVerification,
+  SafeModeApplySummary,
   SafeModeMode,
   SafeModeOpportunitySummary,
   SessionLifecycleSummary,
@@ -133,14 +147,14 @@ const SAFE_MODE_OFF_VALUES: readonly string[] = DISABLE_VALUES;
 const SAFE_MODE_OBSERVE_VALUES: readonly string[] = ['observe', 'on', 'true', '1', 'yes'];
 
 /**
- * Resolve the Safe Mode M1 setting from an explicit option or the environment.
+ * Resolve the Safe Mode setting from an explicit option or the environment.
  *
  * Exported because the parsed semantics are part of the documented opt-in
- * contract — in particular the deliberate downgrade: `apply` is not implemented
- * in this revision, so it is *reported* (`applyRequested: true`) and resolved to
- * `observe`, because observation is the only Safe Mode behaviour that exists and
- * it modifies nothing. An unusable value is reported as `ignored` and leaves
- * Safe Mode off; it is never guessed at.
+ * contract, including the deliberate coupling: `apply` resolves to the `observe`
+ * mode **with** `applyRequested: true`, so the transformation can never run
+ * without the observation path (and therefore its containment and counters) that
+ * owns it. An unusable value is reported as `ignored` and leaves Safe Mode off;
+ * it is never guessed at.
  */
 export function resolveSafeModeSetting(
   explicit: unknown,
@@ -587,6 +601,37 @@ function createSessionState(sessionId: string, at: number): SessionState {
 }
 
 /**
+ * The kind basis the observer passes to the elision pass.
+ *
+ * `observeRequestContext` is reached only from the `context` hook registration
+ * (`plugin-v2.ts`). Stage 1T verified that `context` is the primary-request hook
+ * twice over: in the installed runtime the single dispatch site pairs each
+ * `SessionContext` method with exactly one hook name (`primary` → `context`, and
+ * `compaction`/`generate`/`title` → their own names), and a live session fired
+ * `context` once per `model.request` of kind `primary` with the title request
+ * using the `title` hook instead. No timing and no event correlation is
+ * involved: the host selects the hook by name.
+ */
+const PRIMARY_CONTEXT_HOOK_BASIS: SafeModeRequestKindBasis = 'context-hook';
+
+/**
+ * Mutable aggregate behind {@link OpenCodeObserver.getSafeModeApplySummary}.
+ *
+ * Counts only: no tool text, path, digest or session id is retained, and nothing
+ * is persisted. Safe Mode keeps no cache between requests (design §4.4), so this
+ * is a report of what happened rather than state a later request depends on.
+ */
+interface SafeModeApplyState {
+  requestsAttempted: number;
+  requestsApplied: number;
+  elidedOccurrences: number;
+  elidedCharacters: number;
+  elidedBytes: number;
+  markerBytes: number;
+  refused: Record<SafeModeElisionRefusalReason, number>;
+}
+
+/**
  * Observation-only OpenCode observer.
  *
  * Responsibilities: count tool executions, track tool frequency, identify
@@ -594,6 +639,13 @@ function createSessionState(sessionId: string, at: number): SessionState {
  * fields OpenCode actually reports. It holds no reference to any hook input or
  * output after a call returns, writes nothing unless a sink is configured, and
  * never throws into OpenCode.
+ *
+ * The one exception to "observation only" is the opt-in Safe Mode **apply** path
+ * (`isSafeModeApplying()`): when the caller asks for `apply` *and* observation is
+ * enabled, the assembled request also goes through
+ * `safe.exact-duplicate-tool-result-elision` — the only code in this package that
+ * writes to a request, and only to a duplicate tool-result text that is still
+ * present earlier in the same payload.
  *
  * State is in memory only and bounded by {@link ObservationLimits}.
  */
@@ -630,6 +682,10 @@ export class OpenCodeObserver {
   #enabled: boolean;
   /** Safe Mode M1 mode: `off` unless explicitly opted in. */
   #safeMode: SafeModeMode;
+  /** Whether the caller explicitly opted in to Safe Mode **apply**. */
+  #safeModeApply = false;
+  /** Content-free aggregate of every apply attempt, or `undefined` while apply is off. */
+  #elision: SafeModeApplyState | undefined;
   /** Effective bounds for the opportunity analyzer. */
   #opportunityLimits: OpportunityLimits;
   #disposed = false;
@@ -661,11 +717,7 @@ export class OpenCodeObserver {
     this.#opportunityLimits = resolveOpportunityLimits(options.opportunityLimits);
     const safeMode = resolveSafeModeSetting(options.safeMode, env);
     this.#safeMode = safeMode.mode;
-    if (safeMode.applyRequested) {
-      // Apply is part of the design and deliberately not implemented here. The
-      // request is reported rather than silently obeyed or silently dropped.
-      this.#diagnose('safe-mode-apply-unavailable');
-    }
+    this.#adoptApplyRequest(safeMode.applyRequested);
     if (safeMode.ignored) {
       this.#diagnose('safe-mode-setting-ignored');
     }
@@ -684,6 +736,46 @@ export class OpenCodeObserver {
    */
   isSafeModeObserving(): boolean {
     return this.#safeMode === 'observe';
+  }
+
+  /**
+   * Whether Safe Mode **apply** is active.
+   *
+   * True only when the caller asked for `apply` *and* observation is enabled: a
+   * disabled or disposed observer never modifies a request, and asking for apply
+   * while disabled is reported (`safe-mode-apply-unavailable`) rather than
+   * silently obeyed. The pass itself is synchronous, stateless and fail-open, so
+   * a retry, a concurrent request, a second plugin instance or a host reload can
+   * only ever see the request it was handed.
+   */
+  isSafeModeApplying(): boolean {
+    return this.#safeMode === 'observe' && this.#safeModeApply && this.#canObserve();
+  }
+
+  /**
+   * Content-free evidence of every apply attempt in this observer.
+   *
+   * `undefined` while apply is off. Counts and the pass's own notes only — no
+   * tool text, path or digest — and no number here is a token figure.
+   */
+  getSafeModeApplySummary(): SafeModeApplySummary | undefined {
+    const state = this.#elision;
+    if (state === undefined) {
+      return undefined;
+    }
+    return {
+      mode: 'apply',
+      passId: SAFE_MODE_ELISION_PASS_ID,
+      version: SAFE_MODE_ELISION_VERSION,
+      requestsAttempted: state.requestsAttempted,
+      requestsApplied: state.requestsApplied,
+      elidedOccurrences: state.elidedOccurrences,
+      elidedCharacters: state.elidedCharacters,
+      elidedBytes: state.elidedBytes,
+      markerBytes: state.markerBytes,
+      refused: { ...state.refused },
+      notes: SAFE_MODE_ELISION_NOTES,
+    };
   }
 
   /**
@@ -769,9 +861,7 @@ export class OpenCodeObserver {
         this.#diagnose('safe-mode-setting-ignored');
       } else {
         this.#safeMode = resolved.mode;
-        if (resolved.applyRequested) {
-          this.#diagnose('safe-mode-apply-unavailable');
-        }
+        this.#adoptApplyRequest(resolved.applyRequested);
       }
     }
 
@@ -973,6 +1063,57 @@ export class OpenCodeObserver {
   /* ---------------------------------------------------------------------- */
   /* Internals                                                              */
   /* ---------------------------------------------------------------------- */
+
+  /**
+   * Adopt (or drop) an explicit request to run Safe Mode apply.
+   *
+   * Asking for apply while observation is disabled is reported rather than
+   * silently obeyed: the observer would otherwise look like it was transforming
+   * requests when nothing ran.
+   */
+  #adoptApplyRequest(requested: boolean): void {
+    this.#safeModeApply = requested;
+    if (requested) {
+      this.#elision ??= {
+        requestsAttempted: 0,
+        requestsApplied: 0,
+        elidedOccurrences: 0,
+        elidedCharacters: 0,
+        elidedBytes: 0,
+        markerBytes: 0,
+        refused: emptyElisionRefusals(),
+      };
+    }
+    if (requested && !this.#canObserve()) {
+      this.#diagnose('safe-mode-apply-unavailable');
+    }
+  }
+
+  /** Fold one apply outcome into the content-free aggregate. */
+  #recordElisionOutcome(outcome: SafeModeElisionOutcome): void {
+    const state = this.#elision;
+    if (state === undefined) {
+      return;
+    }
+    if (outcome.attempted) {
+      state.requestsAttempted += 1;
+    }
+    if (outcome.applied) {
+      state.requestsApplied += 1;
+    }
+    state.elidedOccurrences += outcome.elidedOccurrences;
+    state.elidedCharacters += outcome.elidedCharacters;
+    state.elidedBytes += outcome.elidedBytes;
+    state.markerBytes += outcome.markerBytes;
+    for (const reason of SAFE_MODE_ELISION_REFUSAL_REASONS) {
+      state.refused[reason] += outcome.refused[reason];
+    }
+    // A plan mismatch means the analyzer and the locator disagreed: a defect
+    // signal, and one the caller should see rather than only count.
+    if (outcome.refused['plan-mismatch'] > 0) {
+      this.#diagnose('safe-mode-apply-plan-mismatch');
+    }
+  }
 
   #canObserve(): boolean {
     return this.#enabled && !this.#disposed;
@@ -1331,6 +1472,22 @@ export class OpenCodeObserver {
       return;
     }
     this.#recordOpportunityAnalysis(state, analysis);
+
+    // Apply runs *after* the M1 analysis, so the observation always describes
+    // the request the host assembled rather than the one this pass produced.
+    if (this.#safeModeApply && this.#canObserve()) {
+      try {
+        this.#recordElisionOutcome(
+          applySafeModeElision(candidate, {
+            requestKindBasis: PRIMARY_CONTEXT_HOOK_BASIS,
+            enabled: true,
+            limits: this.#opportunityLimits,
+          }),
+        );
+      } catch {
+        this.noteInternalFailure();
+      }
+    }
   }
 
   /** Fold one content-free request analysis into the session's counters. */

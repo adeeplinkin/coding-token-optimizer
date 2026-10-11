@@ -29,6 +29,23 @@ export type {
 } from './benchmark-adapter.js';
 export { READ_TARGET_ID_LENGTH, defaultHash, isHexDigestLike } from './hash.js';
 export {
+  SAFE_MODE_ELISION_MARKER,
+  SAFE_MODE_ELISION_NOTES,
+  SAFE_MODE_ELISION_PASS_ID,
+  SAFE_MODE_ELISION_REFUSAL_REASONS,
+  SAFE_MODE_ELISION_VERSION,
+  SAFE_MODE_REQUEST_KIND_BASES,
+  applySafeModeElision,
+  emptyElisionRefusals,
+  isAgentLoopContextPayload,
+} from './safe-mode-elision.js';
+export type {
+  SafeModeElisionOptions,
+  SafeModeElisionOutcome,
+  SafeModeElisionRefusalReason,
+  SafeModeRequestKindBasis,
+} from './safe-mode-elision.js';
+export {
   OpenCodeObserver,
   isDisabledByEnvironment,
   normalizeProjectDirectory,
@@ -187,8 +204,10 @@ export type {
   ProjectAttributionBasis,
   ProjectScopeVerification,
   ReadObservationSummary,
+  SafeModeApplySummary,
   SafeModeMode,
   SafeModeOpportunitySummary,
+  SafeModeSetting,
   SessionLifecycleSummary,
   SessionObservationCounts,
   SessionObservationMeasurements,

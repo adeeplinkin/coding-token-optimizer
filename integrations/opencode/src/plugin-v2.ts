@@ -45,13 +45,16 @@ import type {
  * permissions, and never reads tool results into state. V2 delivers one mutable
  * event object per hook call; nothing here assigns to it.
  *
- * One more observation channel exists and is **opt-in**: when Safe Mode M1
- * observation is enabled (`DR_TOKEN_SAFE_MODE=observe` or the `safeMode` plugin
- * option), the adapter also registers `session.hook("context")`, the
- * request-assembly hook Stage 1P validated, and feeds a content-free duplicate
- * analysis into the observer. That hook is read-only like everything else: its
- * callback returns nothing, the payload is never assigned to, and with the
- * setting off `ctx.session` is not touched at all.
+ * One more channel exists and is **opt-in**: when Safe Mode is enabled
+ * (`DR_TOKEN_SAFE_MODE=observe|apply`, or the `safeMode` plugin option), the
+ * adapter also registers `session.hook("context")`, the request-assembly hook
+ * Stage 1P validated, and feeds a content-free duplicate analysis into the
+ * observer. Under `observe` that hook is read-only: its callback returns nothing
+ * and the payload is never assigned to. Under `apply` the same callback also runs
+ * the versioned `safe.exact-duplicate-tool-result-elision` pass, whose *only*
+ * write is the documented `result.value` replacement of a later, byte-identical
+ * duplicate `read` result (Stage 1T); the callback still returns nothing, and
+ * with the setting off `ctx.session` is not touched at all.
  *
  * Fail-open. Every hook body is wrapped, and a failure is reported as a
  * content-free diagnostic instead of being thrown into OpenCode. `setup` itself

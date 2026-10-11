@@ -106,6 +106,41 @@ describe('no telemetry or network path', () => {
   });
 });
 
+describe('the Safe Mode apply path is opt-in, single-writer and unreachable when off', () => {
+  it('keeps exactly one assignment to a tool-result value in the elision module', () => {
+    const source = readSource('safe-mode-elision.ts');
+    // One write, inside the documented loop, on `result['value']`.
+    const assignments = [...source.matchAll(/result\['value'\]\s*=/g)];
+    expect(assignments).toHaveLength(1);
+  });
+
+  it('is imported only by the observer (plus the type-only summary import)', () => {
+    const importers = sourceFiles()
+      .filter((name) => importSpecifiers(readSource(name)).includes('./safe-mode-elision.js'))
+      .sort();
+    // `index.ts` re-exports it, `types.ts` imports a type only, `observer.ts` is the one caller.
+    expect(importers).toEqual(['index.ts', 'observer.ts', 'types.ts']);
+  });
+
+  it('calls the pass from exactly one place, behind the apply switch and the observe gate', () => {
+    const observer = readSource('observer.ts');
+    const calls = [...observer.matchAll(/applySafeModeElision\(/g)];
+    expect(calls).toHaveLength(1);
+    expect(observer).toContain('#safeModeApply && this.#canObserve()');
+  });
+
+  it('reads no environment and writes no file of its own', () => {
+    const source = readSource('safe-mode-elision.ts');
+    expect(source).not.toContain('process.env');
+    expect(source.includes('appendFile') || source.includes('writeFile')).toBe(false);
+  });
+
+  it('is off unless the setting says apply', () => {
+    // `resolveSafeModeSetting` is the only place the switch is interpreted.
+    expect(readSource('observer.ts')).toContain("value === 'apply'");
+  });
+});
+
 describe('the Stage 1R mutation probe cannot be activated by the product', () => {
   it('is not referenced from the package entry point', () => {
     expect(readFileSync(path.join(sourceDirectory, 'index.ts'), 'utf8')).not.toContain(

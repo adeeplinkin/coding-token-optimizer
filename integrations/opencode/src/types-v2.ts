@@ -107,10 +107,15 @@
  * What this contract does **not** carry, and Dr. Token does not assume: the
  * `SessionContext` handed to the `context` callback has no `kind` member. The
  * request kind lives on the model-call hooks (`model.request`/`http.request`),
- * which is why M1's eligibility is content-level and the primary-only gate is
- * enforced (in a future apply mode) where the kind is observable. Stage 1P
- * runtime-confirmed delivery, timing and payload completeness of this hook; no
- * mutation has ever been attempted and none is implemented.
+ * which is why M1's eligibility is content-level. Stage 1P runtime-confirmed
+ * delivery, timing and payload completeness of this hook.
+ *
+ * The kind still reaches apply mode, through the hook **name** rather than the
+ * payload: Stage 1T verified in the installed runtime that one dispatch site maps
+ * each request kind to exactly one hook name (`primary` → `context`,
+ * `compaction`/`generate`/`title` → their own names), so registering `context`
+ * means "primary requests only". See
+ * [docs/SAFE_MODE_1T_APPLY_VALIDATION.md](../../../docs/SAFE_MODE_1T_APPLY_VALIDATION.md) §3.
  *
  * The `Session.ID`, `Agent.ID`, `SessionMessage.ID`, `Tool.CallID` and `Tool.Result`
  * aliases above resolve to `string`/`unknown` in the published package; they are kept

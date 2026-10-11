@@ -12,11 +12,14 @@
  *
  * Usage:
  *   node stage1r-capture-server.mjs --capture <file.jsonl> [--port 0] [--mode probe|scripted]
- *                                   [--read-path <abs path>] [--tool-turns 1]
+ *                                   [--read-path <abs path>] [--tool-calls 1]
  *
  * `--mode probe` records the request and answers `500`, which is enough to learn the exact path and
- * body shape. `--mode scripted` answers with one `read` tool call and then a final text answer, so a
- * session completes normally and a second request is assembled with the tool result in it.
+ * body shape. `--mode scripted` answers with `--tool-calls` `read` tool calls (all for `--read-path`,
+ * default one) and then a final text answer, so a session completes normally and a later request is
+ * assembled with the tool result in it. Stage 1T added `--tool-calls` (default `1`, so Stage 1R's
+ * recorded invocation and its results are unchanged) to place two byte-identical read results in one
+ * request.
  *
  * It prints `LISTENING <port>` once it is ready, so a caller can wait for readiness instead of
  * sleeping. It is not part of the product and is never loaded by a plugin.
@@ -25,7 +28,14 @@ import { createServer } from 'node:http';
 import { appendFileSync, writeFileSync } from 'node:fs';
 
 function parseArgs(argv) {
-  const args = { capture: undefined, port: 0, mode: 'probe', readPath: '', toolTurns: 1 };
+  const args = {
+    capture: undefined,
+    port: 0,
+    mode: 'probe',
+    readPath: '',
+    toolTurns: 1,
+    toolCalls: 1,
+  };
   for (let index = 2; index < argv.length; index += 1) {
     const key = argv[index];
     const value = argv[index + 1];
@@ -34,6 +44,7 @@ function parseArgs(argv) {
     else if (key === '--mode') args.mode = value;
     else if (key === '--read-path') args.readPath = value;
     else if (key === '--tool-turns') args.toolTurns = Number(value);
+    else if (key === '--tool-calls') args.toolCalls = Number(value);
   }
   if (args.capture === undefined) {
     throw new Error('--capture <file.jsonl> is required');
@@ -94,9 +105,12 @@ function sseChatCompletion(res, content, toolCalls, includeUsage) {
     })}\n\n`;
   res.write(chunk({ role: 'assistant', content: content === null ? '' : content }, null));
   if (toolCalls !== undefined) {
-    for (const call of toolCalls) {
-      res.write(chunk({ tool_calls: [{ index: 0, ...call }] }, null));
-    }
+    // Each call must carry its own streamed `index`: the runtime assembles deltas by that index,
+    // so two calls sharing `index: 0` collapse into the last one (observed in the first Stage 1T
+    // wire run as a single `tool` message when `--tool-calls 2` was requested).
+    toolCalls.forEach((call, callIndex) => {
+      res.write(chunk({ tool_calls: [{ index: callIndex, ...call }] }, null));
+    });
     res.write(chunk({}, 'tool_calls'));
   } else {
     res.write(chunk({}, 'stop'));
@@ -136,12 +150,13 @@ function scriptedAnswer(bodyText) {
   const includeUsage = parsed?.stream_options?.include_usage === true;
   const toolTurns = messages.filter((message) => message?.role === 'assistant').length < args.toolTurns;
   if (!sawToolResult && toolTurns) {
-    const call = {
-      id: `call_stage1r_${sequence}`,
+    const count = Number.isInteger(args.toolCalls) && args.toolCalls > 0 ? args.toolCalls : 1;
+    const calls = Array.from({ length: count }, (_unused, index) => ({
+      id: `call_stage1r_${sequence}_${index}`,
       type: 'function',
       function: { name: 'read', arguments: JSON.stringify({ path: args.readPath }) },
-    };
-    return { streaming, includeUsage, content: null, toolCalls: [call] };
+    }));
+    return { streaming, includeUsage, content: null, toolCalls: calls };
   }
   return { streaming, includeUsage, content: 'DONE.', toolCalls: undefined };
 }

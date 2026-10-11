@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { resolveSafeModeSetting } from '../src/index.js';
+import { SAFE_MODE_ELISION_MARKER, resolveSafeModeSetting } from '../src/index.js';
 import {
   createV2Host,
   projectLocation,
@@ -48,6 +48,10 @@ function repeatedReadRequest(sessionID: string, value: string): Record<string, u
       { role: 'tool', content: [toolResult('call_2', 'read', value)] },
     ],
     options: { temperature: 0 },
+    // Present in the live `SessionContext` (Stage 1P read 12 tool definitions), and the apply path's
+    // agent-loop shape gate requires the registry to be **non-empty** (Stage 1T): a payload that
+    // declares no tool at all is not the primary agent loop, so the fixture mirrors the live shape.
+    tools: { read: { description: 'read a file', input: {} } },
   };
 }
 
@@ -157,10 +161,37 @@ describe('opt-in surface', () => {
     await host.close();
   });
 
-  it('reports apply as unavailable and observes instead', async () => {
+  // Stage 1T implemented apply mode, so this no longer reports as unavailable. The
+  // expectation is inverted deliberately: asking for apply must now arm it, and the
+  // "unavailable" report is kept for the case where it genuinely cannot run.
+  it('arms apply mode instead of reporting it unavailable', async () => {
     const host = await createV2Host({ env: { DR_TOKEN_SAFE_MODE: 'apply' } });
 
     expect(host.observer.isSafeModeObserving()).toBe(true);
+    expect(host.observer.isSafeModeApplying()).toBe(true);
+    expect(host.registeredSessionHooks()).toEqual(['context']);
+    expect(host.diagnostics.map((diagnostic) => diagnostic.code)).not.toContain(
+      'safe-mode-apply-unavailable',
+    );
+    expect(host.observer.getSafeModeApplySummary()).toMatchObject({
+      mode: 'apply',
+      passId: 'safe.exact-duplicate-tool-result-elision',
+      version: 1,
+      requestsAttempted: 0,
+      requestsApplied: 0,
+    });
+
+    await host.close();
+  });
+
+  it('reports apply as unavailable when observation itself is disabled', async () => {
+    const host = await createV2Host({
+      env: { DR_TOKEN_SAFE_MODE: 'apply', DR_TOKEN_OPENCODE_OBSERVER: 'off' },
+    });
+
+    expect(host.observer.isSafeModeApplying()).toBe(false);
+    // Registration is unchanged by the request: the hook is registered as it is for
+    // `observe`, and the disabled observer contains every callback.
     expect(host.registeredSessionHooks()).toEqual(['context']);
     expect(host.diagnostics.map((diagnostic) => diagnostic.code)).toContain(
       'safe-mode-apply-unavailable',
@@ -507,6 +538,168 @@ describe('privacy', () => {
     const safeMode = host.observer.getSummary('ses_created')?.safeMode;
     expect(safeMode?.candidateCharacters).toBe(value.length);
     expect(safeMode?.notes.join(' ')).not.toContain('CANARY');
+
+    await host.close();
+  });
+});
+
+/**
+ * Safe Mode **apply**, driven through the real V2 adapter boundary.
+ *
+ * The adapter registers the same `context` hook in both modes; what changes is
+ * that the observer hands the assembled payload to the elision pass. These tests
+ * assert the payload the host handed over, because that is the object the host's
+ * request builder serializes.
+ */
+describe('apply mode through the adapter', () => {
+  /** The two tool-result values of {@link repeatedReadRequest}, in request order. */
+  function toolResultValues(payload: Record<string, unknown>): readonly unknown[] {
+    const messages = payload['messages'] as readonly Record<string, unknown>[];
+    return messages
+      .flatMap((message) => (Array.isArray(message['content']) ? message['content'] : []))
+      .filter(
+        (part): part is Record<string, unknown> =>
+          typeof part === 'object' && part !== null && part['type'] === 'tool-result',
+      )
+      .map((part) => (part['result'] as Record<string, unknown>)['value']);
+  }
+
+  it('replaces only the later duplicate and leaves the original and every other part intact', async () => {
+    const value = 'q'.repeat(500);
+    const host = await hostWithSession({ env: { DR_TOKEN_SAFE_MODE: 'apply' } });
+    const payload = repeatedReadRequest('ses_created', value);
+    const before = structuredClone(payload);
+
+    await host.session('context', payload);
+
+    const values = toolResultValues(payload);
+    expect(values).toEqual([value, SAFE_MODE_ELISION_MARKER]);
+
+    // Ordering, identifiers and tool-call relationships are untouched: every part
+    // except the later tool-result value is byte-identical to what arrived.
+    const after = structuredClone(payload) as Record<string, unknown>;
+    const originalPart = (before['messages'] as Record<string, unknown>[])[4] as Record<
+      string,
+      unknown
+    >;
+    (after['messages'] as Record<string, unknown>[])[4] = structuredClone(originalPart);
+    expect(after).toEqual(before);
+    // The information is still in the payload: the surviving original appears once,
+    // the marker appears once, and the duplicate is gone.
+    const serialized = JSON.stringify(payload);
+    expect(serialized.split(value).length - 1).toBe(1);
+    expect(serialized.split(SAFE_MODE_ELISION_MARKER).length - 1).toBe(1);
+
+    const summary = host.observer.getSafeModeApplySummary();
+    expect(summary?.requestsAttempted).toBe(1);
+    expect(summary?.requestsApplied).toBe(1);
+    expect(summary?.elidedOccurrences).toBe(1);
+    expect(summary?.elidedCharacters).toBe(500);
+    expect(summary?.elidedBytes).toBe(500);
+    expect(summary?.markerBytes).toBe(Buffer.byteLength(SAFE_MODE_ELISION_MARKER, 'utf8'));
+    expect(summary?.notes.join(' ')).toMatch(/not a token measurement|No token figure/i);
+
+    await host.close();
+  });
+
+  it('leaves an ineligible duplicate and a disabled observer untouched', async () => {
+    const short = 's'.repeat(135);
+    const applying = await hostWithSession({ env: { DR_TOKEN_SAFE_MODE: 'apply' } });
+    const smallPayload = repeatedReadRequest('ses_created', short);
+    await applying.session('context', smallPayload);
+
+    expect(toolResultValues(smallPayload)).toEqual([short, short]);
+    expect(applying.observer.getSafeModeApplySummary()?.requestsApplied).toBe(0);
+    expect(
+      applying.observer.getSafeModeApplySummary()?.refused['assignment-guard-failed'],
+    ).toBe(0);
+    await applying.close();
+
+    const observing = await hostWithSession({ env: { DR_TOKEN_SAFE_MODE: 'observe' } });
+    const bigPayload = repeatedReadRequest('ses_created', 'b'.repeat(500));
+    await observing.session('context', bigPayload);
+
+    expect(toolResultValues(bigPayload)).toEqual(['b'.repeat(500), 'b'.repeat(500)]);
+    expect(observing.observer.isSafeModeApplying()).toBe(false);
+    expect(observing.observer.getSafeModeApplySummary()).toBeUndefined();
+    await observing.close();
+  });
+
+  it('does not elide twice when the same request is delivered again', async () => {
+    const host = await hostWithSession({ env: { DR_TOKEN_SAFE_MODE: 'apply' } });
+    const payload = repeatedReadRequest('ses_created', 'r'.repeat(500));
+
+    await host.session('context', payload);
+    const onceWritten = toolResultValues(payload);
+    await host.session('context', payload);
+
+    // The marker is present, so E7 refuses the whole request on the second pass.
+    expect(toolResultValues(payload)).toEqual(onceWritten);
+    expect(onceWritten[1]).toBe(SAFE_MODE_ELISION_MARKER);
+    const summary = host.observer.getSafeModeApplySummary();
+    expect(summary?.requestsApplied).toBe(1);
+    expect(summary?.refused['marker-collision']).toBe(1);
+
+    await host.close();
+  });
+
+  it('skips the write when another instance already changed the value', async () => {
+    const value = 'w'.repeat(500);
+    const payload = repeatedReadRequest('ses_created', value);
+
+    // Two independent plugin instances receive the same request object, as Stage 1P
+    // showed. The first writes; the second re-reads and must not write again.
+    const first = await hostWithSession({ env: { DR_TOKEN_SAFE_MODE: 'apply' } });
+    const second = await hostWithSession({ env: { DR_TOKEN_SAFE_MODE: 'apply' } });
+    await first.session('context', payload);
+    const afterFirst = toolResultValues(payload);
+    await second.session('context', payload);
+
+    expect(afterFirst).toEqual([value, SAFE_MODE_ELISION_MARKER]);
+    expect(toolResultValues(payload)).toEqual(afterFirst);
+    expect(first.observer.getSafeModeApplySummary()?.elidedOccurrences).toBe(1);
+    expect(second.observer.getSafeModeApplySummary()?.elidedOccurrences).toBe(0);
+
+    await first.close();
+    await second.close();
+  });
+
+  it('never elides an error result or a non-allowlisted tool', async () => {
+    const value = 'e'.repeat(500);
+    const host = await hostWithSession({ env: { DR_TOKEN_SAFE_MODE: 'apply' } });
+    const payload = repeatedReadRequest('ses_created', value);
+    const messages = payload['messages'] as Record<string, unknown>[];
+    // Turn the second read into an error result and a non-allowlisted tool.
+    messages[4] = {
+      role: 'tool',
+      content: [{ type: 'tool-result', id: 'call_2', name: 'read', result: { type: 'error', value } }],
+    };
+    messages[3] = { role: 'assistant', content: [toolCall('call_2', 'write')] };
+
+    await host.session('context', payload);
+
+    expect(toolResultValues(payload)).toEqual([value, value]);
+    expect(host.observer.getSafeModeApplySummary()?.requestsApplied).toBe(0);
+
+    await host.close();
+  });
+
+  it('refuses a payload that is not agent-loop shaped', async () => {
+    const host = await hostWithSession({ env: { DR_TOKEN_SAFE_MODE: 'apply' } });
+
+    // The live `title` payload shape: no `agent`, no `tools`.
+    await host.session('context', {
+      sessionID: 'ses_created',
+      model: { id: 'test-model' },
+      system: [],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }],
+      options: {},
+    });
+
+    const summary = host.observer.getSafeModeApplySummary();
+    expect(summary?.requestsAttempted).toBe(0);
+    expect(summary?.requestsApplied).toBe(0);
+    expect(summary?.refused['payload-not-agent-loop-shaped']).toBe(1);
 
     await host.close();
   });

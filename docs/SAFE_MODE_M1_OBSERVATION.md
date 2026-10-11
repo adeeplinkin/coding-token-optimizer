@@ -67,7 +67,7 @@ Opt-in semantics:
 | --- | --- |
 | unset / `off` | Safe Mode off; no session hook registered |
 | `observe` | Observation enabled; the request hook is registered |
-| `apply` | **Reported** (`safe-mode-apply-unavailable`) and downgraded to `observe`: apply is part of the design, is not implemented in this revision, and observation is the only Safe Mode behaviour that exists and it modifies nothing |
+| `apply` | Observation **plus** the one documented transformation: the same hook also runs `safe.exact-duplicate-tool-result-elision` (implemented in **Stage 1T**; see [docs/SAFE_MODE_1T_APPLY_VALIDATION.md](SAFE_MODE_1T_APPLY_VALIDATION.md)). Resolves to the `observe` mode with the apply switch on, so the pass can never run without the observation path that contains its failures. Requesting it while observation is disabled is reported (`safe-mode-apply-unavailable`) and nothing is modified |
 | anything else | **Reported** (`safe-mode-setting-ignored`); Safe Mode stays off |
 
 ## 3. Eligibility rules (design §4.2, mapped)
@@ -84,7 +84,7 @@ The design's conditions are evaluated where they are observable at this hook. "E
 | E5 | Both results are completed | The request-level signal is `result.type`; `error` results are excluded and never compared |
 | E6 | Duplicate length ≥ `minElidableChars` (400) | `minEligibleCharacters` (default 400, configurable via `opportunityLimits`); shorter duplicates are still **detected** and counted, then refused as `below-minimum-characters` |
 | E7 | No part already contains the marker prefix | Scanned over compared tool-result texts, `text`/`reasoning` part texts and `system` parts; on a collision **every** would-be elision in that request is refused (`marker-collision`) |
-| E8 | The request kind is `primary` | **Not observable at this hook**: the published `SessionContext` that `session.hook("context")` delivers has no `kind` member (the kind lives on the model-call hooks). M1 does not guess; eligibility is *content-level*, the summary notes say so, and the primary-only gate remains an apply-time requirement |
+| E8 | The request kind is `primary` | **Not observable in the payload**: the published `SessionContext` that `session.hook("context")` delivers has no `kind` member (the kind lives on the model-call hooks), so M1's *counts* are content-level. It is observable in the hook **name**, and apply time enforces it there: the caller must state a verified basis (`context-hook`) and the payload must be primary agent-loop shaped (non-empty `agent`, non-empty `tools`, `messages`). Stage 1T verified the kind → hook mapping at the runtime's single dispatch site *and* live (`context` 1:1 with `model.request:primary`; title uses `title`; compaction/generate have their own names), so `compaction`/`generate`/`title` are excluded **by construction** — see [docs/SAFE_MODE_1T_APPLY_VALIDATION.md](SAFE_MODE_1T_APPLY_VALIDATION.md) §3 and §6 |
 | E9 | The scan stays inside its work budget | Bounded scan (§5); when a bound is hit the request is marked `bounded` and all would-be elisions in it are refused (`scan-bounded`), fail-closed about transforming |
 
 Additional v1 scope decisions, all recorded rather than approximated:
@@ -226,8 +226,9 @@ kind of honest distinction the measurement exists to produce.
   the offline validation replays recorded evidence — so M1's *counting semantics* are verified
   off-runtime, while the measurement of duplicates in **real work** is exactly what M1 is for and has
   not been collected yet.
-- **Unverified at this hook.** E8 (request kind): the `context` payload carries no `kind`; the
-  primary-only gate is enforced where the kind is observable (a future apply mode).
+- **Unverified at this hook.** E8 (request kind) is not readable from the `context` **payload**; the
+  primary-only gate is enforced from the hook **name**, which Stage 1T verified against the installed
+  runtime's dispatch site and a live session ([docs/SAFE_MODE_1T_APPLY_VALIDATION.md](SAFE_MODE_1T_APPLY_VALIDATION.md) §3).
 
 ## 9. Files changed
 
@@ -247,8 +248,13 @@ kind of honest distinction the measurement exists to produce.
 
 ## 10. Limitations and the next gates
 
-1. **E8 (request kind) remains unobservable at this hook.** Apply mode must enforce it where the
-   kind is observable; M1 records content-level eligibility and says so.
+1. **E8 (request kind) is still not readable from the payload** — and no longer needs to be. **Stage
+   1T resolved it where the kind *is* knowable**: the hook name. Apply refuses unless the caller
+   states the verified hook basis and the payload is primary agent-loop shaped (non-empty `agent` and
+   `tools`). `compaction`, `generate` and `title` never reach `context`, because the runtime maps each
+   kind to its own hook name at a single dispatch site
+   ([docs/SAFE_MODE_1T_APPLY_VALIDATION.md](SAFE_MODE_1T_APPLY_VALIDATION.md) §3). M1's own counts
+   remain content-level.
 2. **The wire baseline is deliberately deferred.** The design's M1 gate mentions measuring the true
    sent size; the stage brief scoped 1Q to opportunity measurement, and a length-only body
    measurement is a separate privacy decision that belongs with M2's mechanism check.
@@ -256,8 +262,11 @@ kind of honest distinction the measurement exists to produce.
    optimised; one synthetic case says nothing about rates.
 4. **The comparison contract still needs the declared single-axis variant** (design §6.4) before any
    `benchmark-verified` verdict is possible.
-5. **M2 is not implemented.** No mutation exists anywhere in the product. The *influence* question it
-   depends on — whether the runtime sends a value a plugin writes into the assembled request — was
-   answered separately in Stage 1R (**yes**; runtime-verified) and is recorded in
-   [docs/OPENCODE_REQUEST_HOOK_VALIDATION.md](OPENCODE_REQUEST_HOOK_VALIDATION.md) §11. What remains is
-   M2's own apply mode and its length-based wire check.
+5. **M2's mechanism is now implemented (Stage 1T); M2's real-work evaluation is not.** The
+   *influence* question it depends on — whether the runtime sends a value a plugin writes into the
+   assembled request — was answered in Stage 1R (**yes**; runtime-verified) and is recorded in
+   [docs/OPENCODE_REQUEST_HOOK_VALIDATION.md](OPENCODE_REQUEST_HOOK_VALIDATION.md) §11. Stage 1T adds
+   the apply pass and repeats that experiment for a **size change**, with disabled, ineligible and
+   unverified-kind controls ([docs/SAFE_MODE_1T_APPLY_VALIDATION.md](SAFE_MODE_1T_APPLY_VALIDATION.md)).
+   Nothing here is a savings claim: the optimization is off by default and its effect on coding
+   correctness is the next stage's question.
