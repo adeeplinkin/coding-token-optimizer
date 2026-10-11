@@ -256,5 +256,8 @@ kind of honest distinction the measurement exists to produce.
    optimised; one synthetic case says nothing about rates.
 4. **The comparison contract still needs the declared single-axis variant** (design §6.4) before any
    `benchmark-verified` verdict is possible.
-5. **M2 is not implemented and not prepared here.** No mutation exists; whether the runtime honours a
-   mutated `SessionContext` remains unverified and is M2's wire-check question.
+5. **M2 is not implemented.** No mutation exists anywhere in the product. The *influence* question it
+   depends on — whether the runtime sends a value a plugin writes into the assembled request — was
+   answered separately in Stage 1R (**yes**; runtime-verified) and is recorded in
+   [docs/OPENCODE_REQUEST_HOOK_VALIDATION.md](OPENCODE_REQUEST_HOOK_VALIDATION.md) §11. What remains is
+   M2's own apply mode and its length-based wire check.

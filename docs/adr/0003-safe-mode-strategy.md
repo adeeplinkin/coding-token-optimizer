@@ -72,10 +72,12 @@ implement it on **OpenCode V2 only**.
 
 **Negative / costs**
 
-- **The influence half is still unproven.** Stage 1P runtime-verified that the hook fires with the
-  complete request, so *observation* is settled; whether the runtime **honours a mutated request** is
-  not, and no token claim may rest on it until M2 proves it. A negative result there is a legitimate
-  outcome of this ADR.
+- **The influence half was open for a stage, and is now settled.** Stage 1P runtime-verified that the
+  hook fires with the complete request, so *observation* was settled then. Stage 1R runtime-verified that
+  the runtime **honours a mutated request**: the value written in the callback was the value captured on
+  the wire, with nothing else in the request changed. The mechanism therefore no longer rests on a
+  declaration — but the *effect* is still unearned, because nothing yet shows that an elision leaves the
+  model's answer correct. No token claim may rest on the mechanism alone.
 - Savings are bounded by the window in which two identical copies coexist in one request — compaction
   trimming one of them legitimately disables the elision. Expect modest, not dramatic, numbers.
 - The v1 allowlist is deliberately one tool (`read`), so coverage starts small.
@@ -118,7 +120,7 @@ implement it on **OpenCode V2 only**.
 
 ## Open questions
 
-- Would a mutated `SessionContext` be honoured by OpenCode Desktop 2.0.24? Delivery is proven; influence is not (M2's wire check).
+- **Would a mutated `SessionContext` be honoured by OpenCode Desktop 2.0.24? Yes — answered in Stage 1R.** A substituted string written inside `session.hook("context")` reached the provider wire, and a full structural diff of the outbound body showed that single substitution and nothing else ([docs/OPENCODE_REQUEST_HOOK_VALIDATION.md](../OPENCODE_REQUEST_HOOK_VALIDATION.md) §11).
 - Does the host's usage counter move when the request shrinks, or does cache accounting hide it?
 - How do two plugins that both rewrite `messages` interact?
 - What is the real-world duplicate-read rate that M1 will measure, and is it large enough to justify M3–M5?
@@ -152,7 +154,8 @@ Stage 1P did **not** implement the decision; it verified the dependency it rests
   ADR's equivalence precondition (byte-identical content with the earlier copy still present), observed
   on real traffic rather than argued from a declaration.
 
-**Not yet earned:** whether a **mutated** request would be honoured (M2), how often duplicates occur in
-real work (M1), and the compaction/title/generate request kinds. The full record, including two probe
-defects found by its own tests, is in
+**Not yet earned:** the *effect* of an elision on task correctness (M3–M5), how often duplicates occur
+in real work (M1), and the compaction/title/generate request kinds. The influence question Stage 1P left
+open was answered in Stage 1R — a mutation reaches the wire. The full record, including two probe defects
+found by its own tests and the Stage 1R influence evidence, is in
 [docs/OPENCODE_REQUEST_HOOK_VALIDATION.md](../OPENCODE_REQUEST_HOOK_VALIDATION.md).

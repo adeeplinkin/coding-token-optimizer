@@ -1,4 +1,4 @@
-# OpenCode request-hook validation (Stage 1P)
+# OpenCode request-hook validation (Stages 1P and 1R)
 
 **Status (2026-10-11): the OpenCode V2 model-request hook is RUNTIME-VERIFIED end to end** —
 registration, invocation, timing, and the live shape of an assembled request **including two
@@ -9,8 +9,10 @@ free-model session**.
 **Runtime:** `opencode v2.0.24` — the Desktop app's own bundled CLI
 (`%LOCALAPPDATA%\Programs\@opencodedesktop\resources\opencode-cli.exe`, byte-identical to
 `%APPDATA%\ai.opencode.desktop\cli\2.0.24\opencode-cli.exe`, 206 128 008 bytes).
-**Probe:** `integrations/opencode/src/request-probe.ts` (observation only, not exported from the package
-entry point). **Tests:** `integrations/opencode/tests/request-probe.test.ts` (29 tests).
+**Probes:** `integrations/opencode/src/request-probe.ts` (Stage 1P, observation only, not exported from
+the package entry point) and `integrations/opencode/src/request-mutation-probe.ts` (Stage 1R, the gated
+influence probe; also not exported). **Tests:** `integrations/opencode/tests/request-probe.test.ts`
+(29 tests) and `integrations/opencode/tests/request-mutation-probe.test.ts` (34 tests).
 **Related:** [docs/SAFE_MODE_DESIGN.md](SAFE_MODE_DESIGN.md) ·
 [docs/SAFE_MODE_M1_OBSERVATION.md](SAFE_MODE_M1_OBSERVATION.md) (Stage 1Q: the M1 opportunity analyzer built on this hook) ·
 [docs/adr/0003-safe-mode-strategy.md](adr/0003-safe-mode-strategy.md) ·
@@ -26,6 +28,13 @@ entry point). **Tests:** `integrations/opencode/tests/request-probe.test.ts` (29
 > same request** — one duplicate group, one elidable later copy, **135 elidable characters**. No
 > provider was contacted during the zero-cost phase (a built-in provider pointed at a dead loopback
 > endpoint), and the single authorized model call was free-tariff and synthetic-content only.
+
+> **Stage 1R follow-up (2026-10-11): the influence half is now RUNTIME-VERIFIED.** Stage 1P settled
+> *delivery* — the callback fires during assembly. Stage 1R settles *influence*: a value written inside
+> `ctx.session.hook("context")` is the value the runtime sends to the provider. A control/treatment
+> pair captured the real outbound bodies at a private loopback endpoint, and the treatment body
+> differed from the control **in exactly one place: the substituted string**. No provider was contacted,
+> no credential was used and no model call was made. See **§11**.
 
 ---
 
@@ -56,6 +65,9 @@ runtime) · **Contract-verified** (read from the published declaration of the *e
 **No gap remains in the four questions this stage had to answer:** the hook exists, is registrable,
 fires at the required timing, and carries complete model-visible tool results including a detectable
 duplicate (§5).
+
+**The one question this stage deliberately left open — whether a mutation made in that callback is
+honoured — was answered afterwards, in §11 (Stage 1R): yes, it reaches the wire.**
 
 ## 3. Method (zero cost, zero provider contact)
 
@@ -257,13 +269,13 @@ override was removed for this run and restored afterwards. Because config/data i
 complete on this platform (§3), the session record was written to the normal OpenCode store — the
 expected consequence of using the CLI, and the only thing this stage wrote outside `%TEMP%`.
 
-### 5.1 Still unverified, with no claim made
+### 5.1 Not verified by this stage (Stage 1P)
 
 - **Compaction timing** (`kind: "compaction"`, `hasCompactionPart`) — contract-verified only; every
   live request was `primary`.
 - **Desktop GUI sessions** — the GUI's own runtime was not driven; only the bundled CLI was.
-- **Whether a mutated context would be honoured.** This stage proves *observation*; influence is a
-  separate risk with its own milestones (Stage 1O §11 M1–M2).
+- **Whether a mutated context would be honoured** — this stage proves *observation*; influence was a
+  separate risk with its own milestone. **It was answered later, by Stage 1R: see §11.**
 - **Whether the runtime's *own* read result is identical for a re-read in every case** — one file, one
   range, one session. A differing copy must (and does, by construction) disable elision.
 - **`tool-argument` read identification on V2** remains as recorded in Stage 1N.
@@ -380,3 +392,233 @@ evidence file contains one `probe-start` with all three capabilities `true`, the
    pairing and ~2 ms separation, not by a synchronized instrument.
 6. **`Context` members beyond what is needed were not probed** — the probe deliberately ignores
    provider/HTTP details it does not need.
+
+---
+
+## 11. Stage 1R — influence validation (runtime-verified)
+
+**Status (2026-10-11): RUNTIME-VERIFIED at zero cost.** A value written into an assembled request inside
+`ctx.session.hook("context")` is the value the runtime sends to the provider. Stage 1P settled *delivery*
+(the callback fires, with the complete request, before the send); this stage settles *influence* (the host
+honours the edit).
+
+**Verdict: influence PROVEN — not inferred, and not disproven.** The outbound body was captured at a
+private loopback endpoint that a built-in provider was pointed at. No provider was contacted, no
+credential was used, no model call was made and no cost was incurred.
+
+### 11.1 What was asked, and what was measured
+
+| Question | Result |
+| --- | --- |
+| Does a mutation made in the `context` callback reach the outbound request? | **Runtime-verified: yes.** In both treatment runs the provider body contained the substituted string and not the original one |
+| Does the mutation reach the request when it is *disabled*? | **Runtime-verified: no.** The disabled run and the observe-mode control sent the unmodified content |
+| Does anything unrelated change? | **Runtime-verified: no.** A full structural diff of the whole captured body against the control found **exactly one** difference, at the substitution site |
+| Do malformed payloads fail safely? | **Unit-tested + runtime-verified in shape.** Every refusal path is recorded, never guessed, and never throws into the host (§11.6) |
+| Can the experiment activate itself in production? | **No.** The probe is not exported from the package entry point, and a source guard fails if any shipped module imports it |
+| Can the `context` callback distinguish request kinds? | **No — reconfirmed. The payload has no `kind`.** Its keys are `sessionID, model, system, messages, options, agent, tools`; the kind exists only on `model.request`/`http.request` |
+
+### 11.2 Method (zero cost, zero provider contact)
+
+A disposable project (`%TEMP%\dr-token-stage1r\project`, isolated `XDG_CONFIG_HOME`/`XDG_DATA_HOME`,
+synthetic fixtures only) with three pieces and nothing else:
+
+1. **A capture server**, not a model — `integrations/opencode/scripts/stage1r-capture-server.mjs`. It
+   listens on loopback, records every request it receives, and answers as a provider would: one `read`
+   tool call first, then a final text answer. It is a validation aid, not product code.
+2. **A project config** pointing the *built-in* provider at it:
+   `{ "provider": { "opencode": { "options": { "baseURL": "http://127.0.0.1:<port>/v1" } } } }`.
+3. **A harness plugin** (`<project>/.opencode/plugins/dr-token-m2-probe.ts`, eleven lines) that loads the
+   probe from a staged copy of `dist/` and forwards the process environment and sink to it.
+
+The protocol was learned in a capture-only recon run rather than assumed: the runtime posts
+`POST /v1/chat/completions` with `application/json`, `stream: true`,
+`stream_options.include_usage: true`, `max_completion_tokens`, **12 tool definitions** and roles
+`system,user` for the first call and `system,user,assistant,tool` for the second. The capture server
+answers in exactly that shape, which is why a session completes normally (`exit 0`, model replies
+`DONE.`) and a **second real request** is assembled with the tool result inside it.
+
+**The permitted edit** (the only assignment in the whole probe): one `tool-result` part whose
+`result.type` is `text`, whose value is a string, and whose value contains the configured marker
+**exactly once in the entire request** — `result.value` is rewritten with that single occurrence
+replaced. The fixture is `fixtures/m2-content.json` =
+`{"lines":["ALPHA","BETA","GAMMA"],"note":"DRTOKEN-M2-ORIGINAL-7f3a"}`; the substitution swaps the
+marker word only (`ORIGINAL` → `MODIFIED`), so **the replacement is the same length as the original**.
+
+**Five sessions**, each with a fresh capture server, a fresh session id and the same prompt:
+
+| Run | Switch | Marker pair |
+| --- | --- | --- |
+| `control` | `observe` (a marker configuration is supplied, but mutation is not enabled) | present → modified |
+| `treatment1` | `mutate` | present → modified |
+| `treatment2` | `mutate` (repeat, for determinism) | present → modified |
+| `disabled` | `off` (the probe registers nothing) | present → modified |
+| `notarget` | `mutate`, but the configured marker does not exist in the request | absent → replaced |
+
+### 11.3 Exact mutation and control results
+
+All five sessions: `exit 0`, one `read` of the synthetic fixture, model reply `DONE.`, **two** outbound
+requests, both `kind: "primary"`, no retry.
+
+| Run | Request 1 (21,244 bytes, `system,user`) | Request 2 (`system,user,assistant,tool`) | Byte-identical to control request 2? | Probe record for invocation 2 |
+| --- | --- | --- | --- | --- |
+| `control` | no marker | **contains the original** | yes (baseline) | target found (1 part, 1 occurrence), nothing written |
+| `treatment1` | no marker | **contains the substituted value; the original is absent** | **no — exactly 1 difference** | `applied: true`, 117 → 117 characters |
+| `treatment2` | no marker | **contains the substituted value; the original is absent** | **no — exactly 1 difference** | `applied: true`, 117 → 117 characters |
+| `disabled` | no marker | **contains the original** | yes | `bypassed` — nothing was registered |
+| `notarget` | no marker | **contains the original** | yes | `attempted: true`, `applied: false`, refusal `target-absent` |
+
+The structural diff of the whole captured body (control request 2 vs treatment request 2), recursive,
+over every key and array element:
+
+```json
+{"path":"$.messages[3].content","bytes":[117,117],"commonPrefix":102,"left":"ORIGINAL","right":"MODIFIED"}
+```
+
+That is the **only** difference. The model id, all 4 system parts, every other message and part, all 12
+tool definitions, the option map and the generation parameters are byte-identical, and both bodies are
+21,632 bytes. Because the substitution is deliberately **the same length**, the byte count cannot mask a
+content change — the presence/absence of each marker string is decisive on its own:
+`{ORIG: true, MOD: false}` for the control and `{ORIG: false, MOD: true}` for each treatment.
+
+Two further details worth recording:
+
+- In the treatment runs the **first** invocation (before any tool result existed) reported
+  `attempted: true, applied: false, refusal: target-absent` — the gate refuses rather than guessing, even
+  in `mutate` mode.
+- The `disabled` run produced exactly one probe record (`bypassed`) and an unmodified body, so the switch
+  is a real gate and not a label.
+
+### 11.4 Why it works (mechanism, `source-confirmed` in the shipped build)
+
+The pinned `2.0.24` binary is a single-file executable whose embedded application bundle is readable.
+The two functions that decide this question are the hook trigger and the request builder:
+
+```js
+// @opencode/PluginHooks — the payload object goes to each callback, and the SAME object is returned
+s = b(function* (l, c, f) {
+  for (let h of e.get(r(l, c)) ?? []) {
+    if (h.options?.providerID !== undefined && h.options.providerID !== of(f)) continue;
+    yield* h.callback(f);            // ← the callback receives the payload itself
+  }
+  return f;                          // ← and the trigger returns that same object
+})
+
+// @opencode/SessionModelRequest.prepare — the provider request is built from the trigger's RETURN value
+R  = yield* f({ sessionID, model, system, messages, options }, toolsByName);
+...  system: R.system, messages: I9(g9(R.messages, M.capabilities)), options: ..., tools: ...
+```
+
+So the object a plugin edits **is** the object the request is assembled from, and the runtime's own
+post-processing (`g9`/`I9`, which only rewrites media/file parts a model cannot accept) leaves a `text`
+tool result untouched. This is `source-confirmed` — read from the exact pinned build — and the captures
+above are the runtime verification of it. It is also why the probe needed no return value: the V2
+contract has no return channel, and none is required.
+
+### 11.5 Safety and isolation
+
+- **Explicitly gated, disabled by default.** Mutation requires *both* a `mutation` configuration *and*
+  the switch value `mutate`. The switch values `off`/`false`/`0`/`no`/`disabled` register nothing at all,
+  and any other value (including unset) can only observe.
+- **One assignment, one scope.** The only write anywhere in the module is one substitution inside one
+  `text` tool result's value. `system`, `options` (model settings), `tools`, `agent`, permissions and
+  tool-call inputs are never assigned, deleted or redefined — asserted by a unit test that freezes all of
+  them, and confirmed at run level by the whole-body diff above.
+- **Refusals are recorded, never guessed:** `invalid-config`, `target-absent`, `target-ambiguous`,
+  `target-occurrences-not-unique`, `assignment-failed` (a frozen payload). An assignment failure is
+  contained and reported; it never becomes an exception in the host.
+- **Content-free by construction.** Probe records carry counts, key *names*, booleans, lengths and
+  one-way digests — never prompt text, file paths, tool-result content or header values. A sweep of all
+  five probe record files found **none** of the fixture text, the markers, the file name, the prompt
+  text, the substituted marker or any credential-shaped string. The capture server records header
+  **names** only (a value lookup returns `false`); the raw bodies exist solely as disposable `%TEMP%`
+  evidence and are not committed, quoted or summarised beyond booleans and lengths here.
+- **No production path.** The probe is not exported from the package entry point, no shipped module
+imports it, it reads no environment of its own (the single-environment-reader source guard still holds)
+and it writes no file (the single-writer guard still holds). Both are enforced by the source guard and
+by tests.
+- **Containment unchanged.** The observer's own defaults, its bypass switch, its failure posture and the
+  adapters' registrations are untouched; the experiment ran in a disposable project that was removed
+  afterwards (plugin file, vendored copy and project config deleted; every capture server stopped —
+  confirmed by probing all five experiment ports, all closed).
+
+### 11.6 Tests
+
+The probe ships with **34 unit tests** (`tests/request-mutation-probe.test.ts`) and **4 source guards**
+(`tests/source-guard.test.ts`), covering: registration and capability reporting; every disable value;
+the mode-resolution table; observe mode leaving a deep-frozen payload untouched; the payload key names
+and the absent `kind`; the nested-`context` payload variant; the http-request record; the marker booleans
+appearing only when the caller named the markers; the successful single substitution and its exact text;
+the control-versus-treatment switch comparison on identical payloads; frozen `system`/`options`/`tools`/
+tool-call inputs; each refusal (`target-absent`, `target-ambiguous`, `target-occurrences-not-unique`,
+`invalid-config`, `assignment-failed`); non-`text` results (`content`, `json`, non-string value); the
+marker in `system`, in a tool-call input, or outside the per-payload bound; the retry path; a throwing
+accessor; a throwing sink; the record cap; malformed payload shapes; the default limits; and that the
+module is unreachable from the package entry point.
+
+### 11.7 Reproducing this validation
+
+```bash
+CLI="$LOCALAPPDATA/Programs/@opencodedesktop/resources/opencode-cli.exe"
+BASE="$LOCALAPPDATA/Temp/dr-token-stage1r"
+mkdir -p "$BASE/project/.opencode/plugins" "$BASE/project/.opencode/vendor/dr-token-probe/dist" \
+         "$BASE/project/fixtures" "$BASE/iso/config" "$BASE/iso/data" "$BASE/evidence"
+cp -r integrations/opencode/dist/. "$BASE/project/.opencode/vendor/dr-token-probe/dist/"
+# fixture: {"lines":["ALPHA","BETA","GAMMA"],"note":"DRTOKEN-M2-ORIGINAL-7f3a"}
+# harness plugin: loads createMutationProbe from ../vendor/.../request-mutation-probe.js,
+#                forwards process.env and a JSONL sink (see §11.2).
+
+node integrations/opencode/scripts/stage1r-capture-server.mjs \
+  --capture "$BASE/evidence/<run>-capture.jsonl" --port 8792 --mode scripted \
+  --read-path "fixtures/m2-content.json" --tool-turns 1 &
+
+# config: { "provider": { "opencode": { "options": { "baseURL": "http://127.0.0.1:8792/v1" } } } }
+cd "$BASE/project"
+# DR_TOKEN_M2_PROBE: `observe` (control) | `mutate` (treatment) | `off` (disabled run)
+XDG_CONFIG_HOME="$BASE/iso/config" XDG_DATA_HOME="$BASE/iso/data" \
+DR_TOKEN_M2_PROBE=observe \
+DR_TOKEN_M2_PROBE_EVIDENCE="$BASE/evidence/<run>-probe.jsonl" \
+DR_TOKEN_M2_ORIGINAL=DRTOKEN-M2-ORIGINAL-7f3a \
+DR_TOKEN_M2_REPLACEMENT=DRTOKEN-M2-MODIFIED-7f3a \
+  "$CLI" run --standalone --auto --title "stage1r" --model opencode/big-pickle \
+  "Read fixtures/m2-content.json and report the note field." < /dev/null
+```
+
+Expected: the session completes (`exit 0`, `DONE.`); the capture file holds two requests; the second
+contains the marker pair's original (control/disabled/notarget) or the substituted value
+(treatment) — and nothing else differs between them.
+
+### 11.8 What this stage does **not** claim
+
+1. **A same-length substitution proves the content path, not any size change.** It says nothing about
+   whether a *shorter* body is framed, parsed or billed as expected; M2's apply-mode wire check (design
+   §6.3) is still required before any elision is shipped, and it still needs its own length-only
+   measurement.
+2. **No token or cost claim.** Nothing here measured tokens, and the experiment's own server reports none.
+   A smaller request is not a saving until M4/M5's benchmark schema and controls say so.
+3. **One synthetic file, one tool (`read`), one result, `kind: "primary"` only.** Compaction, title and
+   generate requests were not produced, and — reconfirmed here — the `context` payload cannot even
+   distinguish them, so apply mode must enforce its primary-only gate where the kind *is* observable.
+4. **Only the bundled CLI was driven.** The Desktop GUI's own runtime remains unverified, as in every
+   previous stage.
+5. **The probe could not read the body in-process.** At `http.request` the body is a `ReadableStream`
+   (`bodyType: "ReadableStream"`, no length), so the wire evidence comes from the capture server rather
+   than from the probe. This is recorded as a finding, not worked around: extending the probe to consume a
+   clone would change its cost and its obligations for evidence the capture already provides.
+6. **This is not an implementation.** No elision, no apply mode, no Safe Mode code, no product change:
+   the probe exists only to answer the influence question, and stays out of the shipped package.
+
+### 11.9 Files changed in Stage 1R
+
+| File | Change |
+| --- | --- |
+| `integrations/opencode/src/request-mutation-probe.ts` | **New.** The gated influence probe (not exported) |
+| `integrations/opencode/tests/request-mutation-probe.test.ts` | **New.** 34 tests |
+| `integrations/opencode/scripts/stage1r-capture-server.mjs` | **New.** The loopback capture server used as a stand-in provider |
+| `integrations/opencode/tests/source-guard.test.ts` | Four guards: unreachable from the entry point, imported by no shipped module, no environment read, no file write, one documented assignment |
+| `docs/OPENCODE_REQUEST_HOOK_VALIDATION.md` | This section, and the header/§2/§5.1 updates |
+| `docs/SAFE_MODE_DESIGN.md`, `docs/SAFE_MODE_M1_OBSERVATION.md`, `docs/adr/0003-safe-mode-strategy.md`, `README.md` | The influence question is recorded as answered, with its limits |
+
+**Verification (all five commands, exit 0):** `npm run typecheck`, `npm run build`, `npm test`
+(**582 passed, 0 failed** — 19 core, 70 benchmark, 83 Codex, 410 OpenCode), `npm run verify` (582 passed,
+0 failed) and `npm run benchmark` (16 correctness checks passed, 8 fixtures `unavailable`, no savings
+claim). All 544 tests that existed before this stage still pass.

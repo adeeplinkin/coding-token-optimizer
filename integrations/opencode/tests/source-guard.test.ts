@@ -106,6 +106,34 @@ describe('no telemetry or network path', () => {
   });
 });
 
+describe('the Stage 1R mutation probe cannot be activated by the product', () => {
+  it('is not referenced from the package entry point', () => {
+    expect(readFileSync(path.join(sourceDirectory, 'index.ts'), 'utf8')).not.toContain(
+      'request-mutation-probe',
+    );
+  });
+
+  it('is imported by no shipped module', () => {
+    const importers = sourceFiles().filter((name) =>
+      importSpecifiers(readSource(name)).includes('./request-mutation-probe.js'),
+    );
+    expect(importers).toEqual([]);
+  });
+
+  it('reads no environment and writes no file of its own', () => {
+    const source = readSource('request-mutation-probe.ts');
+    expect(source).not.toContain('process.env');
+    expect(source.includes('appendFile') || source.includes('writeFile')).toBe(false);
+  });
+
+  it('keeps its only assignment inside the mutation it documents', () => {
+    const source = readSource('request-mutation-probe.ts');
+    // One assignment to a payload member, and it is the documented substitution.
+    const assignments = [...source.matchAll(/target\.container\['value'\]\s*=/g)];
+    expect(assignments).toHaveLength(1);
+  });
+});
+
 describe('dependency hygiene', () => {
   it('declares no runtime dependency', () => {
     const manifest = JSON.parse(readFileSync(path.join(packageRoot, 'package.json'), 'utf8')) as {

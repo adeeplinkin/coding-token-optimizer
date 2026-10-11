@@ -51,7 +51,7 @@ runtime and the `path`/`data` differences were runtime-confirmed in Stages 1E–
 | `ctx.event.subscribe()` delivers the event stream (55 events in one live run) | **Runtime-verified** |
 | `session.usage.updated` carries host-reported tokens (`input`, `output`, `reasoning`, `cache.read`, `cache.write`) and cost | **Runtime-verified** (values matched the runtime's own session totals) |
 | Session lifecycle + project scope gate (`session.created/deleted/moved`) | **Runtime-verified** (Stage 1J) |
-| `ctx.session.hook("context")` exists and its `SessionContext` exposes **mutable** `system`, `messages`, `options`, `tools` while the model request is assembled | **Contract-verified** (published 2.0.24 declarations); **invocation runtime-verified in Stage 1P** (fires per attempt, ~2 ms before the send, with the complete request: 4 system parts, the message list, 12 tool definitions). **Whether a mutation would be honoured remains unverified** |
+| `ctx.session.hook("context")` exists and its `SessionContext` exposes **mutable** `system`, `messages`, `options`, `tools` while the model request is assembled | **Contract-verified** (published 2.0.24 declarations); **invocation runtime-verified in Stage 1P** (fires per attempt, ~2 ms before the send, with the complete request: 4 system parts, the message list, 12 tool definitions). **A mutation is honoured: runtime-verified in Stage 1R** — a substituted value reached the provider wire with nothing else changed ([docs/OPENCODE_REQUEST_HOOK_VALIDATION.md](OPENCODE_REQUEST_HOOK_VALIDATION.md) §11) |
 | `ctx.session.hook("http.request")` exposes the actual outbound `Request` (and `http.response` the response) | **Contract-verified**; **invocation runtime-verified in Stage 1P** |
 | `ctx.session.hook("compaction")` can supply `result` and *skip the model request*; `ctx.permission.hook("evaluate")` can change `effect`; `ctx.tool.transform` can add/update/remove tool definitions | **Contract-verified** — unverified |
 | `Tool.Result = { output?, content?, metadata? }` (members readonly; the *event* property is replaceable) | **Contract-verified** |
@@ -212,10 +212,13 @@ capability gap rather than worked around.
 
 Two honest caveats about OpenCode, both of which shape the milestones in §11:
 
-1. **Delivery is settled; influence is not.** Stage 1P runtime-verified that `session.hook("context")`
-   fires during assembly with the complete request, and that the run behaved identically with the probe
-   present and absent. What remains unproven is whether the runtime **honours a mutated object** — that
-   is what M2's wire check exists for, and no token claim is possible before it.
+1. **Delivery and influence are settled; the *effect* is not.** Stage 1P runtime-verified that
+   `session.hook("context")` fires during assembly with the complete request, and that the run behaved
+   identically with the probe present and absent. Stage 1R then runtime-verified that the runtime
+   **honours a mutated object**: a value written in the callback was the value captured on the wire
+   (see [docs/OPENCODE_REQUEST_HOOK_VALIDATION.md](OPENCODE_REQUEST_HOOK_VALIDATION.md) §11). What is
+   still unproven is the *effect* — that removing a duplicate leaves the model's answer correct — which
+   is M2's wire check plus M3's deterministic gate. No token claim is possible before those.
 2. The 2.0.24 declarations are the ones the repository already vendored (digests recorded in
    `integrations/opencode/src/types-v2.ts`); the API line is moving, so capability detection stays
    runtime and the adapter stays thin.
@@ -580,7 +583,7 @@ There is no persistent Safe Mode state to clean up: no cache, no database, no da
 | Scenario | Expected behaviour |
 | --- | --- |
 | The host does not deliver `session.hook("context")` (or the payload is not the expected shape) | Capability detection disables the strategy; the adapter reports `strategy-disabled`; the observer keeps working |
-| The mutated request is **not** honoured by the host | Detected at `http.request` (no shrink) → the apply mode is reported as **ineffective**, no savings claim is made, and the milestone stops |
+| The mutated request is **not** honoured by the host | Detected at `http.request` (no shrink) → the apply mode is reported as **ineffective**, no savings claim is made, and the milestone stops. **Not observed in Stage 1R**: the edit reached the wire |
 | The request contains no duplicate | Normal, expected, and the most common case: record `no-opportunity` |
 | The duplicate's earlier copy has already been trimmed by compaction | No elision (E4) — the pass never assumes a copy outside the payload it holds |
 | A file changed between the two reads | Different content → no elision |
@@ -598,7 +601,7 @@ There is no persistent Safe Mode state to clean up: no cache, no database, no da
 | Milestone | Deliverable | Gate to pass |
 | --- | --- | --- |
 | **M1 — observe only** — ✅ **implemented (Stage 1Q)** | OpenCode V2 adapter builds a request view from `session.hook("context")` in observe mode and records content-free would-elide decisions; see [docs/SAFE_MODE_M1_OBSERVATION.md](SAFE_MODE_M1_OBSERVATION.md) | Recorded Stage 1P evidence replayed offline: every count reproduced, and the one live duplicate (135 chars) is correctly classified *ineligible* against the 400-char threshold. Still open: duplicate rates in **real** work, the (c) wire baseline, and E8's primary-only gate (not observable at this hook). **No mutation** |
-| **M2 — apply behind an opt-in flag** | The transformation runs in `mode: "apply"`; the wire check proves the body shrank by the recorded amount and retained parts are unchanged | Mechanism proven end-to-end before any benchmark |
+| **M2 — apply behind an opt-in flag** | The transformation runs in `mode: "apply"`; the wire check proves the body shrank by the recorded amount and retained parts are unchanged | Mechanism proven end-to-end before any benchmark — the **influence half is already proven (Stage 1R)**; the apply-mode shrink check is still M2's own gate |
 | **M3 — the correctness gate** | Level 1 harness (§6.2) in CI, including the independent preservation checker and the refusal cases | All Level 1 assertions pass; failing rejects the strategy |
 | **M4 — benchmark schema** | Declared single-axis variant in provenance + comparability rule (§6.4) | A control/treatment pair compares as `unavailable`/`benchmark-verified`, never `invalid` |
 | **M5 — Level 2 experiment** | Paired control/treatment runs with mechanism evidence and the §6.3 controls | Published result, or a published rejection |
@@ -609,7 +612,7 @@ There is no persistent Safe Mode state to clean up: no cache, no database, no da
 
 ## 12. Open questions this stage deliberately leaves open
 
-1. **Would a mutated request be honoured?** Stage 1P settled delivery, timing and payload completeness; influence is still unproven, and M2's wire check exists to answer it.
+1. **Would a mutated request be honoured?** ✅ **Answered: yes (Stage 1R).** Stage 1P settled delivery, timing and payload completeness; Stage 1R captured the outbound body and found the substituted value on the wire, with no other field changed. See [docs/OPENCODE_REQUEST_HOOK_VALIDATION.md](OPENCODE_REQUEST_HOOK_VALIDATION.md) §11. What remains open is the *effect* on task correctness (M3–M5), not the mechanism.
 2. **Does an in-place rewrite of `event.result` reach the model on 2.0.24?** Contract-verified only; not needed for M1 (request-level elision avoids it), but relevant for a later, cheaper variant.
 3. **How do two plugins that both edit `messages` interact?** Unknown; the design refuses on unexpected input rather than coordinating.
 4. **Does the marker change model behaviour measurably?** Only Level 2 can say — and that is exactly why correctness is a gate, not a metric.
