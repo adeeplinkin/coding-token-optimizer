@@ -688,6 +688,16 @@ export interface SessionObservationSummary {
    * observation mode is active for this observer instance. Absent by default.
    */
   readonly safeMode?: SafeModeOpportunitySummary;
+  /**
+   * Safe Mode **apply** counters for this session, present only when the caller
+   * opted in to `apply` at some point for the observer that owned the session.
+   *
+   * They are the pass's own request-size facts — bytes replaced, bytes written as
+   * the versioned marker, and refusals by reason — and they are per session, so
+   * they describe this session's requests and nothing else. No number here is a
+   * token figure and none of them is a claim of saving.
+   */
+  readonly safeModeApply?: SafeModeApplySummary;
   /** Static, content-free caveats that apply to this summary. */
   readonly notes: readonly string[];
 }

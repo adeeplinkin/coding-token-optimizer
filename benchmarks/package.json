@@ -20,7 +20,9 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "vitest run",
-    "benchmark": "node dist/cli.js"
+    "benchmark": "node dist/cli.js",
+    "level2": "node dist/level2/cli.js",
+    "level2:verify": "node dist/level2/cli.js --offline-verify"
   },
   "dependencies": {
     "@dr-token/core": "*"

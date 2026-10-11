@@ -27,6 +27,42 @@ export type {
   HarnessUnavailableMeasurement,
   ObservedRunMetrics,
 } from './benchmark-adapter.js';
+export {
+  CONTAINMENT_COMMAND_ARGUMENT_KEYS,
+  CONTAINMENT_DENIED_TOOLS,
+  CONTAINMENT_GUARD_PLUGIN_ID,
+  CONTAINMENT_PATH_ARGUMENT_KEYS,
+  classifyContainedPath,
+  classifyToolCall,
+  createContainmentGuardPluginV2,
+  summarizeContainmentEvidence,
+} from './containment.js';
+export type {
+  ContainmentBlockReason,
+  ContainmentClassification,
+  ContainmentEvidenceLine,
+  ContainmentEvidenceSummary,
+  ContainmentGuardOptions,
+  ContainmentPathVerdict,
+} from './containment.js';
+export {
+  MAX_INTERRUPT_ATTEMPTS,
+  decideCostGovernor,
+  latestSessionCostUsd,
+  missingGovernorHelpers,
+  planGovernorArming,
+  startCostGovernor,
+} from './governor.js';
+export type {
+  CostGovernor,
+  CostGovernorAction,
+  CostGovernorInput,
+  CostGovernorOptions,
+  CostGovernorState,
+  GovernorArmingInput,
+  GovernorArmingPlan,
+  GovernorHelperAvailability,
+} from './governor.js';
 export { READ_TARGET_ID_LENGTH, defaultHash, isHexDigestLike } from './hash.js';
 export {
   SAFE_MODE_ELISION_MARKER,

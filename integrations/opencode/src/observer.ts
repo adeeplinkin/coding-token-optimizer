@@ -482,6 +482,12 @@ interface SessionState {
   readonly project: SessionProjectState;
   /** Safe Mode M1 opportunity counters, folded from analysed requests. */
   readonly opportunities: OpportunityState;
+  /**
+   * Safe Mode apply counters for *this* session, or `undefined` while apply has
+   * never been requested. Initialised when the session is created if apply is
+   * already active, and back-filled by `#adoptApplyRequest` otherwise.
+   */
+  elision: SafeModeApplyState | undefined;
   createdEvents: number;
   idleEvents: number;
   compactedEvents: number;
@@ -587,6 +593,7 @@ function createSessionState(sessionId: string, at: number): SessionState {
       decreasesObserved: 0,
     },
     opportunities: createOpportunityState(),
+    elision: undefined,
     project: {
       projectId: undefined,
       workspaceId: undefined,
@@ -620,6 +627,11 @@ const PRIMARY_CONTEXT_HOOK_BASIS: SafeModeRequestKindBasis = 'context-hook';
  * Counts only: no tool text, path, digest or session id is retained, and nothing
  * is persisted. Safe Mode keeps no cache between requests (design §4.4), so this
  * is a report of what happened rather than state a later request depends on.
+ *
+ * One aggregate exists **per session**, not per instance. A single plugin
+ * instance can observe several sessions, and a summary must describe the session
+ * it is filed under; folding every session into one instance-wide counter would
+ * attribute one session's elisions to another.
  */
 interface SafeModeApplyState {
   requestsAttempted: number;
@@ -629,6 +641,19 @@ interface SafeModeApplyState {
   elidedBytes: number;
   markerBytes: number;
   refused: Record<SafeModeElisionRefusalReason, number>;
+}
+
+/** All-zero apply counters, with every refusal reason present. */
+function createApplyState(): SafeModeApplyState {
+  return {
+    requestsAttempted: 0,
+    requestsApplied: 0,
+    elidedOccurrences: 0,
+    elidedCharacters: 0,
+    elidedBytes: 0,
+    markerBytes: 0,
+    refused: emptyElisionRefusals(),
+  };
 }
 
 /**
@@ -684,8 +709,13 @@ export class OpenCodeObserver {
   #safeMode: SafeModeMode;
   /** Whether the caller explicitly opted in to Safe Mode **apply**. */
   #safeModeApply = false;
-  /** Content-free aggregate of every apply attempt, or `undefined` while apply is off. */
-  #elision: SafeModeApplyState | undefined;
+  /**
+   * Whether apply has ever been requested, which is what makes
+   * {@link OpenCodeObserver.getSafeModeApplySummary} report counters at all. A
+   * request that was later dropped leaves the counters readable, so the record of
+   * what happened is never erased.
+   */
+  #applyCountersActive = false;
   /** Effective bounds for the opportunity analyzer. */
   #opportunityLimits: OpportunityLimits;
   #disposed = false;
@@ -759,23 +789,28 @@ export class OpenCodeObserver {
    * tool text, path or digest — and no number here is a token figure.
    */
   getSafeModeApplySummary(): SafeModeApplySummary | undefined {
-    const state = this.#elision;
-    if (state === undefined) {
+    if (!this.#applyCountersActive) {
       return undefined;
     }
-    return {
-      mode: 'apply',
-      passId: SAFE_MODE_ELISION_PASS_ID,
-      version: SAFE_MODE_ELISION_VERSION,
-      requestsAttempted: state.requestsAttempted,
-      requestsApplied: state.requestsApplied,
-      elidedOccurrences: state.elidedOccurrences,
-      elidedCharacters: state.elidedCharacters,
-      elidedBytes: state.elidedBytes,
-      markerBytes: state.markerBytes,
-      refused: { ...state.refused },
-      notes: SAFE_MODE_ELISION_NOTES,
-    };
+    // Summed across sessions for this instance-wide view; each session's own
+    // counters stay separate and are what a per-session summary reports.
+    const total = createApplyState();
+    for (const state of this.#sessions.values()) {
+      const own = state.elision;
+      if (own === undefined) {
+        continue;
+      }
+      total.requestsAttempted += own.requestsAttempted;
+      total.requestsApplied += own.requestsApplied;
+      total.elidedOccurrences += own.elidedOccurrences;
+      total.elidedCharacters += own.elidedCharacters;
+      total.elidedBytes += own.elidedBytes;
+      total.markerBytes += own.markerBytes;
+      for (const reason of SAFE_MODE_ELISION_REFUSAL_REASONS) {
+        total.refused[reason] += own.refused[reason];
+      }
+    }
+    return this.#applySummary(total);
   }
 
   /**
@@ -1074,24 +1109,38 @@ export class OpenCodeObserver {
   #adoptApplyRequest(requested: boolean): void {
     this.#safeModeApply = requested;
     if (requested) {
-      this.#elision ??= {
-        requestsAttempted: 0,
-        requestsApplied: 0,
-        elidedOccurrences: 0,
-        elidedCharacters: 0,
-        elidedBytes: 0,
-        markerBytes: 0,
-        refused: emptyElisionRefusals(),
-      };
+      this.#applyCountersActive = true;
+      // Sessions created before the switch was flipped get their counters here,
+      // so no session is ever missing the aggregate its summary reports.
+      for (const state of this.#sessions.values()) {
+        state.elision ??= createApplyState();
+      }
     }
     if (requested && !this.#canObserve()) {
       this.#diagnose('safe-mode-apply-unavailable');
     }
   }
 
-  /** Fold one apply outcome into the content-free aggregate. */
-  #recordElisionOutcome(outcome: SafeModeElisionOutcome): void {
-    const state = this.#elision;
+  /** Render content-free apply counters in the documented summary shape. */
+  #applySummary(state: SafeModeApplyState): SafeModeApplySummary {
+    return {
+      mode: 'apply',
+      passId: SAFE_MODE_ELISION_PASS_ID,
+      version: SAFE_MODE_ELISION_VERSION,
+      requestsAttempted: state.requestsAttempted,
+      requestsApplied: state.requestsApplied,
+      elidedOccurrences: state.elidedOccurrences,
+      elidedCharacters: state.elidedCharacters,
+      elidedBytes: state.elidedBytes,
+      markerBytes: state.markerBytes,
+      refused: { ...state.refused },
+      notes: SAFE_MODE_ELISION_NOTES,
+    };
+  }
+
+  /** Fold one apply outcome into this session's content-free aggregate. */
+  #recordElisionOutcome(session: SessionState, outcome: SafeModeElisionOutcome): void {
+    const state = session.elision;
     if (state === undefined) {
       return;
     }
@@ -1175,6 +1224,9 @@ export class OpenCodeObserver {
       this.#evictLeastRecentlyUsedSession();
     }
     const created = createSessionState(sessionId, this.#timestamp());
+    if (this.#safeModeApply) {
+      created.elision = createApplyState();
+    }
     this.#sessions.set(sessionId, created);
     this.#sessionsCreated += 1;
     return created;
@@ -1478,6 +1530,7 @@ export class OpenCodeObserver {
     if (this.#safeModeApply && this.#canObserve()) {
       try {
         this.#recordElisionOutcome(
+          state,
           applySafeModeElision(candidate, {
             requestKindBasis: PRIMARY_CONTEXT_HOOK_BASIS,
             enabled: true,
@@ -2131,6 +2184,13 @@ export class OpenCodeObserver {
           }
         : undefined;
 
+    // Apply counters travel with the session they were observed in. They are
+    // request-size facts (bytes replaced, bytes written as markers), never token
+    // figures, and they are what lets a benchmark check that a shorter outbound
+    // request is the *recorded* elision rather than an unrelated difference.
+    const safeModeApply: SafeModeApplySummary | undefined =
+      state.elision === undefined ? undefined : this.#applySummary(state.elision);
+
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       adapter: this.#adapterIdentity(),
@@ -2145,6 +2205,7 @@ export class OpenCodeObserver {
       project,
       measurements,
       ...(safeMode === undefined ? {} : { safeMode }),
+      ...(safeModeApply === undefined ? {} : { safeModeApply }),
       notes: [
         ...OBSERVATION_NOTES,
         ...(counts.toolStartsObserved === 0 ? [NOTE_NO_TOOL_ACTIVITY] : []),

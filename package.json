@@ -18,7 +18,11 @@
     "typecheck": "npm run build --workspace @dr-token/core && npm run typecheck --workspaces --if-present",
     "test": "npm run build --workspaces --if-present && npm run test --workspaces --if-present",
     "benchmark": "npm run build --workspaces --if-present && npm run benchmark --workspace @dr-token/benchmarks",
-    "verify": "npm run typecheck && npm run build && npm test"
+    "level2": "npm run build --workspaces --if-present && npm run level2 --workspace @dr-token/benchmarks --",
+    "level2:verify": "npm run build --workspaces --if-present && npm run level2:verify --workspace @dr-token/benchmarks",
+    "verify:wire": "npm run build --workspaces --if-present && npm run verify:wire --workspaces --if-present",
+    "verify": "npm run typecheck && npm run build && npm test",
+    "verify:all": "npm run verify && npm run verify:wire && npm run level2:verify"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

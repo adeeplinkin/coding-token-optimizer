@@ -1,0 +1,154 @@
+/**
+ * Whether a **live** arm run measured this harness at all.
+ *
+ * A live session can end with an artifact that looks perfectly well-formed while
+ * carrying no evidence that the repository-local plugin ever reached the runtime. That
+ * is not a hypothetical: Stage 1U's pilot ran every session in a runtime that could not
+ * offer the model at all, and a session whose plugin never loads produces the same
+ * shape — an artifact, an observation, and `usage: unavailable` — which the report
+ * would otherwise publish as a "no-opportunity" treatment run. A canary whose only job
+ * is to prove the live path must be able to fail on that, rather than file it.
+ *
+ * The check therefore reads only things that cannot exist without the plugin:
+ *
+ * - **`wire.hookInvocations`** is the length of the wire probe's own log. The probe is a
+ *   second repository-local plugin, and it appends one line per outbound request it is
+ *   handed. Zero invocations across a completed session means the plugin layer never
+ *   ran (or the session never asked the model for anything).
+ * - **`apply`** is the observer's Safe Mode counter block, present only when a plugin
+ *   that was told to apply actually observed. Its presence in the control arm, or its
+ *   absence in the treatment arm, means the two arms are not the declared pair.
+ *
+ * It is deliberately *not* a quality check: a run that engages the harness completely can
+ * still fail the task, and that is reported as a coding failure and nothing else.
+ */
+import type { Level2ArmObservation } from './types.js';
+
+/** Verdict for one live arm run. */
+export interface LiveEngagementVerdict {
+  readonly measurable: boolean;
+  /**
+   * True when the problem makes the run meaningless rather than merely unsuccessful, so
+   * the plan must stop instead of repeating the session.
+   *
+   * Repeating it could not help: the environment is what it is, and each attempt costs
+   * money to learn the same thing.
+   */
+  readonly stop: boolean;
+  readonly detail: string;
+}
+
+/** Preconditions a caller can add to the engagement check. */
+export interface LiveEngagementRequirements {
+  /**
+   * True when this run was configured with a per-session spending cap on a runtime where an
+   * in-session stop is possible. The observation must then show the governor armed: an
+   * unarmed governor means the authorized cap was not the bound that was in force, which is
+   * a safety failure rather than a measurement to compare.
+   */
+  readonly requireInSessionGovernor?: boolean;
+}
+
+/**
+ * Read one live arm observation for evidence that the harness was engaged.
+ *
+ * The caller must treat `measurable: false` as a failed run, and `stop: true` as a
+ * reason to end the plan rather than retry.
+ */
+export function checkLiveEngagement(
+  observation: Level2ArmObservation,
+  requirements: LiveEngagementRequirements = {},
+): LiveEngagementVerdict {
+  const arm = observation.identity.arm;
+  const requests = observation.wire.hookInvocations;
+
+  if (requests === 0) {
+    return {
+      measurable: false,
+      stop: true,
+      detail:
+        `the ${arm} arm produced no outbound request the plugin could see, so the ` +
+        'repository-local plugins did not reach the runtime (or the session never called the ' +
+        'model). Nothing about the harness was measured, and repeating it would spend ' +
+        'authorization to learn the same thing.',
+    };
+  }
+
+  // Containment is a precondition, not a bonus: a session whose guard never
+  // registered ran with its tools unenforced, so whatever it measured is not the
+  // harness this experiment declares. It is checked before the arm-pair checks
+  // because it applies to both arms identically.
+  const containment = observation.containment;
+  if (containment === undefined) {
+    return {
+      measurable: false,
+      stop: true,
+      detail:
+        'the session artifact carries no containment evidence, so nothing shows its tools stayed inside the workspace; ' +
+        'a live run is refused rather than treated as a valid measurement.',
+    };
+  }
+  if (containment.guard !== 'loaded') {
+    return {
+      measurable: false,
+      stop: true,
+      detail:
+        `the containment guard did not register its tool hook (${containment.guard}), so this session ran without the ` +
+        'enforcement layer; repeating it would spend authorization to learn the same thing, so the plan stops.',
+    };
+  }
+  if (!containment.rootKnown) {
+    return {
+      measurable: false,
+      stop: true,
+      detail:
+        'the containment guard could not determine the session workspace, so no tool call was checked and the session ' +
+        'cannot be treated as a valid measurement.',
+    };
+  }
+
+  // Defence in depth for the in-session cap. The arm driver already refuses to start a
+  // capped live session whose governor cannot arm; this is the same rule applied to what the
+  // session reports, so a build that armed and then lost the governor is refused too.
+  if (requirements.requireInSessionGovernor === true && observation.inSessionGovernor?.armed !== true) {
+    const governor = observation.inSessionGovernor;
+    return {
+      measurable: false,
+      stop: true,
+      detail:
+        'the session was authorized with a per-session spending cap, but the in-session governor did not enforce it ' +
+        `(${governor === undefined ? 'no governor evidence was recorded' : `armed: false, ${governor.reason ?? 'no reason recorded'}`}), so the cost bound that was authorized was not in force; ` +
+        'the run is refused rather than compared as if it had been capped.',
+    };
+  }
+
+  if (arm === 'treatment' && observation.apply === undefined) {
+    return {
+      measurable: false,
+      stop: true,
+      detail:
+        'the treatment session was observed but recorded no Safe Mode apply counters, so the ' +
+        'arm switch never reached the plugin and the pair would compare the pass off against the ' +
+        'pass off.',
+    };
+  }
+
+  if (arm === 'control' && observation.apply !== undefined) {
+    return {
+      measurable: false,
+      stop: true,
+      detail:
+        'the control session recorded Safe Mode apply counters, so the arms are not the declared ' +
+        'pair: the pass was on in both.',
+    };
+  }
+
+  return {
+    measurable: true,
+    stop: false,
+    detail:
+      `the harness was engaged for the ${arm} arm: ${String(requests)} outbound request(s) reached ` +
+      `the plugin${arm === 'treatment' ? ` and the pass attempted ${String(observation.apply?.requestsAttempted ?? 0)} of them` : ' with the pass off'}, ` +
+      `and the containment guard registered its tool hook (${containment.blockedCalls} call(s) refused, ${containment.allowedCalls} checked and allowed).`,
+  };
+}

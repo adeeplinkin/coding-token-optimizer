@@ -266,6 +266,95 @@ nothing about real coding sessions, because:
 
 Only a controlled comparison using real harness measurements can support a savings claim.
 
+## Level 2 — the paired real-harness experiment (Stage 1U)
+
+Level 0 (synthetic fixtures) and Level 1 (the deterministic request-level harness) run with no model.
+Level 2 is the real thing: the same task solved twice by a real coding agent, once with the Safe Mode
+pass off (control) and once with it on (treatment), compared through the declared-variant contract
+above.
+
+```sh
+npm run level2:verify                       # verify the apparatus offline: no model, no cost
+npm run level2 -- --plan                    # print the run plan and its minimum-sample checks
+npm run level2 -- --rehearse                # both arms through a loopback scripted provider
+npm run level2 -- --preflight --model <id>  # both runtimes' catalogues, the price row, a verdict
+npm run level2 -- --live --approve-live --model <id> --runtime service --max-runs <n> \
+  --max-cost-usd <n> --max-units <n>        # spend and usage caps; see docs/LEVEL2_PILOT_PREP.md
+```
+
+A live run is refused unless the runtime it is told to use reports a model catalogue that lists the
+named model, and it stops before the next session once a cap is broken. A live session is also refused
+as a measurement when no outbound request reached the repository-local plugin, because that means the
+harness never engaged — the shape Stage 1U's pilot produced while looking successful — and when the
+session does not report that its containment guard registered and checked the workspace. Containment is
+enforced by the runtime's own explicit permission denies plus a guard plugin that refuses any tool call
+resolving outside the session workspace (see [LEVEL2_CANARY_PREP.md](LEVEL2_CANARY_PREP.md) §4). The unit
+and cumulative caps are checked *after* each session (they bound the sequence); on the service runtime
+the per-session spending cap is also enforced **in session**, by a governor that calls the runtime's own
+`session.interrupt` when the reported cost crosses it, and the wall-clock kill always applies. A live capped
+session whose governor cannot arm is refused before any model process starts, and every arm run carries a
+per-run nonce and a completion flag that its artifact must prove before it is accepted — so a crashed,
+stale, partial or mismatched run cannot be published as a measurement (see
+[LEVEL2_CANARY_PREP.md](LEVEL2_CANARY_PREP.md) §9). Reports list every planned run's disposition: `solved`,
+`task-failed`, `invalid-measurement`, `unavailable-evidence` or `not-run`.
+
+The **two-session canary** that verifies the live path before the 6-session pilot — its exact command,
+model, expected spend, enforceable-versus-post-session limits and authorization request — is
+[LEVEL2_CANARY_PREP.md](LEVEL2_CANARY_PREP.md). The 6-session pilot's price list, expected volume, hard
+caps and remaining uncertainty are in [LEVEL2_PILOT_PREP.md](LEVEL2_PILOT_PREP.md).
+
+### What a Level 2 run is
+
+- **Frozen task pack** (`benchmarks/src/level2/tasks.ts`): six synthetic repositories spanning
+  reading-and-editing, debugging a failing suite, a multi-file change, a repeated-read task designed
+  to *create* an elidable duplicate, a task with no duplicate opportunity at all, and an edge-case fix.
+  The pack is fingerprinted, so a changed pack is visibly a different experiment.
+- **Independent grading**: each repository ships its own `node --test` suite, and grading **restores
+  the pristine test files** before running them. An agent that rewrites the tests gains nothing; the
+  offline verification proves this by grading a repository whose tests were replaced with trivially
+  passing ones (it still fails).
+- **Fresh session, fresh repository**: one session per arm run, in a newly provisioned copy. The
+  runtime is chosen explicitly: `--runtime standalone` gives the session a private config and data home,
+  while `--runtime service` runs it on the already-running background service — the only runtime on the
+  development machine that holds an account model catalogue — and swaps the arm's switch from an
+  environment variable to explicit options in the repository-local plugin file. The artifact records
+  which was used and what that means for isolation.
+- **One declared difference**: both arms load the same shipped plugin; only `DR_TOKEN_SAFE_MODE`
+  differs (`off` versus `apply`).
+- **ABBA ordering** per task, so provider cache warm-up cannot systematically favour one arm, and the
+  order each pair actually ran in is recorded.
+- **Minimum samples**: at least 5 tasks and at least 3 pairs per task (≥ 15 pairs, ≥ 30 arm runs).
+  Fewer is reported as an incomplete experiment, never as a result.
+
+### Mechanism evidence, and its honest limits
+
+A token delta is not evidence that this pass caused it, so every treatment run must show the pass
+fired, and every control run must show it did not:
+
+- the pass's own counters (`requestsApplied`, `elidedBytes`, `markerBytes`) travel in the session
+  summary the shipped observer writes;
+- where a loopback provider endpoint is in the request path, the marker is counted at that endpoint,
+  and a control arm must show zero markers;
+- a treatment run whose mechanism cannot be confirmed is classified `unexplained` and excluded from
+  every comparison; a run with nothing eligible to elide is `no-opportunity`, which is **not** a
+  saving of zero.
+
+The runtime hands the outbound body to `session.hook("http.request")` as a `ReadableStream`, so a
+plugin **cannot** measure the request it is about to send (measured in Stage 1U). A live run against a
+real provider therefore has no wire observation and is labelled `fired-counters-only` rather than
+`fired`. The exact byte identity — treatment request shorter by exactly
+`elidedBytes - markerBytes` — is asserted by the wire regression over one deterministic request
+(`npm run verify:wire`), where both arms send the same request.
+
+### Token fields
+
+Level 2 reports each host-reported token field separately (input, output, reasoning, cache-read,
+cache-write) and never sums them. The framework's `totalTokens` metric stays **unavailable** by
+construction, which means the generic comparison verdict for a Level 2 pair is `unavailable` rather
+than `benchmark-verified`: the correctness gate and every comparability guard still run, but no
+"verified improvement" verdict can be produced from overlapping fields. Per-field deltas are reported
+as a distribution (median, range, sample count, sign consistency) over the pairs whose mechanism fired.
+
 ## Adding a real coding-harness benchmark later
 
 1. Add an adapter that produces an `OptimizationRequest` from real harness context and records
@@ -295,3 +384,18 @@ added without replacing the framework.
 | `benchmarks/src/report.ts` | Report building and JSON writing |
 | `benchmarks/src/benchmark.ts` | Suite orchestration |
 | `benchmarks/src/cli.ts` | Command-line entry point |
+| `benchmarks/src/level2/tasks.ts` | The frozen Level 2 task pack, with correct and wrong solutions |
+| `benchmarks/src/level2/repos.ts` | Repository provisioning, revision identity, snapshotting |
+| `benchmarks/src/level2/grade.ts` | Independent grading against pristine tests |
+| `benchmarks/src/level2/plan.ts` | ABBA run plan and minimum-sample enforcement |
+| `benchmarks/src/level2/variants.ts` | The Level 2 declared variant and per-arm settings |
+| `benchmarks/src/level2/mechanism.ts` | Mechanism classification from counters and endpoint evidence |
+| `benchmarks/src/level2/records.ts` | Arm observations to framework run records |
+| `benchmarks/src/level2/observation.ts` | Strict artifact intake (mechanism recomputed, never trusted) |
+| `benchmarks/src/level2/report.ts` | Experiment building, per-field distributions, Markdown and JSON |
+| `benchmarks/src/level2/runner.ts` | Provisioning, arm driver invocation, grading, assembly, the runtime-catalogue probe and the isolation verdict |
+| `benchmarks/src/level2/budget.ts` | Per-session and total caps in both currencies (units and reported USD) |
+| `benchmarks/src/level2/guards.ts` | The refusals that stand between an authorization and a live call |
+| `benchmarks/src/level2/verify.ts` | The offline verification suite |
+| `benchmarks/src/level2/cli.ts` | `--offline-verify`, `--plan`, `--rehearse`, `--live` |
+| `integrations/opencode/scripts/level2-arm.mjs` | One arm, one session, content-free evidence |
