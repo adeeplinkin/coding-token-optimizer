@@ -107,11 +107,105 @@ Two runs may only be compared when their identity and provenance agree:
 
 - same fixture id, with provenance matching the recorded fixture
 - one `baseline` role and one `candidate` role
-- same harness, same mode, same optimizer revision, same optimizer configuration
+- same harness, same mode, same optimizer revision, same optimizer configuration — or, for a
+  *declared controlled comparison*, the same everything except the one declared optimization
+  axis (see the next section)
 
 Anything else produces an `invalid` verdict with an explanation. The baseline is a plain
 pass-through `OptimizerEngine` with no registered passes and is never weakened to make a future
 optimization look better.
+
+## Declared controlled comparisons (Stage 1S)
+
+An A/B measurement of an optimization needs the one thing the comparability rules above forbid: a
+baseline and a candidate whose optimizer configuration differs. Stage 1S therefore allows a
+*declared* variant, so that exactly one optimization difference is permitted — and only that one.
+A declaration names the experiment, the single axis it may move, and both arms:
+
+```ts
+const variant: DeclaredVariant = {
+  declarationId: 'duplicate-elision-a',
+  axis: 'optimizer-configuration',
+  control: {
+    variantId: 'control',
+    role: 'baseline',
+    optimizerConfiguration: 'pass-through',
+  },
+  treatment: {
+    variantId: 'safe-mode-v1',
+    role: 'candidate',
+    optimizerConfiguration: 'pass-through+duplicate-elision',
+  },
+};
+
+await runBenchmarkSuite({
+  variant,
+  candidateOptimizer: treatmentEngine, // the arm that actually exercises the treatment
+});
+```
+
+The two arms deliberately record different configuration identities. What makes the pair
+comparable is that both runs carry the declared arm identity, and every other comparability fact
+still has to match:
+
+| Requirement | Enforced by |
+| --- | --- |
+| Same declared experiment and axis | both arms must record the same `declarationId` and `axis` |
+| Correct baseline/treatment assignment | the control arm must be `baseline`, the treatment arm `candidate` |
+| Exactly one permitted difference | the recorded optimizer configurations must differ |
+| No hidden difference | each recorded `configurationId` is re-derived from its own harness, revision, mode and configuration |
+| Same task and input | same fixture id and an identical input hash |
+| Same harness, mode and optimizer revision | equality checks |
+| Same model, environment and project state | model and repository revision must both match, or both be unavailable |
+| Same correctness criteria | identical correctness check names |
+| Same measurement definitions | identical per-metric evidence classes |
+
+Any failure produces `invalid` with a reason. The permitted difference never becomes a token
+claim by itself: the correctness and token-evidence rules are untouched, so a treatment arm that
+fails correctness is a `regression` however few tokens it used, estimates never produce
+`benchmark-verified`, and missing token measurements stay `unavailable`.
+
+Metadata is refused rather than repaired:
+
+- a declaration that only one arm carries is `invalid` (a half-declared pair is not a controlled
+  comparison);
+- a malformed declaration — unknown or missing field, unknown axis, empty identifier, two arms
+  that share a variant id or an optimizer configuration, or a control arm that is not on
+  `baseline` — makes `runBenchmarkSuite` throw `InvalidVariantDeclarationError` before any run is
+  recorded;
+- an explicitly supplied `baselineConfiguration`/`candidateConfiguration` that contradicts the
+  declaration is rejected, because the one permitted difference must have a single source of truth.
+
+### Backward compatibility
+
+- A comparison where **neither** run declares a variant follows the original rules exactly:
+  different `configurationId` values are still `invalid`.
+- An undeclared run records no `variant` field, and a report with no declared variant omits
+  `controlledVariants` entirely, so a Stage 1B report is unchanged.
+- `BENCHMARK_SCHEMA_VERSION` stays `1`: the declared-variant fields are additive and optional.
+
+When a declaration is used, the report restates it under `controlledVariants`, so a reader can see
+which experiment produced the numbers:
+
+```json
+"controlledVariants": [
+  {
+    "declarationId": "duplicate-elision-a",
+    "axis": "optimizer-configuration",
+    "arms": [
+      { "variantId": "control", "role": "baseline", "optimizerConfiguration": "pass-through" },
+      { "variantId": "safe-mode-v1", "role": "candidate", "optimizerConfiguration": "pass-through+duplicate-elision" }
+    ]
+  }
+]
+```
+
+Declaring a variant makes a comparison *possible*; it does not make one *positive*. Until real
+harness token usage exists, a declared pair still lands on `unavailable` like every other pair.
+
+The command-line runner has no `--variant` flag yet: a declared comparison is run through
+`runBenchmarkSuite` (as the variant tests do), while `npm run benchmark` keeps exercising the
+undeclared path.
 
 ## How correctness is verified
 
@@ -130,7 +224,9 @@ error and a recovery attempt, and content-preservation checks still apply to the
 
 `compareRuns` applies this precedence:
 
-1. **Identity and provenance** problems → `invalid`.
+1. **Identity and provenance** problems → `invalid`. A pair where both runs declare the same
+   controlled experiment is routed through the declared-variant rules first (see above); a pair
+   where only one run declares a variant is `invalid`.
 2. **Invalid measurements** (negative, non-finite, or fractional whole-number counts) → `invalid`.
 3. **Baseline correctness failure** → `invalid` (the comparison would be meaningless).
 4. **Candidate correctness failure** → `regression` with `correctnessRegression: true`. A
@@ -194,7 +290,8 @@ added without replacing the framework.
 | `benchmarks/src/fixtures.ts` | Fixture loading and schema validation |
 | `benchmarks/src/provenance.ts` | Version constants, configuration ids, provenance construction |
 | `benchmarks/src/runner.ts` | Deterministic fixture execution, correctness checks, run records |
-| `benchmarks/src/comparison.ts` | Accuracy-first baseline/candidate comparison |
+| `benchmarks/src/comparison.ts` | Accuracy-first baseline/candidate comparison, including declared controlled comparisons |
+| `benchmarks/src/variant.ts` | Declared-variant validation and arm provenance |
 | `benchmarks/src/report.ts` | Report building and JSON writing |
 | `benchmarks/src/benchmark.ts` | Suite orchestration |
 | `benchmarks/src/cli.ts` | Command-line entry point |

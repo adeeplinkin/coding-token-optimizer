@@ -10,6 +10,7 @@ import type {
   CorrectnessOutcome,
   OptimizationDecisionSummary,
   RunMetrics,
+  VariantProvenance,
 } from './types.js';
 import {
   HARNESS_METRIC_UNAVAILABLE_NOTE,
@@ -43,6 +44,13 @@ export interface BenchmarkRunOptions {
   readonly model?: string;
   readonly optimizerRevision?: string;
   readonly repositoryRevision?: string;
+  /**
+   * Declared controlled-comparison arm to record, when this run belongs to one.
+   * The runner records exactly what it is told; declaration validation and
+   * arm-to-configuration agreement are owned by the suite and re-verified by
+   * `compareRuns` from the recorded provenance.
+   */
+  readonly variant?: VariantProvenance;
   /** Injectable clock, used so report timestamps can be fixed in tests. */
   readonly now?: () => Date;
 }
@@ -178,6 +186,7 @@ export async function runFixture(
     ...(options.repositoryRevision === undefined
       ? {}
       : { repositoryRevision: options.repositoryRevision }),
+    ...(options.variant === undefined ? {} : { variant: options.variant }),
   });
 
   return {

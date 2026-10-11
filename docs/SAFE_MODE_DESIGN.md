@@ -337,6 +337,17 @@ separate `baselineConfiguration` / `candidateConfiguration` values.
 Until that exists, Safe Mode savings are **unmeasurable by the project's own standard**, and this
 document claims none.
 
+**Resolved in Stage 1S.** The contract above now exists. A `DeclaredVariant` names the two arms
+and the single permitted axis (`optimizer-configuration`); the declaration is validated before any
+run is recorded; both arms record their declared identity in provenance; and `compareRuns`
+re-verifies every comparability fact except that one axis — same fixture and input hash, harness,
+mode, optimizer revision, model, repository revision, correctness criteria and measurement
+definitions — before it permits the comparison. A half-declared pair, a swapped arm assignment or
+a second difference stays `invalid`, and undeclared comparisons keep the original strict
+`configurationId` guard unchanged. See [docs/BENCHMARKING.md](BENCHMARKING.md) for the contract and
+examples. This closes the *contract* gap only: no Safe Mode transformation is implemented, so no
+savings are measurable in this stage and none are claimed.
+
 ---
 
 ## 7. Token measurement and provenance

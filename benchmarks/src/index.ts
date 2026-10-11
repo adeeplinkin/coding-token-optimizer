@@ -5,9 +5,21 @@
  * fixtures, checks context preservation, and compares baseline with candidate
  * runs. Token usage is reported as unavailable because no real coding harness
  * has been executed yet.
+ *
+ * Stage 1S adds declared controlled comparisons: a named experiment may permit
+ * exactly one optimization difference (the optimizer configuration) between a
+ * control and a treatment arm, while every other comparability fact must still
+ * match. Undeclared comparisons keep the original strict behavior.
  */
 export { runBenchmarkSuite } from './benchmark.js';
 export type { BenchmarkSuiteOptions, BenchmarkSuiteResult } from './benchmark.js';
+export {
+  InvalidVariantDeclarationError,
+  OPTIMIZATION_VARIANT_AXES,
+  validateVariantDeclaration,
+  variantArmFor,
+  variantProvenanceFor,
+} from './variant.js';
 export { compareRuns } from './comparison.js';
 export { DEFAULT_FIXTURES_DIR, FixtureValidationError, loadFixtures, validateFixture } from './fixtures.js';
 export {
@@ -53,14 +65,20 @@ export type {
   BenchmarkSummary,
   ComparisonResult,
   ComparisonVerdict,
+  ControlledVariantSummary,
   CorrectnessCheck,
   CorrectnessOutcome,
+  DeclaredVariant,
+  DeclaredVariantArm,
+  DeclaredVariantArmSummary,
   FixtureCategory,
   Measurement,
   MeasurementEvidenceClass,
   MetricName,
   OptimizationDecisionSummary,
+  OptimizationVariantAxis,
   RequiredContent,
   RunMetrics,
   UnavailableMeasurement,
+  VariantProvenance,
 } from './types.js';

@@ -10,12 +10,19 @@ import {
   type BenchmarkRunOptions,
   type ContextOptimizer,
 } from './runner.js';
+import {
+  InvalidVariantDeclarationError,
+  validateVariantDeclaration,
+  variantArmFor,
+  variantProvenanceFor,
+} from './variant.js';
 import type {
   BenchmarkFixture,
   BenchmarkReport,
   BenchmarkRunRecord,
   BenchmarkRunRole,
   ComparisonResult,
+  DeclaredVariant,
 } from './types.js';
 
 /** Options for a full benchmark suite run. */
@@ -28,6 +35,12 @@ export interface BenchmarkSuiteOptions {
   readonly candidateOptimizer?: ContextOptimizer;
   readonly baselineConfiguration?: string;
   readonly candidateConfiguration?: string;
+  /**
+   * Declared controlled comparison. When supplied, both arms are validated, the
+   * arm configurations replace the per-role configuration values, and the
+   * declared arm identity is recorded in each run's provenance.
+   */
+  readonly variant?: DeclaredVariant;
   readonly harness?: string;
   readonly model?: string;
   readonly optimizerRevision?: string;
@@ -49,9 +62,14 @@ export interface BenchmarkSuiteResult {
  * compare each pair.
  *
  * Stage 1B ships no optimization passes, so both runs use the same pass-through
- * configuration. The comparison therefore reports `unavailable` for token
- * savings, which is the honest result until real passes and real harness
+ * configuration by default. The comparison therefore reports `unavailable` for
+ * token savings, which is the honest result until real passes and real harness
  * measurements exist.
+ *
+ * When a declared variant is supplied, the two arms intentionally record
+ * different optimizer configurations and each run carries its declared arm
+ * identity. The comparison then permits exactly that one declared difference; a
+ * declaration is never accepted as evidence of savings by itself.
  */
 export async function runBenchmarkSuite(
   options: BenchmarkSuiteOptions = {},
@@ -59,6 +77,17 @@ export async function runBenchmarkSuite(
   const fixtures = await loadFixtures(options.fixturesDir);
   const mode = options.mode ?? 'safe';
   const clock = options.now ?? ((): Date => new Date());
+
+  // Malformed metadata is rejected before a single run is recorded, so an
+  // invalid declaration can never produce a report.
+  const declaredVariant =
+    options.variant === undefined ? undefined : validateVariantDeclaration(options.variant);
+  if (declaredVariant !== undefined) {
+    const conflict = firstConfigurationConflict(options, declaredVariant);
+    if (conflict !== undefined) {
+      throw new InvalidVariantDeclarationError(conflict);
+    }
+  }
 
   // The default optimizer is a pass-through engine with no registered passes.
   // Baselines are never weakened to make a future optimization look better.
@@ -68,8 +97,13 @@ export async function runBenchmarkSuite(
     const optimizer =
       (role === 'baseline' ? options.baselineOptimizer : options.candidateOptimizer) ??
       defaultOptimizer;
+    const explicitConfiguration =
+      role === 'baseline' ? options.baselineConfiguration : options.candidateConfiguration;
     const optimizerConfiguration =
-      (role === 'baseline' ? options.baselineConfiguration : options.candidateConfiguration) ??
+      (declaredVariant === undefined
+        ? undefined
+        : variantArmFor(declaredVariant, role).optimizerConfiguration) ??
+      explicitConfiguration ??
       DEFAULT_OPTIMIZER_CONFIGURATION;
 
     return {
@@ -86,6 +120,9 @@ export async function runBenchmarkSuite(
       ...(options.repositoryRevision === undefined
         ? {}
         : { repositoryRevision: options.repositoryRevision }),
+      ...(declaredVariant === undefined
+        ? {}
+        : { variant: variantProvenanceFor(declaredVariant, role) }),
     };
   };
 
@@ -111,4 +148,28 @@ export async function runBenchmarkSuite(
     fixtures,
     correctnessFailed: runs.some((run) => !run.correctness.passed),
   };
+}
+
+/**
+ * Reason an explicitly supplied arm configuration contradicts the declaration,
+ * or `undefined` when they agree. Two sources of truth for the one permitted
+ * difference would be inconsistent metadata, so it is refused.
+ */
+function firstConfigurationConflict(
+  options: BenchmarkSuiteOptions,
+  declaration: DeclaredVariant,
+): string | undefined {
+  if (
+    options.baselineConfiguration !== undefined &&
+    options.baselineConfiguration !== declaration.control.optimizerConfiguration
+  ) {
+    return 'The declared control configuration does not match the explicitly supplied baseline configuration.';
+  }
+  if (
+    options.candidateConfiguration !== undefined &&
+    options.candidateConfiguration !== declaration.treatment.optimizerConfiguration
+  ) {
+    return 'The declared treatment configuration does not match the explicitly supplied candidate configuration.';
+  }
+  return undefined;
 }

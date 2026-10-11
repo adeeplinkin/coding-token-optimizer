@@ -5,6 +5,7 @@ import type {
   BenchmarkRunRole,
   MeasurementEvidenceClass,
   MetricName,
+  VariantProvenance,
 } from './types.js';
 
 /**
@@ -35,6 +36,8 @@ export interface ProvenanceInput {
   readonly optimizerRevision: string;
   readonly optimizerConfiguration: string;
   readonly repositoryRevision?: string;
+  /** Declared controlled-comparison arm, when the run belongs to one. */
+  readonly variant?: VariantProvenance;
   readonly recordedAt: Date;
   readonly measurementEvidence: Readonly<Record<MetricName, MeasurementEvidenceClass>>;
 }
@@ -77,6 +80,7 @@ export function createProvenance(input: ProvenanceInput): BenchmarkProvenance {
       mode: input.mode,
       optimizerConfiguration: input.optimizerConfiguration,
     }),
+    ...(input.variant === undefined ? {} : { variant: input.variant }),
     recordedAt: input.recordedAt.toISOString(),
     measurementEvidence: input.measurementEvidence,
   };

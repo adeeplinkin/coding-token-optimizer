@@ -51,6 +51,79 @@ export interface BenchmarkFixture {
 export type BenchmarkRunRole = 'baseline' | 'candidate';
 
 /**
+ * The only axis a declared controlled comparison may move (Stage 1S).
+ *
+ * A control arm and a treatment arm necessarily record different optimizer
+ * configurations; every other comparability fact must stay identical. No other
+ * axis is permitted, so an undeclared difference is still rejected.
+ */
+export type OptimizationVariantAxis = 'optimizer-configuration';
+
+/** One arm of a declared controlled comparison. */
+export interface DeclaredVariantArm {
+  /** Explicit optimization variant identifier, e.g. `control` or `safe-mode-v1`. */
+  readonly variantId: string;
+  /**
+   * Role this arm must be recorded with. The control arm is always the
+   * `baseline` and the treatment arm is always the `candidate`, so a swapped
+   * declaration is a malformed declaration rather than a silent A/B flip.
+   */
+  readonly role: BenchmarkRunRole;
+  /** Optimizer configuration string this arm must record in provenance. */
+  readonly optimizerConfiguration: string;
+}
+
+/**
+ * A declared controlled comparison: a named experiment with exactly one
+ * permitted optimization difference between its two arms.
+ *
+ * Declaring the experiment is what makes a baseline/candidate pair comparable;
+ * it never widens the comparison guard by itself, because the recorded
+ * provenance of both arms is re-verified independently in `compareRuns`.
+ */
+export interface DeclaredVariant {
+  /** Stable identifier of the whole declared experiment, shared by both arms. */
+  readonly declarationId: string;
+  /** The single axis permitted to differ between the two arms. */
+  readonly axis: OptimizationVariantAxis;
+  /** The control arm: the exact optimization setting without the treatment. */
+  readonly control: DeclaredVariantArm;
+  /** The treatment arm: the control setting plus the declared optimization. */
+  readonly treatment: DeclaredVariantArm;
+}
+
+/**
+ * Recorded identity of the declared arm a run belongs to.
+ *
+ * Present only when the run was produced by a declared controlled comparison;
+ * its absence keeps a run in the original strict (undeclared) comparison path.
+ */
+export interface VariantProvenance {
+  /** Declared experiment identifier, shared by both arms. */
+  readonly declarationId: string;
+  /** This arm's explicit optimization variant identifier. */
+  readonly variantId: string;
+  /** The axis declared to differ between the arms. */
+  readonly axis: OptimizationVariantAxis;
+  /** This arm's declared role. */
+  readonly role: BenchmarkRunRole;
+}
+
+/** One arm as summarized in a report. */
+export interface DeclaredVariantArmSummary {
+  readonly variantId: string;
+  readonly role: BenchmarkRunRole;
+  readonly optimizerConfiguration: string;
+}
+
+/** A declared controlled comparison, restated in the report artifact. */
+export interface ControlledVariantSummary {
+  readonly declarationId: string;
+  readonly axis: OptimizationVariantAxis;
+  readonly arms: readonly DeclaredVariantArmSummary[];
+}
+
+/**
  * Evidence classification for a single measurement.
  *
  * These classes are not interchangeable: `benchmark-verified` requires a valid
@@ -118,6 +191,14 @@ export interface BenchmarkProvenance {
   readonly repositoryRevision: Measurement<string>;
   /** Stable identifier combining harness, revision, mode and configuration. */
   readonly configurationId: string;
+  /**
+   * Declared controlled-comparison arm, or absent for an undeclared run.
+   *
+   * When present on both arms, the pair is a *declared* comparison and the one
+   * permitted optimization difference is validated against this declaration.
+   * When absent, the original `configurationId` equality guard applies unchanged.
+   */
+  readonly variant?: VariantProvenance;
   /** ISO timestamp for when the run was recorded. */
   readonly recordedAt: string;
   /** Evidence class of every metric in this run. */
@@ -214,4 +295,10 @@ export interface BenchmarkReport {
   readonly runs: readonly BenchmarkRunRecord[];
   readonly comparisons: readonly ComparisonResult[];
   readonly summary: BenchmarkSummary;
+  /**
+   * Declared controlled comparisons restated explicitly, derived from run
+   * provenance. Omitted entirely when no run declares a variant, so a report
+   * from the undeclared path stays byte-identical to the Stage 1B schema.
+   */
+  readonly controlledVariants?: readonly ControlledVariantSummary[];
 }

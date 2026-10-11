@@ -1,10 +1,21 @@
 import type {
+  BenchmarkProvenance,
   BenchmarkRunRecord,
   ComparisonResult,
   ComparisonVerdict,
   Measurement,
+  MeasurementEvidenceClass,
+  MetricName,
+  VariantProvenance,
 } from './types.js';
-import { findInvalidMetricValues, isAvailable, measured, unavailable } from './measurement.js';
+import {
+  ALL_METRICS,
+  findInvalidMetricValues,
+  isAvailable,
+  measured,
+  unavailable,
+} from './measurement.js';
+import { createConfigurationId } from './provenance.js';
 
 /**
  * Compare a baseline run with a candidate run.
@@ -183,8 +194,36 @@ function tokenDeltaPercent(
   return measured(((candidateTotal.value - baselineTotal.value) / baselineTotal.value) * 100);
 }
 
-/** Reason the two runs are not comparable, or `undefined` when they are. */
+/**
+ * Reason the two runs are not comparable, or `undefined` when they are.
+ *
+ * Two dispatch paths exist: undeclared runs keep the original strict
+ * `configurationId` guard, while runs that both carry a declared variant are
+ * compared through the declared path, which permits exactly one difference and
+ * re-verifies every other comparability fact.
+ */
 function firstProvenanceMismatch(
+  baseline: BenchmarkRunRecord,
+  candidate: BenchmarkRunRecord,
+): string | undefined {
+  const base = baseline.provenance.variant;
+  const declared = candidate.provenance.variant;
+
+  if (base === undefined && declared === undefined) {
+    return firstUndeclaredProvenanceMismatch(baseline, candidate);
+  }
+  if (base === undefined || declared === undefined) {
+    return 'Inconsistent variant metadata: exactly one run declares an optimization variant, so the pair is not a declared controlled comparison.';
+  }
+  return firstDeclaredVariantMismatch(baseline, candidate, base, declared);
+}
+
+/**
+ * The original Stage 1B guard, unchanged: two undeclared runs are comparable
+ * only when their harness, mode, configuration identity and optimizer revision
+ * all match. Stage 1S never weakens this path.
+ */
+function firstUndeclaredProvenanceMismatch(
   baseline: BenchmarkRunRecord,
   candidate: BenchmarkRunRecord,
 ): string | undefined {
@@ -204,6 +243,126 @@ function firstProvenanceMismatch(
     return `The runs used different optimizer revisions ("${base.optimizerRevision}" and "${candidateProvenance.optimizerRevision}").`;
   }
   return undefined;
+}
+
+/**
+ * Comparability for a pair that both declare the same controlled experiment.
+ *
+ * The declaration permits exactly one difference — the optimizer configuration —
+ * and only when both arms agree on the experiment, the axis and the arm
+ * assignment. Every other fact that could invalidate a baseline/treatment
+ * comparison is re-checked here: harness, mode, optimizer revision, model,
+ * repository revision, input context, correctness criteria and measurement
+ * definitions. The configuration identity is re-derived from its recorded
+ * parts so a difference cannot be hidden outside the declared axis.
+ */
+function firstDeclaredVariantMismatch(
+  baseline: BenchmarkRunRecord,
+  candidate: BenchmarkRunRecord,
+  base: VariantProvenance,
+  declared: VariantProvenance,
+): string | undefined {
+  const baseProvenance: BenchmarkProvenance = baseline.provenance;
+  const candidateProvenance: BenchmarkProvenance = candidate.provenance;
+
+  if (baseProvenance.harness !== candidateProvenance.harness) {
+    return `The runs were recorded with different harnesses ("${baseProvenance.harness}" and "${candidateProvenance.harness}").`;
+  }
+  if (baseProvenance.mode !== candidateProvenance.mode) {
+    return `The runs were recorded in different optimization modes ("${baseProvenance.mode}" and "${candidateProvenance.mode}").`;
+  }
+  if (baseProvenance.optimizerRevision !== candidateProvenance.optimizerRevision) {
+    return `The runs used different optimizer revisions ("${baseProvenance.optimizerRevision}" and "${candidateProvenance.optimizerRevision}").`;
+  }
+
+  if (base.declarationId !== declared.declarationId) {
+    return 'The declared runs belong to different controlled experiments, so they are not one control/treatment pair.';
+  }
+  if (base.axis !== declared.axis) {
+    return `The declared runs declare different optimization axes ("${base.axis}" and "${declared.axis}").`;
+  }
+  // The run roles are already pinned to baseline/candidate by `compareRuns`, so
+  // requiring the declared arms to match them is what makes a swapped
+  // declaration fail instead of silently flipping the A/B direction.
+  if (base.role !== 'baseline' || declared.role !== 'candidate') {
+    return 'The declared variant arms are assigned the wrong roles: the control arm must be the baseline and the treatment arm the candidate.';
+  }
+  if (base.variantId === declared.variantId) {
+    return `The declared runs record the same variant arm ("${base.variantId}"), so no control/treatment difference is declared.`;
+  }
+
+  if (baseProvenance.optimizerConfiguration === candidateProvenance.optimizerConfiguration) {
+    return 'The declared runs record the same optimizer configuration, so the declared optimization difference is missing.';
+  }
+
+  const expectedBaselineConfiguration = createConfigurationId({
+    harness: baseProvenance.harness,
+    optimizerRevision: baseProvenance.optimizerRevision,
+    mode: baseProvenance.mode,
+    optimizerConfiguration: baseProvenance.optimizerConfiguration,
+  });
+  if (baseProvenance.configurationId !== expectedBaselineConfiguration) {
+    return 'The baseline configuration identity is not consistent with its recorded harness, revision, mode and configuration.';
+  }
+  const expectedCandidateConfiguration = createConfigurationId({
+    harness: candidateProvenance.harness,
+    optimizerRevision: candidateProvenance.optimizerRevision,
+    mode: candidateProvenance.mode,
+    optimizerConfiguration: candidateProvenance.optimizerConfiguration,
+  });
+  if (candidateProvenance.configurationId !== expectedCandidateConfiguration) {
+    return 'The candidate configuration identity is not consistent with its recorded harness, revision, mode and configuration.';
+  }
+  if (baseProvenance.configurationId === candidateProvenance.configurationId) {
+    return 'The declared runs share one configuration identity despite declaring different arms.';
+  }
+
+  if (!sameMeasurementIdentity(baseProvenance.model, candidateProvenance.model)) {
+    return 'The declared runs were recorded with different models; a token comparison across models is not meaningful.';
+  }
+  if (
+    !sameMeasurementIdentity(
+      baseProvenance.repositoryRevision,
+      candidateProvenance.repositoryRevision,
+    )
+  ) {
+    return 'The declared runs were recorded against different repository revisions, so the test environment differs.';
+  }
+  if (baseline.inputHash !== candidate.inputHash) {
+    return 'The declared runs were recorded for different input contexts.';
+  }
+
+  const baseChecks = baseline.correctness.checks.map((check) => check.name).join('\n');
+  const candidateChecks = candidate.correctness.checks.map((check) => check.name).join('\n');
+  if (baseChecks !== candidateChecks) {
+    return 'The declared runs use different correctness checks, so their correctness outcomes are not comparable.';
+  }
+
+  if (!sameMeasurementDefinitions(baseProvenance.measurementEvidence, candidateProvenance.measurementEvidence)) {
+    return 'The declared runs use different measurement definitions.';
+  }
+
+  return undefined;
+}
+
+/**
+ * Two provenance measurements describe the same thing only when both are
+ * unavailable or both carry the same observed value. An available value is
+ * never treated as equal to a missing one.
+ */
+function sameMeasurementIdentity(a: Measurement<string>, b: Measurement<string>): boolean {
+  if (!isAvailable(a) || !isAvailable(b)) {
+    return !isAvailable(a) && !isAvailable(b);
+  }
+  return a.value === b.value;
+}
+
+/** Per-metric evidence classifications must match for a comparable pair. */
+function sameMeasurementDefinitions(
+  a: Readonly<Record<MetricName, MeasurementEvidenceClass>>,
+  b: Readonly<Record<MetricName, MeasurementEvidenceClass>>,
+): boolean {
+  return ALL_METRICS.every((name) => a[name] === b[name]);
 }
 
 function comparison(

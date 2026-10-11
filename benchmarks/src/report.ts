@@ -8,6 +8,9 @@ import {
   type BenchmarkSummary,
   type ComparisonResult,
   type ComparisonVerdict,
+  type ControlledVariantSummary,
+  type DeclaredVariantArmSummary,
+  type OptimizationVariantAxis,
 } from './types.js';
 import { ALL_METRICS, isAvailable } from './measurement.js';
 
@@ -64,6 +67,8 @@ export function buildReport(input: ReportInput): BenchmarkReport {
     unavailableMetrics,
   };
 
+  const controlledVariants = summarizeControlledVariants(input.runs);
+
   return {
     schemaVersion: BENCHMARK_SCHEMA_VERSION,
     generatedAt: input.generatedAt.toISOString(),
@@ -72,7 +77,71 @@ export function buildReport(input: ReportInput): BenchmarkReport {
     runs: input.runs,
     comparisons: input.comparisons,
     summary,
+    // Omitted (rather than empty) when nothing was declared, so a report from
+    // the undeclared path is unchanged from the Stage 1B schema.
+    ...(controlledVariants.length === 0 ? {} : { controlledVariants }),
   };
+}
+
+/** A declared experiment as it is being collected from run provenance. */
+interface ControlledVariantBuild {
+  readonly axis: OptimizationVariantAxis;
+  readonly arms: Map<string, DeclaredVariantArmSummary>;
+}
+
+/**
+ * Restate every declared controlled comparison found in the recorded runs.
+ *
+ * The declaration is derived from run provenance rather than passed in, so the
+ * report states the experiment it was actually produced with. Identical arms
+ * repeated across fixtures collapse into one entry, and output is sorted, so
+ * two reports for the same declaration are byte-identical.
+ */
+function summarizeControlledVariants(
+  runs: readonly BenchmarkRunRecord[],
+): readonly ControlledVariantSummary[] {
+  const builds = new Map<string, ControlledVariantBuild>();
+
+  for (const run of runs) {
+    const variant = run.provenance.variant;
+    if (variant === undefined) {
+      continue;
+    }
+    const build = builds.get(variant.declarationId) ?? {
+      axis: variant.axis,
+      arms: new Map<string, DeclaredVariantArmSummary>(),
+    };
+    const arm: DeclaredVariantArmSummary = {
+      variantId: variant.variantId,
+      role: variant.role,
+      optimizerConfiguration: run.provenance.optimizerConfiguration,
+    };
+    build.arms.set(`${arm.role}|${arm.variantId}|${arm.optimizerConfiguration}`, arm);
+    builds.set(variant.declarationId, build);
+  }
+
+  return [...builds.entries()]
+    .map(([declarationId, build]) => ({
+      declarationId,
+      axis: build.axis,
+      arms: [...build.arms.values()].sort(compareArms),
+    }))
+    .sort((left, right) => compareStrings(left.declarationId, right.declarationId));
+}
+
+function compareArms(left: DeclaredVariantArmSummary, right: DeclaredVariantArmSummary): number {
+  return (
+    compareStrings(left.role, right.role) ||
+    compareStrings(left.variantId, right.variantId) ||
+    compareStrings(left.optimizerConfiguration, right.optimizerConfiguration)
+  );
+}
+
+function compareStrings(left: string, right: string): number {
+  if (left === right) {
+    return 0;
+  }
+  return left < right ? -1 : 1;
 }
 
 /** Write a report as pretty-printed JSON, creating parent directories. */
