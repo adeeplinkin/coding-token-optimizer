@@ -15,7 +15,7 @@ export {
   PAIR_ORDER_CONTROL_FIRST,
   PAIR_ORDER_TREATMENT_FIRST,
 } from './plan.js';
-export { LEVEL2_TASKS, findTask } from './tasks.js';
+export { LEVEL2_TASKS, MECHANISM_TASK_ID, findTask, mechanismReadPath } from './tasks.js';
 export {
   LEVEL2_CONTROL_CONFIGURATION,
   LEVEL2_DECLARATION_ID,
@@ -67,16 +67,34 @@ export {
 export type { BudgetDecision, BudgetSettings, BudgetState, BudgetStopReason } from './budget.js';
 export { readArmArtifact } from './observation.js';
 export type { Level2ArtifactRead } from './observation.js';
-export { checkArmArtifactProvenance, intakeArmEvidence } from './intake.js';
+export {
+  checkArmArtifactProvenance,
+  checkFreeOnlyPolicy,
+  checkModelGuard,
+  checkSessionCompletion,
+  intakeArmEvidence,
+} from './intake.js';
 export type {
   ArmEvidenceIntake,
   ArmEvidenceOutcome,
   ArmInvalidReason,
   ArmProvenanceInput,
   ArmProvenanceVerdict,
+  FreeOnlyPolicyVerdict,
+  SessionCompletionVerdict,
 } from './intake.js';
 export { checkLiveEngagement } from './engagement.js';
 export type { LiveEngagementVerdict } from './engagement.js';
+export { parseWorkingTree, readWorkingTree } from './guards.js';
+export type { GitRunner, WorkingTreeEntry, WorkingTreeState } from './guards.js';
+export { runArmSequence } from './sequence.js';
+export type {
+  ArmSequenceBudget,
+  ArmSequenceOptions,
+  ArmSequenceResult,
+  ArmSequenceStop,
+  ArmStopCode,
+} from './sequence.js';
 export {
   LEVEL2_REPORT_DIR,
   LEVEL2_REPORT_NOTES,
@@ -99,6 +117,7 @@ export {
 export type {
   ArmEnvironmentProbe,
   ArmEnvironmentProbeOutcome,
+  ArmFreeOnlyProbe,
   ArmModelPrice,
   ArmObservedPaths,
   ArmRunOptions,
@@ -109,13 +128,77 @@ export type {
 } from './runner.js';
 export { describeLiveBounds, liveRunRefusals } from './guards.js';
 export type { LiveGuardInput } from './guards.js';
+export { containmentProbeMatrix, runContainmentProbe } from './containment-probe.js';
+export type {
+  ContainmentProbeMatrix,
+  ContainmentProbeOptions,
+  ContainmentProbeRun,
+  ContainmentProbeStep,
+  ContainmentProbeStepResult,
+} from './containment-probe.js';
 export {
+  MODEL_GUARD_PROBE_PLUGIN,
+  PROBE_UNAPPROVED_MODEL,
+  PROBE_UNKNOWN_MODEL,
+  modelGuardProbeAvailable,
+  modelGuardProbeCases,
+  probePolicyDigest,
+  removeModelGuardProbeCase,
+  runModelGuardProbe,
+  runModelGuardProbeCase,
+} from './model-guard-probe.js';
+export type {
+  ModelGuardProbeCase,
+  ModelGuardProbeCaseResult,
+  ModelGuardProbeOptions,
+  ModelGuardProbeOutcome,
+  ModelGuardProbeRun,
+} from './model-guard-probe.js';
+export { SCRIPTED_PROVIDER, startScriptedProvider } from './scripted-provider.js';
+export type { ScriptedProvider, ScriptedProviderOptions } from './scripted-provider.js';
+export {
+  freeOnlyPolicyEvidence,
+  modelGuardEvidence,
   requireTask,
   runOfflineVerification,
   syntheticObservation,
   taskCategories,
   taskIds,
 } from './verify.js';
+export {
+  AUXILIARY_REQUEST_KINDS,
+  FREE_ONLY_APPROVED_MODELS,
+  FREE_ONLY_AUXILIARY_MODEL,
+  FREE_ONLY_PRICE_FIELDS,
+  FREE_ONLY_PRIMARY_MODEL,
+  FREE_ONLY_PROVIDER,
+  MODEL_REQUEST_HOOK,
+  PRIMARY_REQUEST_KIND,
+  REQUEST_KINDS,
+  approvedModelRefusals,
+  auxiliaryRequestKinds,
+  describePriceFacts,
+  describeResolvedPolicy,
+  endpointModelIds,
+  freeOnlyModelConfig,
+  freeOnlyModelConfigDigest,
+  freeOnlyModelConfigText,
+  freeOnlyPriceRefusals,
+  freeOnlyRefusals,
+  isApprovedEndpointModel,
+  isFreeOnlyModelConfig,
+  isZeroPriceRow,
+  modelRefToId,
+  readResolvedModelPolicy,
+  resolvedPolicyRefusals,
+} from './free-model-policy.js';
+export type {
+  CataloguePriceFacts,
+  FreeOnlyModelConfig,
+  FreeOnlyPriceField,
+  ModelPriceRow,
+  ResolvedModelPolicyFacts,
+} from './free-model-policy.js';
 export type { OfflineVerificationResult, VerificationCheck } from './verify.js';
 export type {
   Level2ApplyEvidence,
@@ -125,11 +208,15 @@ export type {
   Level2ContainmentEvidence,
   Level2Declaration,
   Level2Distribution,
+  Level2EndpointKindCounts,
   Level2ExperimentResult,
   Level2GradeCheck,
   Level2Grading,
   Level2InSessionGovernorEvidence,
   Level2MechanismVerdict,
+  Level2ModelPolicyEvidence,
+  Level2NativePermissionsEvidence,
+  Level2RequestKindEvidence,
   Level2PublishedPair,
   Level2RunDisposition,
   Level2RunDispositionClass,

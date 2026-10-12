@@ -47,6 +47,17 @@ export interface LiveEngagementRequirements {
    * a safety failure rather than a measurement to compare.
    */
   readonly requireInSessionGovernor?: boolean;
+  /**
+   * True when this run must be able to show the **native permission layer** was resolved.
+   *
+   * Containment has two layers: the plugin guard (whose enforcement the harness proves against
+   * the installed runtime) and the runtime's own permission policy. The guest's own event stream
+   * does not carry the session's permission rules in the pinned runtime, so the second layer is
+   * evidenced by asking the runtime for its resolved rules before a session starts. A live run
+   * whose runtime did not report them is refused rather than compared: with the native layer
+   * unobserved, only half of containment is evidenced.
+   */
+  readonly requireNativePermissions?: boolean;
 }
 
 /**
@@ -107,9 +118,79 @@ export function checkLiveEngagement(
     };
   }
 
+  // The pre-transmission model guard, checked for the same reason as containment and with the same
+  // severity: it is the only layer that can stop a request that does not belong to the approved
+  // envelope, and a session where it did not register would have sent one. An attempted refusal is
+  // its own failure — the request never left the process, but the session is no longer the free-only
+  // session the experiment declares.
+  const modelGuard = observation.modelGuard;
+  if (modelGuard === undefined) {
+    return {
+      measurable: false,
+      stop: true,
+      detail:
+        'the session artifact carries no pre-transmission model-guard evidence, so nothing shows an unapproved model request would have been refused before it was sent; ' +
+        'a live run is refused rather than treated as bounded because it did not say otherwise.',
+    };
+  }
+  if (modelGuard.guard !== 'loaded') {
+    return {
+      measurable: false,
+      stop: true,
+      detail:
+        `the pre-transmission model guard did not register the request hook (${modelGuard.guard}), so this session would have sent a request naming any model of an allowed provider; ` +
+        'repeating it would spend authorization to learn the same thing, so the plan stops.',
+    };
+  }
+  if (modelGuard.refused > 0) {
+    const detail = modelGuard.refusals
+      .map(
+        (entry) =>
+          `${entry.reason}${entry.requestKind === undefined ? '' : `@${entry.requestKind}`}${entry.model === undefined ? '' : `[${entry.model}]`}`,
+      )
+      .join(', ');
+    return {
+      measurable: false,
+      stop: true,
+      detail:
+        `the model guard refused ${String(modelGuard.refused)} request(s) outside the approved envelope (${detail || 'reason unrecorded'}): the request never reached a provider, but this session is not the free-only session the experiment declares.`,
+    };
+  }
+
   // Defence in depth for the in-session cap. The arm driver already refuses to start a
   // capped live session whose governor cannot arm; this is the same rule applied to what the
   // session reports, so a build that armed and then lost the governor is refused too.
+  if (requirements.requireNativePermissions === true) {
+    const native = observation.nativePermissions;
+    if (native === undefined) {
+      return {
+        measurable: false,
+        stop: true,
+        detail:
+          'the session artifact carries no evidence of the native permission layer, so only the plugin guard was evidenced; ' +
+          'a live run is refused rather than compared with half of containment unobserved.',
+      };
+    }
+    if (!native.observed) {
+      return {
+        measurable: false,
+        stop: true,
+        detail:
+          `the runtime did not report the permission rules it resolved for this repository (${native.error ?? 'no reason recorded'}); ` +
+          'with the native layer unobserved, containment rests on the plugin guard alone.',
+      };
+    }
+    if (native.missingRequiredDenies.length > 0 || !native.allRequiredPresent) {
+      return {
+        measurable: false,
+        stop: true,
+        detail:
+          `the runtime resolved ${String(native.rules.length)} permission rule(s) but not every deny this policy requires ` +
+          `(missing: ${native.missingRequiredDenies.join(', ') || 'unrecorded'}); the session ran with part of containment unenforced.`,
+      };
+    }
+  }
+
   if (requirements.requireInSessionGovernor === true && observation.inSessionGovernor?.armed !== true) {
     const governor = observation.inSessionGovernor;
     return {
@@ -149,6 +230,7 @@ export function checkLiveEngagement(
     detail:
       `the harness was engaged for the ${arm} arm: ${String(requests)} outbound request(s) reached ` +
       `the plugin${arm === 'treatment' ? ` and the pass attempted ${String(observation.apply?.requestsAttempted ?? 0)} of them` : ' with the pass off'}, ` +
-      `and the containment guard registered its tool hook (${containment.blockedCalls} call(s) refused, ${containment.allowedCalls} checked and allowed).`,
+      `the containment guard registered its tool hook (${containment.blockedCalls} call(s) refused, ${containment.allowedCalls} checked and allowed), ` +
+      `and the pre-transmission model guard registered its request hook and refused nothing across ${String(modelGuard.invocations)} request(s).`,
   };
 }

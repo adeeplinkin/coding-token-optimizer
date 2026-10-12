@@ -298,6 +298,76 @@ stale, partial or mismatched run cannot be published as a measurement (see
 [LEVEL2_CANARY_PREP.md](LEVEL2_CANARY_PREP.md) §9). Reports list every planned run's disposition: `solved`,
 `task-failed`, `invalid-measurement`, `unavailable-evidence` or `not-run`.
 
+An artifact must also prove that it describes a session which **ran to completion**. The driver exits 0
+as soon as it has written a whole file — the right contract for a process, whose evidence must survive a
+failure — so a session the runtime killed or the wall clock stopped used to arrive looking complete. It is
+now refused by name (`session-exit-nonzero`, `session-timed-out`, `session-outcome-unrecorded`) before any
+grading is attempted, and an artifact whose declared mode is not the mode the caller started — a
+rehearsal's scripted counts offered to a live run — is refused as `mode-mismatch`.
+
+Containment is **enforcement, not configuration**. The offline harness asks a real session, through the
+real plugin boundary and a loopback scripted provider, for the calls the policy must refuse: an absolute
+path outside the workspace, a traversal, a shell command, an out-of-workspace write, a patch, a fetch and
+a nested agent. Each is refused with the guard's own wording visible in the result the provider received,
+with no side effect on disk and no canary text on the wire, while an in-workspace read and write still
+succeed — and a session whose guard was deliberately prevented from registering is **refused** by the
+engagement gate rather than published.
+
+The plan also stops as soon as a run stops being evidence. The first fatal arm outcome — a session that
+produced no measurement at all, a runtime that refused the model, a session that never engaged the
+harness, or a cap that forbids another session — ends the plan, and every remaining planned run is
+published as `not-run` instead of being launched. A coding failure does not stop it: a task the model
+tried and failed is a result, not an apparatus failure. The rule is a function over the plan with the
+per-run execution injected, so it is fault-injected in tests with no runtime and no cost
+(`benchmarks/tests/level2-sequence.test.ts`), and a live run additionally refuses to start on a working
+tree with uncommitted changes — read-only, never repairing anything — because a report that cannot name
+the revision it measured is reproducible by nobody. `benchmarks/tests/containment-probe.test.ts` holds that evidence;
+[LEVEL2_CANARY_PREP.md](LEVEL2_CANARY_PREP.md) §6.1 states the matrix and its limits (tool-layer
+containment, pinned revision only).
+
+Containment has a second layer, and it is *required* rather than assumed: before a live session starts, the
+harness asks the runtime for the permission rules it resolved for that repository and refuses to start if
+any deny the policy declares is missing; a run whose artifact carries no such reading, or an incomplete
+one, is refused as a measurement. The plugin event stream does not carry those rules in the pinned runtime
+(`permissionRules: null` is a reporting gap, not a missing rule), so the reading comes from the runtime's
+own resolver instead. Containment is what makes the task fair, and so is the instruction: the prompts state
+that the session has no shell tool and that its tests are run outside it, because a task that orders an
+agent to run a command the policy refuses cannot measure coding. See
+[LEVEL2_CANARY_PREP.md](LEVEL2_CANARY_PREP.md) §6.3–§6.4.
+
+The experiment is **free-only**, and free is a price, not a name. The approved set is the measured free
+primary `opencode/mimo-v2.6-flash-free` plus the auxiliary/backup
+`opencode/muse-spark-1.3-contributor-free`, and a model may be named only if the runtime's own `model.list`
+row for it is present and **0** in every tier the runtime prices — input, output, cache read and cache
+write. The check runs *before* a session is spawned, and an artifact whose policy block does not re-derive
+to a verified free-only run is refused as `model-policy-unverified` instead of compared. Both arms receive
+one configuration object with no arm parameter (primary, auxiliary, `enabled_providers: ['opencode']`,
+`compaction.auto: false`, `autoupdate: false`, `share: 'disabled'`), digested per arm and re-checked against
+the runtime's own resolved answer for the repository, so a dropped key is a refusal rather than a surprise.
+Auxiliary inference is prevented rather than hoped for — automatic title generation is suppressed by
+supplying the title on the command line, compaction is off — and the absence is measured: the runtime's
+`model.request` kinds must show `primary` only, with the loopback endpoint independently confirming that
+every request carried the agent tool registry. A synthetic per-kind hook name registers cleanly and never
+fires in this runtime, which is why a zero from a hook that never ran is treated as silence, not absence.
+[SAFE_MODE_1U_FREE_ONLY.md](SAFE_MODE_1U_FREE_ONLY.md) is the full statement, including what is still
+unverified.
+
+**Nothing outside the envelope is transmitted.** The free-only policy bounds the provider and the artifact
+gate bounds the *measurement*, but neither can stop a request: `opencode` offers free and paid models alike,
+and a refused measurement is refused after the call. A third layer acts *before* dispatch — a plugin hook,
+`ctx.session.hook("model.request")`, whose callback the pinned runtime runs with no `try`/`catch`, so a thrown
+refusal propagates out of the request assembly and the request is never built. It permits only the approved
+pair; refuses every other model (a paid one under the same provider, another provider's, an unknown id), an
+unreadable model and an unsupported request kind; and it never rewrites a model. It is mandatory three ways:
+the arm driver refuses to spawn without the guard factory and summarizer and an envelope matching *this*
+run's configuration; the artifact must carry the guard's summarized evidence or it is refused as
+`model-guard-unverified`; and the engagement gate refuses a session in which the guard refused a request,
+because it left the declared envelope. Enforcement is proven at the endpoint, not from the guard's own log:
+`benchmarks/tests/model-guard-probe.test.ts` starts real sessions against a loopback scripted provider and
+shows the guarded unapproved model reaching **no** endpoint while the unguarded control reaches one. The full
+statement, including that it covers the pinned revision's dispatch path only, is
+[SAFE_MODE_1U_FREE_ONLY.md](SAFE_MODE_1U_FREE_ONLY.md) §5.
+
 The **two-session canary** that verifies the live path before the 6-session pilot — its exact command,
 model, expected spend, enforceable-versus-post-session limits and authorization request — is
 [LEVEL2_CANARY_PREP.md](LEVEL2_CANARY_PREP.md). The 6-session pilot's price list, expected volume, hard

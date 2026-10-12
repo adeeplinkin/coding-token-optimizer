@@ -25,7 +25,9 @@ import {
   describeLiveBounds,
   isolationVerdict,
   liveRunRefusals,
+  parseWorkingTree,
   probeCanRunModel,
+  readWorkingTree,
   provisionTaskRepo,
   readArmArtifact,
   reportedCostUsd,
@@ -672,6 +674,9 @@ describe('the runtime catalogue gate', () => {
     pricing: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
     modelStatus: 'active',
     contextLimit: 400_000,
+    // Absent in this fixture: the free-only verdict is its own suite below, and a fixture that
+    // invented one here would let the catalogue checks pass on evidence they never saw.
+    freeOnly: undefined,
     notes: [],
     ...overrides,
   });
@@ -734,6 +739,7 @@ describe('the isolation proof', () => {
     pricing: undefined,
     modelStatus: undefined,
     contextLimit: undefined,
+    freeOnly: undefined,
     notes: [],
     ...overrides,
   });
@@ -822,6 +828,8 @@ describe('the live-run guards', () => {
     runtime: 'service',
     cliPath: 'opencode-cli.exe',
     cliPresent: true,
+    // A clean checkout: the run the guards describe is attributable to a revision.
+    workingTree: { clean: true, entries: [], error: undefined },
     maxRuns: 6,
     planArmRuns: 6,
     maxUnitsPerRun: 1_500_000,
@@ -834,6 +842,66 @@ describe('the live-run guards', () => {
 
   it('allows a bounded, approved, attributable run', () => {
     expect(liveRunRefusals(input())).toEqual([]);
+  });
+
+  it('refuses to start on a working tree it cannot attribute the run to', () => {
+    // This is the 2026-10-12 canary's defect: the tree carried uncommitted work and the run
+    // started anyway, so the report could not name the revision it measured.
+    const dirty = liveRunRefusals(
+      input({
+        workingTree: {
+          clean: false,
+          entries: [
+            { code: ' M', path: 'benchmarks/src/level2/cli.ts' },
+            { code: '??', path: 'benchmarks/src/level2/sequence.ts' },
+          ],
+          error: undefined,
+        },
+      }),
+    ).join(' ');
+    expect(dirty).toMatch(/working tree has 2 uncommitted change/);
+    expect(dirty).toMatch(/benchmarks\/src\/level2\/cli\.ts/);
+    expect(dirty).toMatch(/commit or stash/);
+
+    const unreadable = liveRunRefusals(
+      input({ workingTree: { clean: false, entries: [], error: 'not a git repository' } }),
+    ).join(' ');
+    expect(unreadable).toMatch(/working tree could not be read/);
+    expect(unreadable).toMatch(/not a git repository/);
+  });
+
+  it('reads the working tree read-only, and never treats an unreadable one as clean', () => {
+    const clean = readWorkingTree(process.cwd(), (args) =>
+      args.includes('rev-parse')
+        ? { stdout: 'C:/repo\n', error: undefined }
+        : { stdout: '', error: undefined },
+    );
+    expect(clean.clean).toBe(true);
+    expect(clean.entries).toEqual([]);
+
+    const dirty = readWorkingTree(process.cwd(), (args) =>
+      args.includes('rev-parse')
+        ? { stdout: 'C:/repo\n', error: undefined }
+        : { stdout: ' M src/a.ts\n?? src/b.ts\n', error: undefined },
+    );
+    expect(dirty.clean).toBe(false);
+    expect(dirty.entries.map((entry) => entry.path)).toEqual(['src/a.ts', 'src/b.ts']);
+
+    // Git failing is not "clean": nothing was read, so nothing may be assumed.
+    const failed = readWorkingTree(process.cwd(), () => ({ stdout: '', error: 'git not found' }));
+    expect(failed.clean).toBe(false);
+    expect(failed.error).toBe('git not found');
+  });
+
+  it('parses porcelain status including untracked files, and ignores nothing else', () => {
+    expect(parseWorkingTree('').clean).toBe(true);
+    const parsed = parseWorkingTree(' M a.ts\nA  b.ts\n?? c/\n');
+    expect(parsed.clean).toBe(false);
+    expect(parsed.entries).toEqual([
+      { code: ' M', path: 'a.ts' },
+      { code: 'A ', path: 'b.ts' },
+      { code: '??', path: 'c/' },
+    ]);
   });
 
   it('refuses without explicit approval, a model, or a present CLI', () => {

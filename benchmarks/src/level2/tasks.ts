@@ -162,7 +162,7 @@ export const LEVEL2_TASKS: readonly Level2Task[] = [
     category: 'read-and-edit',
     title: 'Implement a missing function after reading the module and its tests',
     prompt:
-      'In this repository, implement `total` in src/total.js so that it returns the sum of the numbers in the array it is given, treating non-numeric entries as zero. Read the existing source and tests first, then make the change. Run `node --test` until every test passes. Do not modify any file under test/ or data/.',
+      'In this repository, implement `total` in src/total.js so that it returns the sum of the numbers in the array it is given, treating non-numeric entries as zero. Read the existing source and tests first, then make the change. This session has no shell tool, so the tests cannot be run from inside it; they are run outside the session against pristine copies. Do not modify any file under test/ or data/.',
     files: {
       'package.json': manifest('read-and-edit-total'),
       'README.md': readme('read-and-edit-total'),
@@ -213,7 +213,7 @@ export function total(values) {
     category: 'debug-failing-test',
     title: 'Find and fix the cause of three failing unit tests',
     prompt:
-      'The test suite in this repository fails. Run `node --test`, read src/discount.js and the tests, then fix the source so every test passes. Do not modify any file under test/. Explain which assertions failed and why before you change anything.',
+      'The test suite in this repository fails. Read src/discount.js and the tests, then fix the source so every test passes. This session has no shell tool, so the suite cannot be run from inside it; it is run outside the session against pristine copies. Do not modify any file under test/. Explain which assertions fail and why before you change anything.',
     files: {
       'package.json': manifest('debug-failing-test-discount'),
       'README.md': readme('debug-failing-test-discount'),
@@ -272,7 +272,7 @@ export function formatPrice(value) {
     category: 'multi-file-change',
     title: 'Add a new module and export it through the package entry point',
     prompt:
-      'In this repository, add a new module src/units.js exporting `toKilometres(miles)`, which converts miles to kilometres rounded to three decimals (1 mile = 1.609344 km). Then export `toKilometres` from src/index.js without removing the existing `formatDistance` export. Read the current sources first, then make the change and run `node --test` until every test passes. Do not modify any file under test/.',
+      'In this repository, add a new module src/units.js exporting `toKilometres(miles)`, which converts miles to kilometres rounded to three decimals (1 mile = 1.609344 km). Then export `toKilometres` from src/index.js without removing the existing `formatDistance` export. Read the current sources first, then make the change. This session has no shell tool, so the tests cannot be run from inside it; they are run outside the session against pristine copies. Do not modify any file under test/.',
     files: {
       'package.json': manifest('multi-file-add-module'),
       'README.md': readme('multi-file-add-module'),
@@ -317,7 +317,7 @@ export function toKilometres(miles) {
     category: 'repeated-reads',
     title: 'Read a large catalogue twice, then implement a lookup',
     prompt:
-      'In this repository, read data/catalog.json in two separate read calls (once to inspect the shape, and once again to confirm the `note` field and the entry ids), then implement `findEntry(entries, id)` in src/catalog.js so it returns the matching entry or null. Run `node --test` until every test passes. Do not modify any file under test/ or data/.',
+      'In this repository, read data/catalog.json in two separate read calls (once to inspect the shape, and once again to confirm the `note` field and the entry ids), then implement `findEntry(entries, id)` in src/catalog.js so it returns the matching entry or null. This session has no shell tool, so the tests cannot be run from inside it; they are run outside the session against pristine copies. Do not modify any file under test/ or data/.',
     files: {
       'package.json': manifest('repeated-reads-catalogue'),
       'README.md': readme('repeated-reads-catalogue'),
@@ -364,7 +364,7 @@ export function findEntry(entries, id) {
     category: 'no-duplicate-opportunity',
     title: 'Implement a clamp helper with no repeated reads',
     prompt:
-      'In this repository, implement `clamp(value, lower, upper)` in src/clamp.js so it returns the value limited to the inclusive range. Read src/clamp.js and test/clamp.test.mjs once each, make the change, and run `node --test` until every test passes. Do not modify any file under test/.',
+      'In this repository, implement `clamp(value, lower, upper)` in src/clamp.js so it returns the value limited to the inclusive range. Read src/clamp.js and test/clamp.test.mjs once each, then make the change. This session has no shell tool, so the tests cannot be run from inside it; they are run outside the session against pristine copies. Do not modify any file under test/.',
     files: {
       'package.json': manifest('no-duplicate-opportunity-clamp'),
       'README.md': readme('no-duplicate-opportunity-clamp'),
@@ -415,7 +415,7 @@ export function clamp(value, lower, upper) {
     category: 'edge-case-fix',
     title: 'Handle empty rows and untrimmed fields in a parser',
     prompt:
-      'In this repository, src/parse.js is too naive: `parseRows` must split the text into rows on newlines, split each row on commas, trim every field, and drop rows whose fields are all empty. Read the source and tests, fix the implementation, and run `node --test` until every test passes. Do not modify any file under test/.',
+      'In this repository, src/parse.js is too naive: `parseRows` must split the text into rows on newlines, split each row on commas, trim every field, and drop rows whose fields are all empty. Read the source and tests, then fix the implementation. This session has no shell tool, so the tests cannot be run from inside it; they are run outside the session against pristine copies. Do not modify any file under test/.',
     files: {
       'package.json': manifest('edge-case-parse-rows'),
       'README.md': readme('edge-case-parse-rows'),
@@ -470,4 +470,32 @@ export function parseRows(text) {
 /** Look up one task by id. */
 export function findTask(id: string): Level2Task | undefined {
   return LEVEL2_TASKS.find((task) => task.id === id);
+}
+
+/**
+ * The task whose category exists to create an eligible duplicate read.
+ *
+ * The scripted rehearsal asks a session to read one file **twice**, because two identical tool
+ * results in one request are what the pass needs to have anything to elide. Only one task in the
+ * pack is built for that (`data/catalog.json`, ~8 KB of synthetic catalogue), so it is the task a
+ * rehearsal must run: the default of the first task id would read a file the task does not
+ * contain and report `no-opportunity` while looking like a pass that simply found nothing.
+ */
+export const MECHANISM_TASK_ID = 'repeated-reads-catalogue';
+
+/**
+ * The file a scripted session is asked to read twice, chosen from the task's **own** files.
+ *
+ * Preferring a `data/` file is deliberate — the pack's repeated-read fixture lives there, and the
+ * task instruction forbids editing it, so a read of it cannot be confused with work — and the
+ * largest remaining file is the fallback so a rehearsal of any task reads something that exists.
+ * The returned path is workspace-relative with forward slashes, which is how the pack declares its
+ * files and how the scripted provider expects to be told what to read.
+ */
+export function mechanismReadPath(task: Level2Task): string | undefined {
+  const files = Object.entries(task.files)
+    .map(([path, content]) => ({ path, bytes: content.length }))
+    .sort((left, right) => right.bytes - left.bytes);
+  const preferred = files.find((entry) => entry.path.startsWith('data/')) ?? files[0];
+  return preferred?.path;
 }

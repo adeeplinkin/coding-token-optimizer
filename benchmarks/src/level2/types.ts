@@ -163,6 +163,20 @@ export interface Level2WireRequest {
   readonly bodyBytes: number;
   /** Markers of the Safe Mode marker prefix found in this request body. */
   readonly markerCount: number;
+  /**
+   * The model identifier the request body named, or `undefined` when it could not be read.
+   *
+   * An identifier is not content: it is the same string the run was started with, and it is
+   * what makes "no unexpected model substitution" checkable at the endpoint rather than
+   * assumed from the configuration.
+   */
+  readonly model?: string;
+  /**
+   * Whether the request carried a tool registry. The runtime's agent-loop request does; its
+   * auxiliary title request does not, so this is the endpoint's own way of showing that an
+   * auxiliary request did or did not happen.
+   */
+  readonly hasTools?: boolean;
 }
 
 /**
@@ -192,6 +206,114 @@ export interface Level2WireEvidence {
   readonly unmeasurableRequests: number;
   /** True when every observed request went to the configured provider base URL. */
   readonly allRequestsToProvider: boolean;
+}
+
+/**
+ * What the runtime was observed to do, per request kind, for one arm run.
+ *
+ * The request kind is not content — it is the runtime's own category for the call it composed
+ * — and it is the fact that decides whether an auxiliary call (a title, a compaction, a
+ * generate) happened at all. `modelsNamed` is the set of model identifiers the runtime named
+ * when composing requests, which is how a substitution would show up.
+ *
+ * Two sources feed this: the runtime's `model.request:<kind>` hooks (available in every mode,
+ * including live), and the loopback endpoint's own record in a rehearsal. Neither is the
+ * optimizer's report of itself.
+ */
+export interface Level2RequestKindEvidence {
+  /** Where the counts came from, so the strength of the claim travels with it. */
+  readonly source: 'model-request-hooks' | 'loopback-endpoint' | 'none';
+  /**
+   * The hook name(s) the runtime accepted, so a silent absence is distinguishable from a zero.
+   *
+   * A name here is not evidence that the hook **fires**: the pinned runtime accepts a hook
+   * registration without validating the name and then never calls one it does not dispatch
+   * (measured — a per-kind name such as `model.request:title` registers cleanly and stays silent
+   * while real requests go out). Only {@link kinds} can show an absence, which is why a check
+   * that requires "no title request" must also require the invocation count of the primary kind
+   * to be above zero from *this* hook.
+   */
+  readonly kindsRegistered: readonly string[];
+  /** Invocations per request kind, e.g. `{ primary: 2, title: 0 }`. */
+  readonly kinds: Readonly<Record<string, number>>;
+  /** Model identifiers the runtime named when composing requests, and how often. */
+  readonly modelsNamed: Readonly<Record<string, number>>;
+  /** The paths/kinds the probe registered but the runtime rejected, if any. */
+  readonly registrationFailures: readonly string[];
+  /**
+   * The payload key names the runtime handed the hook, so the recorded kinds can be seen to come
+   * from real payloads rather than from a hook that fired with nothing in it.
+   */
+  readonly payloadKeys: readonly string[];
+  /**
+   * What the loopback endpoint itself received, when the run was pointed at one. Independent of
+   * the hook: a request without the agent-loop tool registry is an auxiliary request, so the two
+   * readings can be compared instead of one being trusted.
+   */
+  readonly endpointKinds: Level2EndpointKindCounts | undefined;
+  /** True when no kind other than `primary` was ever composed. */
+  readonly auxiliaryRequests: number;
+}
+
+/** The loopback endpoint's own count of what it received, by request shape. */
+export interface Level2EndpointKindCounts {
+  readonly requests: number;
+  /** Requests that declared the agent-loop tool registry, i.e. primary requests. */
+  readonly withToolRegistry: number;
+  /** Requests with no tool registry: auxiliary work, whatever kind composed it. */
+  readonly withoutToolRegistry: number;
+}
+
+/**
+ * The free-only model policy as one arm run exercised it.
+ *
+ * This is the evidence that the run stayed inside the approved envelope: the configuration the
+ * repository received (so the two arms' configurations can be shown to be identical), the
+ * price row the runtime reported for the model *before* any session started, what the runtime
+ * resolved from that configuration, and what kinds of request it then composed.
+ *
+ * A run whose policy evidence is absent or does not match the expected configuration is refused
+ * by the intake rather than compared: it is not a cheap run, it is an unverified one.
+ */
+export interface Level2ModelPolicyEvidence {
+  /** The primary model the policy requires. */
+  readonly primaryModel: string;
+  /** The model configured for unavoidable auxiliary calls. */
+  readonly auxiliaryModel: string;
+  /** Every approved model identifier. */
+  readonly approvedModels: readonly string[];
+  /** The exact configuration object written into the repository's `.opencode/opencode.json`. */
+  readonly config: unknown;
+  /** SHA-256 of the canonical configuration text; identical in both arms by construction. */
+  readonly configDigest: string;
+  /** True when the written configuration was structurally the free-only one. */
+  readonly configAccepted: boolean;
+  /** Where the price verdict came from, or `not-checked` when no catalogue was consulted. */
+  readonly catalogueSource: 'service' | 'standalone' | 'not-checked';
+  /** True only when every tier was explicitly zero. */
+  readonly priceVerifiedFree: boolean;
+  /** The price row the runtime reported, when one was read. */
+  readonly priceRow:
+    | {
+        readonly input: number | undefined;
+        readonly output: number | undefined;
+        readonly cacheRead: number | undefined;
+        readonly cacheWrite: number | undefined;
+      }
+    | undefined;
+  /** Why no catalogue was consulted, when none was (a rehearsal spends nothing). */
+  readonly priceCheckSkippedReason: string | undefined;
+  /** Every pre-spawn refusal; empty means the run started inside the policy. */
+  readonly refusals: readonly string[];
+  /** What the runtime resolved from the configuration, as its own config read reported it. */
+  readonly resolved: unknown;
+  /** Request kinds the runtime was observed to compose. */
+  readonly requests: Level2RequestKindEvidence;
+  /**
+   * True when the auxiliary calls were removed at the source rather than only bounded: the
+   * stable session title is supplied on the command line, so the runtime composes none.
+   */
+  readonly titleGenerationSuppressed: boolean;
 }
 
 /**
@@ -242,6 +364,53 @@ export interface Level2ContainmentEvidence {
 }
 
 /**
+ * The **pre-transmission model guard** as one arm run exercised it.
+ *
+ * This is the third enforcement layer, and the only one that acts while a request is still being
+ * assembled: the price gate and the resolved-configuration check decide whether a session may
+ * *start*, the containment guard decides what its tools may *do*, and this decides whether a model
+ * request may be *sent*. It is read from the guard plugin's own record, and the two facts that
+ * decide measurability are `loaded` **and** `hookRegistered` — a plugin that ran without the runtime
+ * accepting its hook bounds nothing, however complete its evidence file looks.
+ *
+ * `refused` being non-zero is reported rather than tolerated: a request the guard stopped means the
+ * session tried to step outside the approved envelope, so nothing it produced is a free-only
+ * measurement, even though the request itself never left the process.
+ */
+export interface Level2ModelGuardEvidence {
+  /** `loaded` requires both the plugin and the runtime-accepted hook, not one of them. */
+  readonly guard: 'loaded' | 'capability-missing' | 'missing';
+  /** The hook name the guard registered; the one the runtime dispatches every request to. */
+  readonly hook: string;
+  readonly loaded: boolean;
+  readonly hookRegistered: boolean;
+  /** Requests the guard saw and classified, whether it allowed or refused them. */
+  readonly invocations: number;
+  readonly allowed: number;
+  readonly refused: number;
+  /** Why each refusal happened. Model identifiers and reasons only, never request content. */
+  readonly refusals: readonly {
+    readonly requestKind?: string;
+    readonly model?: string;
+    readonly reason: string;
+  }[];
+  /** True when the guard was constructed without a usable envelope: it refuses everything. */
+  readonly misconfigured: boolean;
+  /** The configuration digest the guard was given, so it can be compared with this run's. */
+  readonly policyDigest: string;
+  /** The envelope itself, as the driver passed it; absent when the policy could not state one. */
+  readonly envelope:
+    | {
+        readonly primary: string;
+        readonly approved: readonly string[];
+        readonly allowedKinds: readonly string[];
+        readonly policyDigest: string;
+      }
+    | undefined;
+  readonly evidenceLines: number;
+}
+
+/**
  * What the in-session spending governor did during one arm run.
  *
  * Read from the driver's own supervisor, which polls the cost the runtime reports
@@ -249,6 +418,37 @@ export interface Level2ContainmentEvidence {
  * crossed. `armed: false` with a reason means the session ran without an in-session
  * spending bound, and the report must say so rather than implying one existed.
  */
+/**
+ * The runtime's own resolved permission rules for one arm's repository.
+ *
+ * This is the **second** containment layer, and it is evidenced by asking the runtime rather than
+ * by assuming it: the arm driver runs a read-only `api config.get --standalone` in the arm's own
+ * isolated environment before any session starts and records the canonical actions, effects and a
+ * resource *class* (never a path). A live session whose runtime did not resolve the required
+ * denies is refused, because then only the plugin layer would be in force.
+ *
+ * The plugin event stream does **not** carry the session's permission rules in the pinned runtime
+ * (`permissionRules: null` in the guard's own evidence is a gap in what the runtime reports to a
+ * plugin, not a missing rule), so this is where the native layer is observed.
+ */
+export interface Level2NativePermissionsEvidence {
+  /** True when the runtime reported at least one permission rule. */
+  readonly observed: boolean;
+  /** Exactly which read-only call produced this, so the claim names its source. */
+  readonly source: string;
+  readonly rules: readonly {
+    readonly action: string;
+    readonly effect: string;
+    readonly resource: string;
+  }[];
+  /** The denies the canary policy requires, in the runtime's own vocabulary. */
+  readonly requiredDenies: readonly string[];
+  /** Required denies the runtime did not report. Empty means the layer is fully evidenced. */
+  readonly missingRequiredDenies: readonly string[];
+  readonly allRequiredPresent: boolean;
+  readonly error: string | undefined;
+}
+
 export interface Level2InSessionGovernorEvidence {
   readonly armed: boolean;
   readonly reason: string | undefined;
@@ -289,10 +489,25 @@ export interface Level2ArmObservation {
    * `checkLiveEngagement`).
    */
   readonly containment: Level2ContainmentEvidence | undefined;
+  /** The native permission layer as the runtime itself resolved it; absent before it was read. */
+  readonly nativePermissions: Level2NativePermissionsEvidence | undefined;
   /** In-session spending-governor evidence, or `undefined` when none was recorded. */
   readonly inSessionGovernor: Level2InSessionGovernorEvidence | undefined;
+  /**
+   * Pre-transmission model-guard evidence, or `undefined` when the artifact predates it.
+   *
+   * A run without it is refused: an unregistered guard means an unapproved model request would
+   * have been sent, and there would be no record either way.
+   */
+  readonly modelGuard: Level2ModelGuardEvidence | undefined;
   /** Classification computed from {@link apply} and {@link wire}. */
   readonly mechanism: Level2MechanismVerdict;
+  /**
+   * The free-only model policy as this run exercised it, or `undefined` when the artifact
+   * predates it. A run without it is refused by the intake: the approved envelope is part of
+   * what makes the measurement interpretable.
+   */
+  readonly modelPolicy: Level2ModelPolicyEvidence | undefined;
 }
 
 /** A method, a number and the pairs it was observed on. Never a single headline. */

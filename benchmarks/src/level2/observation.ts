@@ -11,6 +11,7 @@
  * - the arm, task and pair identity must agree with the plan, so a mislabelled run
  *   cannot present itself as its counterpart.
  */
+import { isFreeOnlyModelConfig, isZeroPriceRow } from './free-model-policy.js';
 import { classifyMechanism } from './mechanism.js';
 import { digest } from './repos.js';
 import type {
@@ -21,6 +22,10 @@ import type {
   Level2ContainmentEvidence,
   Level2Grading,
   Level2InSessionGovernorEvidence,
+  Level2ModelGuardEvidence,
+  Level2ModelPolicyEvidence,
+  Level2NativePermissionsEvidence,
+  Level2RequestKindEvidence,
   Level2RunIdentity,
   Level2UsageObservation,
   Level2WireEvidence,
@@ -104,9 +109,159 @@ function readWireRequests(value: unknown, problems: string[]): readonly Level2Wi
     if (seq === undefined || bodyBytes === undefined || markerCount === undefined) {
       return;
     }
-    requests.push({ seq, bodyBytes, markerCount });
+    requests.push({
+      seq,
+      bodyBytes,
+      markerCount,
+      // Absent when the endpoint could not read an identifier; never defaulted to the
+      // requested model, which would make a substitution unobservable.
+      ...(typeof entry['model'] === 'string' ? { model: entry['model'] } : {}),
+      ...(typeof entry['hasTools'] === 'boolean' ? { hasTools: entry['hasTools'] } : {}),
+    });
   });
   return requests;
+}
+
+/**
+ * Read the runtime's observed request kinds and the models it named.
+ *
+ * `kindsRegistered` is kept because a zero and a never-registered hook are different facts: a
+ * runtime that refused the hook reports no kind at all, and a report of "no title request"
+ * must be able to say which of the two it is. An absent block reads as `undefined` rather
+ * than as an empty success.
+ */
+function readRequestKinds(value: unknown, problems: string[]): Level2RequestKindEvidence | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const source = value['source'];
+  if (source !== 'model-request-hooks' && source !== 'loopback-endpoint' && source !== 'none') {
+    problems.push('modelPolicy.requests.source must be a known source.');
+    return undefined;
+  }
+  const counts = (input: unknown): Record<string, number> => {
+    if (!isRecord(input)) return {};
+    const result: Record<string, number> = {};
+    for (const [key, entry] of Object.entries(input)) {
+      if (typeof entry === 'number' && Number.isInteger(entry) && entry >= 0) {
+        result[key] = entry;
+      }
+    }
+    return result;
+  };
+  const kinds = counts(value['kinds']);
+  const modelsNamed = counts(value['modelsNamed']);
+  const kindsRegistered = Array.isArray(value['kindsRegistered'])
+    ? value['kindsRegistered'].filter((entry): entry is string => typeof entry === 'string')
+    : [];
+  const registrationFailures = Array.isArray(value['registrationFailures'])
+    ? value['registrationFailures'].filter((entry): entry is string => typeof entry === 'string')
+    : [];
+  const payloadKeys = Array.isArray(value['payloadKeys'])
+    ? value['payloadKeys'].filter((entry): entry is string => typeof entry === 'string')
+    : [];
+  const endpointRecord = isRecord(value['endpointKinds']) ? value['endpointKinds'] : undefined;
+  const endpointCount = (entry: unknown, field: string): number | undefined => {
+    const read = readCount(entry, `modelPolicy.requests.endpointKinds.${field}`, problems);
+    return read;
+  };
+  const endpointKinds =
+    endpointRecord === undefined
+      ? undefined
+      : {
+          requests: endpointCount(endpointRecord['requests'], 'requests') ?? 0,
+          withToolRegistry: endpointCount(endpointRecord['withToolRegistry'], 'withToolRegistry') ?? 0,
+          withoutToolRegistry:
+            endpointCount(endpointRecord['withoutToolRegistry'], 'withoutToolRegistry') ?? 0,
+        };
+  // Everything that is not the primary kind is auxiliary, including a kind this harness does not
+  // recognize: a request nobody can name is not a request anyone can rule in.
+  const auxiliaryRequests = Object.entries(kinds)
+    .filter(([kind]) => kind !== 'primary')
+    .reduce((total, [, count]) => total + count, 0);
+  return {
+    source,
+    kindsRegistered,
+    kinds,
+    modelsNamed,
+    registrationFailures,
+    payloadKeys,
+    endpointKinds,
+    auxiliaryRequests,
+  };
+}
+
+/**
+ * Read the free-only policy evidence.
+ *
+ * The three facts that decide whether the run stayed inside the envelope are **recomputed**
+ * here rather than believed: whether the recorded configuration is structurally the approved
+ * one, whether the price row is zero in every tier, and how many non-primary requests the
+ * runtime composed. A driver that wrote `priceVerifiedFree: true` beside a non-zero row is
+ * read as not verified.
+ */
+function readModelPolicy(value: unknown, problems: string[]): Level2ModelPolicyEvidence | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const priceRecord = isRecord(value['priceRow']) ? value['priceRow'] : undefined;
+  const priceRow =
+    priceRecord === undefined
+      ? undefined
+      : {
+          input: readOptionalNumber(priceRecord['input'], 'modelPolicy.priceRow.input', problems),
+          output: readOptionalNumber(priceRecord['output'], 'modelPolicy.priceRow.output', problems),
+          cacheRead: readOptionalNumber(
+            priceRecord['cacheRead'],
+            'modelPolicy.priceRow.cacheRead',
+            problems,
+          ),
+          cacheWrite: readOptionalNumber(
+            priceRecord['cacheWrite'],
+            'modelPolicy.priceRow.cacheWrite',
+            problems,
+          ),
+        };
+  const catalogueSource = value['catalogueSource'];
+  const requests = readRequestKinds(value['requests'], problems);
+  const approvedModels = Array.isArray(value['approvedModels'])
+    ? value['approvedModels'].filter((entry): entry is string => typeof entry === 'string')
+    : [];
+  const refusals = Array.isArray(value['refusals'])
+    ? value['refusals'].filter((entry): entry is string => typeof entry === 'string')
+    : [];
+  return {
+    primaryModel: typeof value['primaryModel'] === 'string' ? value['primaryModel'] : '',
+    auxiliaryModel: typeof value['auxiliaryModel'] === 'string' ? value['auxiliaryModel'] : '',
+    approvedModels,
+    config: value['config'],
+    configDigest: typeof value['configDigest'] === 'string' ? value['configDigest'] : '',
+    configAccepted:
+      value['configAccepted'] === true && isFreeOnlyModelConfig(value['config']),
+    catalogueSource:
+      catalogueSource === 'service' || catalogueSource === 'standalone'
+        ? catalogueSource
+        : 'not-checked',
+    priceVerifiedFree: value['priceVerifiedFree'] === true && isZeroPriceRow(priceRow),
+    priceRow,
+    priceCheckSkippedReason:
+      typeof value['priceCheckSkippedReason'] === 'string'
+        ? value['priceCheckSkippedReason']
+        : undefined,
+    refusals,
+    resolved: value['resolved'],
+    requests: requests ?? {
+      source: 'none',
+      kindsRegistered: [],
+      kinds: {},
+      modelsNamed: {},
+      registrationFailures: [],
+      payloadKeys: [],
+      endpointKinds: undefined,
+      auxiliaryRequests: 0,
+    },
+    titleGenerationSuppressed: value['titleGenerationSuppressed'] === true,
+  };
 }
 
 /**
@@ -302,6 +457,128 @@ export function readArmArtifact(
     };
   };
 
+  /**
+   * Read the runtime's own resolved permission rules.
+   *
+   * Absent is absent: a run whose artifact predates this evidence reads as `undefined`, and the
+   * engagement gate refuses a live run that cannot show the native layer was resolved. A malformed
+   * rule list is a problem rather than a partial credit.
+   */
+  const readNativePermissions = (): Level2NativePermissionsEvidence | undefined => {
+    const record = value['nativePermissions'];
+    if (!isRecord(record)) {
+      return undefined;
+    }
+    const rules = Array.isArray(record['rules'])
+      ? record['rules'].flatMap((rule) =>
+          isRecord(rule) &&
+          typeof rule['action'] === 'string' &&
+          typeof rule['effect'] === 'string'
+            ? [
+                {
+                  action: rule['action'],
+                  effect: rule['effect'],
+                  resource: typeof rule['resource'] === 'string' ? rule['resource'] : 'unclassified',
+                },
+              ]
+            : [],
+        )
+      : [];
+    if (!Array.isArray(record['rules'])) {
+      problems.push('nativePermissions.rules must be an array.');
+    }
+    const requiredDenies = Array.isArray(record['requiredDenies'])
+      ? record['requiredDenies'].filter((entry): entry is string => typeof entry === 'string')
+      : [];
+    const missingRequiredDenies = Array.isArray(record['missingRequiredDenies'])
+      ? record['missingRequiredDenies'].filter((entry): entry is string => typeof entry === 'string')
+      : [];
+    return {
+      // The flag is recomputed: a caller cannot make the layer look observed by asserting it.
+      observed: rules.length > 0,
+      source: typeof record['source'] === 'string' ? record['source'] : 'unrecorded',
+      rules,
+      requiredDenies,
+      missingRequiredDenies,
+      allRequiredPresent:
+        rules.length > 0 &&
+        requiredDenies.length > 0 &&
+        requiredDenies.every((action) =>
+          rules.some((rule) => rule.action === action && rule.effect === 'deny'),
+        ),
+      error: typeof record['error'] === 'string' ? record['error'] : undefined,
+    };
+  };
+
+  /**
+   * Read the pre-transmission model-guard evidence.
+   *
+   * Same rule as containment: an absent or unrecognized `guard` yields `undefined` and the
+   * engagement gate refuses the run, because the alternative — defaulting an unreadable block to
+   * "guarded" — is exactly the failure this layer exists to prevent. The flag is recomputed from
+   * `loaded` and `hookRegistered` rather than taken from the file, so a driver cannot make an
+   * unregistered guard look armed by writing `guard: "loaded"`.
+   */
+  const readModelGuard = (): Level2ModelGuardEvidence | undefined => {
+    const record = value['modelGuard'];
+    if (!isRecord(record)) {
+      return undefined;
+    }
+    const declared = record['guard'];
+    const loaded = record['loaded'] === true;
+    const hookRegistered = record['hookRegistered'] === true;
+    const guard: Level2ModelGuardEvidence['guard'] =
+      loaded && hookRegistered
+        ? 'loaded'
+        : declared === 'capability-missing'
+          ? 'capability-missing'
+          : 'missing';
+    if (declared !== 'loaded' && declared !== 'capability-missing' && declared !== 'missing') {
+      problems.push('modelGuard.guard must be "loaded", "capability-missing" or "missing".');
+    }
+    const refusals = Array.isArray(record['refusals'])
+      ? record['refusals'].flatMap((entry) => {
+          if (!isRecord(entry) || typeof entry['reason'] !== 'string') return [];
+          return [
+            {
+              ...(typeof entry['requestKind'] === 'string' ? { requestKind: entry['requestKind'] } : {}),
+              ...(typeof entry['model'] === 'string' ? { model: entry['model'] } : {}),
+              reason: entry['reason'],
+            },
+          ];
+        })
+      : [];
+    const rawEnvelope = record['envelope'];
+    const envelope =
+      isRecord(rawEnvelope) && typeof rawEnvelope['primary'] === 'string'
+        ? {
+            primary: rawEnvelope['primary'],
+            approved: Array.isArray(rawEnvelope['approved'])
+              ? rawEnvelope['approved'].filter((id): id is string => typeof id === 'string')
+              : [],
+            allowedKinds: Array.isArray(rawEnvelope['allowedKinds'])
+              ? rawEnvelope['allowedKinds'].filter((kind): kind is string => typeof kind === 'string')
+              : [],
+            policyDigest:
+              typeof rawEnvelope['policyDigest'] === 'string' ? rawEnvelope['policyDigest'] : '',
+          }
+        : undefined;
+    return {
+      guard,
+      hook: typeof record['hook'] === 'string' ? record['hook'] : 'unrecorded',
+      loaded,
+      hookRegistered,
+      invocations: readCount(record['invocations'], 'modelGuard.invocations', problems) ?? 0,
+      allowed: readCount(record['allowed'], 'modelGuard.allowed', problems) ?? 0,
+      refused: readCount(record['refused'], 'modelGuard.refused', problems) ?? 0,
+      refusals,
+      misconfigured: record['misconfigured'] === true,
+      policyDigest: typeof record['policyDigest'] === 'string' ? record['policyDigest'] : '',
+      envelope,
+      evidenceLines: readCount(record['evidenceLines'], 'modelGuard.evidenceLines', problems) ?? 0,
+    };
+  };
+
   /** Read the in-session spending-governor evidence; absent is absent, never a zero. */
   const readGovernor = (): Level2InSessionGovernorEvidence | undefined => {
     const record = value['inSessionGovernor'];
@@ -326,7 +603,12 @@ export function readArmArtifact(
   };
 
   const containment = readContainment();
+  const nativePermissions = readNativePermissions();
   const inSessionGovernor = readGovernor();
+  const modelGuard = readModelGuard();
+  // Absent is absent: the intake refuses a run without policy evidence, so nothing is
+  // defaulted into looking verified.
+  const modelPolicy = readModelPolicy(value['modelPolicy'], problems);
 
   const wireRecord = isRecord(value['wire']) ? value['wire'] : undefined;
   const requests = wireRecord === undefined ? [] : readWireRequests(wireRecord['requests'], problems);
@@ -386,8 +668,11 @@ export function readArmArtifact(
       apply,
       wire,
       containment,
+      nativePermissions,
       inSessionGovernor,
+      modelGuard,
       mechanism,
+      modelPolicy,
     },
     problems,
   };

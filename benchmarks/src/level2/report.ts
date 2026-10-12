@@ -46,6 +46,7 @@ export const LEVEL2_REPORT_NOTES: readonly string[] = [
   'A delta inside run-to-run spread is reported as no change, not as an improvement. Three pairs per task is the design\u2019s minimum for a distribution, not for a conclusion.',
   'Request-size facts (bytes elided) are not tokens saved. A run whose mechanism did not fire is recorded as no-opportunity and excluded from every comparison.',
   'Model, task instructions, starting repository state, grading command and grading criteria are identical in both arms; the only declared difference is the optimizer configuration.',
+  'A count of outbound request *callbacks* is not a count of provider attempts or of completed requests. The http.request hook sees each request the runtime composed; a retry the runtime makes internally is a separate attempt it does not report, and a request the provider refuses is still one composed request. The harness reports what it observed and states the rest as unobservable — it never infers a retry.',
 ];
 
 /** All observed token fields, in report order. Fields are never combined. */

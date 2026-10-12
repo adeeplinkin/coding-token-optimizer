@@ -46,6 +46,22 @@ export type {
   ContainmentPathVerdict,
 } from './containment.js';
 export {
+  MODEL_GUARD_PLUGIN_ID,
+  MODEL_GUARD_REQUEST_KINDS,
+  createModelGuardPluginV2,
+  evaluateModelRequest,
+  normalizeModelId,
+  summarizeModelGuardEvidence,
+} from './model-guard.js';
+export type {
+  ModelGuardDecision,
+  ModelGuardEvidenceLine,
+  ModelGuardEvidenceSummary,
+  ModelGuardOptions,
+  ModelGuardPolicy,
+  ModelGuardRefusalReason,
+} from './model-guard.js';
+export {
   MAX_INTERRUPT_ATTEMPTS,
   decideCostGovernor,
   latestSessionCostUsd,
@@ -146,6 +162,7 @@ export type {
   OpenCodeV2SessionDeletedData,
   OpenCodeV2SessionDomain,
   OpenCodeV2SessionHookSpec,
+  OpenCodeV2SessionModelRequest,
   OpenCodeV2SessionMovedData,
   OpenCodeV2ToolDomain,
   OpenCodeV2ToolExecuteAfterEvent,

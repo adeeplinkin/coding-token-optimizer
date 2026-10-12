@@ -16,11 +16,9 @@
  *   unless the operator explicitly approves, names the model, and caps the run count
  *   at or above the plan's arm-run total.
  */
-import { spawn } from 'node:child_process';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join, resolve } from 'node:path';
 import {
   LEVEL2_REPORT_DIR,
   buildExperiment,
@@ -35,7 +33,6 @@ import {
   DEFAULT_MAX_UNITS,
   DEFAULT_MAX_UNITS_PER_RUN,
   createBudgetTracker,
-  hasNoReportedUsage,
 } from './budget.js';
 import {
   DEFAULT_CLI_PATH,
@@ -46,17 +43,31 @@ import {
   runArm,
 } from './runner.js';
 import type { ArmRuntimeMode } from './runner.js';
-import { describeLiveBounds, liveRunRefusals } from './guards.js';
-import { checkLiveEngagement } from './engagement.js';
-import { findTask, LEVEL2_TASKS } from './tasks.js';
+import { describeLiveBounds, liveRunRefusals, readWorkingTree } from './guards.js';
+import {
+  FREE_ONLY_APPROVED_MODELS,
+  FREE_ONLY_AUXILIARY_MODEL,
+  FREE_ONLY_PRIMARY_MODEL,
+  MODEL_REQUEST_HOOK,
+  PRIMARY_REQUEST_KIND,
+  auxiliaryRequestKinds,
+  describeResolvedPolicy,
+  endpointModelIds,
+  freeOnlyModelConfig,
+  freeOnlyModelConfigDigest,
+  isApprovedEndpointModel,
+  readResolvedModelPolicy,
+  resolvedPolicyRefusals,
+} from './free-model-policy.js';
+import { runArmSequence } from './sequence.js';
+import { startScriptedProvider } from './scripted-provider.js';
+import { runContainmentProbe } from './containment-probe.js';
+import type { ContainmentProbeRun, ContainmentProbeStepResult } from './containment-probe.js';
+import { LEVEL2_TASKS, MECHANISM_TASK_ID, findTask, mechanismReadPath } from './tasks.js';
 import { requireTask } from './verify.js';
 import { resolveLevel2Declaration } from './variants.js';
 import { runOfflineVerification } from './verify.js';
 import type { Level2ArmObservation, Level2RunDisposition, Level2Task } from './types.js';
-
-const SCRIPTED_PROVIDER = fileURLToPath(
-  new URL('../../../integrations/opencode/scripts/stage1r-capture-server.mjs', import.meta.url),
-);
 
 interface CliOptions {
   readonly mode: 'offline-verify' | 'plan' | 'preflight' | 'rehearse' | 'live' | 'help';
@@ -258,73 +269,6 @@ function requireCap(key: string, value: string): number | undefined {
   return parsed;
 }
 
-/** Start the loopback scripted provider and wait for its readiness line. */
-async function startScriptedProvider(
-  readPath: string,
-  capturePath: string,
-  toolCalls: number,
-): Promise<{ readonly baseUrl: string; readonly stop: () => void }> {
-  // The provider writes its capture file at startup, so its directory must exist
-  // before it is spawned.
-  await mkdir(dirname(capturePath), { recursive: true });
-
-  const server = spawn(
-    process.execPath,
-    [
-      SCRIPTED_PROVIDER,
-      '--capture',
-      capturePath,
-      '--port',
-      '0',
-      '--mode',
-      'scripted',
-      '--read-path',
-      readPath,
-      '--tool-calls',
-      String(toolCalls),
-    ],
-    { stdio: ['ignore', 'pipe', 'pipe'] },
-  );
-
-  let diagnosis = '';
-  server.stderr.on('data', (chunk) => {
-    diagnosis += String(chunk);
-  });
-
-  const port = await new Promise<number>((resolvePort, rejectPort) => {
-    let buffered = '';
-    const timer = setTimeout(
-      () =>
-        rejectPort(
-          new Error(`the scripted provider did not report readiness: ${diagnosis.trim().slice(0, 300)}`),
-        ),
-      15_000,
-    );
-    server.stdout.on('data', (chunk) => {
-      buffered += String(chunk);
-      const match = /LISTENING (\d+)/.exec(buffered);
-      if (match !== null) {
-        clearTimeout(timer);
-        resolvePort(Number(match[1]));
-      }
-    });
-    server.on('error', (error) => rejectPort(error));
-    server.on('close', (code) => {
-      if (code !== 0) {
-        clearTimeout(timer);
-        rejectPort(new Error(`the scripted provider exited with code ${String(code)}: ${diagnosis.trim().slice(0, 300)}`));
-      }
-    });
-  });
-
-  return {
-    baseUrl: `http://127.0.0.1:${port}/v1`,
-    stop: () => {
-      server.kill();
-    },
-  };
-}
-
 async function writeReports(
   name: string,
   markdown: string,
@@ -403,12 +347,35 @@ function printPlan(plan: ReturnType<typeof buildPlan>): number {
 }
 
 async function runRehearse(options: CliOptions): Promise<number> {
-  const task = tasksFor(options)[0];
+  // The rehearsal's default task is the one the pass is *for*: a task whose repository holds a
+  // file large enough for two identical reads to be eligible. Without `--task` the first task id
+  // used to be chosen, and its repository has no `data/` directory — the scripted reads answered
+  // "file not found", the pass had nothing to elide, and the rehearsal reported `no-opportunity`
+  // as if that were the apparatus working. A rehearsal that cannot exercise the mechanism proves
+  // nothing about the mechanism, so the default is the task that can.
+  const task = options.taskId === undefined ? requireTask(MECHANISM_TASK_ID) : tasksFor(options)[0];
   if (task === undefined) {
     throw new Error('A rehearsal needs a task.');
   }
+  // The file the scripted provider asks for, taken from the task's own files: a path the task
+  // does not contain makes the two reads identical *failures*, which is not a duplicate.
+  const rehearsalReadPath = mechanismReadPath(task);
+  if (rehearsalReadPath === undefined) {
+    throw new Error(`Task "${task.id}" declares no files, so a rehearsal has nothing to read.`);
+  }
   if (!existsSync(options.cliPath)) {
     process.stderr.write(`level2: the OpenCode CLI was not found at ${options.cliPath}\n`);
+    return 2;
+  }
+  // A rehearsal runs the approved free primary and nothing else. It drives the same driver a live
+  // arm does, and that driver refuses a command line that disagrees with the model its free-only
+  // configuration pins — so accepting `--model <something else>` here would only move the refusal
+  // one process later, while suggesting a rehearsal could be run outside the policy at all.
+  const rehearsalModel = FREE_ONLY_PRIMARY_MODEL;
+  if (options.model !== undefined && options.model !== rehearsalModel) {
+    process.stderr.write(
+      `level2: a rehearsal runs the approved free model \`${rehearsalModel}\`; refusing \`${options.model}\`. The free-only configuration pins the primary model, and a rehearsal under a different model would prove nothing about the configuration a live run receives.\n`,
+    );
     return 2;
   }
 
@@ -419,11 +386,11 @@ async function runRehearse(options: CliOptions): Promise<number> {
 
   for (const arm of ['control', 'treatment'] as const) {
     const workspace = armWorkspace(options.workspaceRoot, task.id, 0, arm, 1);
-    const readPath = join(workspace, 'repo', ...'data/catalog.json'.split('/'));
+    const readPath = join(workspace, 'repo', ...rehearsalReadPath.split('/'));
     const capturePath = join(workspace, 'provider-capture.jsonl');
     // The scripted provider answers two `read` calls for the same file, which is the
     // shape the pass needs; the capture file holds what the provider received.
-    const provider = await startScriptedProvider(readPath, capturePath, 2);
+    const provider = await startScriptedProvider({ readPath, capturePath, toolCalls: 2 });
     try {
       const outcome = await runArm({
         task,
@@ -431,7 +398,7 @@ async function runRehearse(options: CliOptions): Promise<number> {
         pairIndex: 0,
         workspaceRoot: options.workspaceRoot,
         mode: 'rehearse',
-        model: options.model ?? 'opencode/big-pickle',
+        model: rehearsalModel,
         baseUrl: provider.baseUrl,
         readPath,
         // The loopback provider's own record is what makes real request lengths and
@@ -476,9 +443,7 @@ async function runRehearse(options: CliOptions): Promise<number> {
     } finally {
       provider.stop();
     }
-  }
-
-  if (observations.length === 2) {
+  }    if (observations.length === 2) {
     const declaration = resolveLevel2Declaration();
     const plan = buildPlan({
       pairsPerTask: 1,
@@ -491,7 +456,7 @@ async function runRehearse(options: CliOptions): Promise<number> {
     });
     const experiment = buildExperiment(observations, plan, [task], dispositions);
     const context = {
-      model: options.model ?? 'opencode/big-pickle',
+      model: rehearsalModel,
       harness: 'opencode-coding-task',
       pairsPerTask: 1,
       generatedAt: new Date().toISOString(),
@@ -509,73 +474,145 @@ async function runRehearse(options: CliOptions): Promise<number> {
     const treatment = observations.find((entry) => entry.identity.arm === 'treatment');
 
     // ------------------------------------------------------------------ //
-    // Containment probe: prove the guard end to end, not just in unit tests.
+    // Containment enforcement probe: one real session per arm, asked for calls the
+    // policy must refuse.
     //
-    // The scripted provider is pointed at a file *outside* the session's repository
-    // copy, and a canary token in that file must never appear in the provider's own
-    // capture of what it received. Run one extra session for it, and take the
-    // in-workspace half from the control arm's existing run as the negative control:
-    // without it, a probe whose session never read anything would look contained.
+    // A guard that loads is not a guard that enforces, and the guard's own report of
+    // itself is not an independent observation. Each arm's probe session is therefore
+    // asked — by the loopback provider's own script — for a fixed matrix: an
+    // in-workspace read and write that must succeed, and an absolute path outside, a
+    // traversal, a shell, an out-of-workspace write, a patch, a fetch and a nested
+    // agent that must not. The provider's own capture says what the runtime did with
+    // each call, and the filesystem is checked for the traces the refused calls would
+    // have left.
     // ------------------------------------------------------------------ //
-    const probeWorkspace = armWorkspace(options.workspaceRoot, task.id, 9, 'control', 1);
-    const probeCapturePath = join(probeWorkspace, 'provider-capture.jsonl');
-    const canaryPath = join(probeWorkspace, 'containment-canary.txt');
-    const canaryToken = `DR-TOKEN-CANARY-${String(Date.now())}`;
-    let insideMarker: string | undefined;
-    let insideMarkerFound = false;
-    let outsideAttempted = false;
-    let outsideTokenFound = true;
-    let outsideGuardBlocks = 0;
-    let probeError: string | undefined;
-    try {
-      // A distinctive phrase from the frozen catalogue fixture (letters, digits and
-      // spaces only, so it survives JSON escaping verbatim). The pack's own tests pin
-      // the fixture, so a change here fails loudly rather than silently weakening the
-      // probe.
-      const markerMatch = /[A-Za-z][A-Za-z0-9 ]{20,}/.exec(task.files['data/catalog.json'] ?? '');
-      insideMarker = markerMatch === null ? undefined : markerMatch[0].trim();
-      await mkdir(probeWorkspace, { recursive: true });
-      await writeFile(
-        canaryPath,
-        `if this text reaches the provider, containment failed: ${canaryToken}\n`,
-        'utf8',
-      );
-      const probeProvider = await startScriptedProvider(canaryPath, probeCapturePath, 1);
+    const probeRuns: ContainmentProbeRun[] = [];
+    const probeProblems: string[] = [];
+    for (const arm of ['control', 'treatment'] as const) {
       try {
-        await runArm({
-          task,
-          arm: 'control',
-          pairIndex: 9,
-          workspaceRoot: options.workspaceRoot,
-          mode: 'rehearse',
-          model: options.model ?? 'opencode/big-pickle',
-          baseUrl: probeProvider.baseUrl,
-          readPath: canaryPath,
-          providerCapture: probeCapturePath,
-          cliPath: options.cliPath,
-          ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
-        });
-      } finally {
-        probeProvider.stop();
+        probeRuns.push(
+          await runContainmentProbe({
+            workspaceRoot: options.workspaceRoot,
+            cliPath: options.cliPath,
+            arm,
+            ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+            onProgress: (line) => {
+              process.stdout.write(`      ${line}\n`);
+            },
+          }),
+        );
+      } catch (error) {
+        probeProblems.push(`${arm}: ${error instanceof Error ? error.message : String(error)}`);
       }
-      const outsideCapture = await readFile(probeCapturePath, 'utf8');
-      outsideAttempted = outsideCapture.trim().length > 0;
-      outsideTokenFound = outsideCapture.includes(canaryToken);
-      const guardText = await readFile(
-        join(probeWorkspace, 'artifacts', 'containment-guard.jsonl'),
-        'utf8',
-      ).catch(() => '');
-      outsideGuardBlocks = guardText.split('\n').filter((line) => line.includes('"kind":"blocked"')).length;
-
-      const controlCapturePath = join(
-        armWorkspace(options.workspaceRoot, task.id, 0, 'control', 1),
-        'provider-capture.jsonl',
-      );
-      const controlCapture = await readFile(controlCapturePath, 'utf8');
-      insideMarkerFound = insideMarker !== undefined && controlCapture.includes(insideMarker);
-    } catch (error) {
-      probeError = error instanceof Error ? error.message : String(error);
     }
+    const probeControl = probeRuns.find((run) => run.arm === 'control');
+    const probeTreatment = probeRuns.find((run) => run.arm === 'treatment');
+    const stepsOf = (run: ContainmentProbeRun | undefined): readonly ContainmentProbeStepResult[] =>
+      run?.steps ?? [];
+    const refusedStepsOf = (run: ContainmentProbeRun | undefined): readonly ContainmentProbeStepResult[] =>
+      stepsOf(run).filter((step) => step.expectation === 'refused');
+    const stepOf = (
+      run: ContainmentProbeRun | undefined,
+      id: string,
+    ): ContainmentProbeStepResult | undefined => stepsOf(run).find((step) => step.id === id);
+    const refusedWithNoContent = (run: ContainmentProbeRun | undefined): boolean => {
+      const refused = refusedStepsOf(run);
+      return (
+        refused.length > 0 &&
+        refused.every(
+          (step) => step.outcome === 'refusal' && !step.forbiddenTextReachedProvider,
+        )
+      );
+    };
+    const refusedWithNoTrace = (run: ContainmentProbeRun | undefined): boolean =>
+      refusedStepsOf(run).every(
+        (step) => step.sideEffectPath === undefined || !step.sideEffectCreated,
+      );
+    /** What each arm's restrictions came to, so the two can be compared as evidence. */
+    const enforcementSignature = (run: ContainmentProbeRun | undefined): string =>
+      JSON.stringify({
+        steps: refusedStepsOf(run).map((step) => [step.id, step.outcome]),
+        reasons: [...(run?.guardBlockReasons ?? [])].sort(),
+        blockedByTool: run?.blockedByTool ?? {},
+      });
+    const describeRefusals = (run: ContainmentProbeRun | undefined): string =>
+      probeProblems.length > 0
+        ? probeProblems.join(' | ')
+        : `guard=${run?.guard ?? 'none'} refused=${String(run?.blockedCalls ?? 0)} allowed=${String(run?.allowedCalls ?? 0)} tools=${Object.keys(run?.blockedByTool ?? {}).join(',') || 'none'}`;
+    const describeProbe = (run: ContainmentProbeRun | undefined): string =>
+      run === undefined
+        ? 'no probe run'
+        : `provenance=${run.provenanceOk ? 'accepted' : (run.invalidReason ?? 'refused')} driverExit=${String(run.driverExitCode)} artifact=${run.root}`;
+    const describeUnexpected = (run: ContainmentProbeRun | undefined): string =>
+      refusedStepsOf(run)
+        .flatMap((step) =>
+          step.outcome === 'refusal' && !step.forbiddenTextReachedProvider
+            ? []
+            : [`${step.id}=${step.outcome}${step.forbiddenTextReachedProvider ? '+canary' : ''}`],
+        )
+        .join(',') || 'none';
+    const describeTraces = (run: ContainmentProbeRun | undefined): string =>
+      refusedStepsOf(run)
+        .flatMap((step) => (step.sideEffectCreated ? [step.id] : []))
+        .join(',') || 'no trace';
+
+
+    /**
+     * Stands in for missing resolved-policy evidence, so "absent" is checked as a refusal rather
+     * than passed over. A check that treated absent evidence as agreement would be vacuous.
+     */
+    const unresolvedPolicy = {
+      source: 'unrecorded',
+      found: false,
+      model: undefined,
+      titleModel: undefined,
+      compactionAuto: undefined,
+      providersAllowed: [],
+      providersDeniedAll: false,
+      update: undefined,
+      share: undefined,
+      error: 'no resolved configuration was recorded',
+    };
+    const describeResolvedFor = (observation: Level2ArmObservation | undefined): string => {
+      const resolved = readResolvedModelPolicy(observation?.modelPolicy?.resolved) ?? unresolvedPolicy;
+      const refusals = resolvedPolicyRefusals(resolved);
+      return refusals.length === 0
+        ? `resolved ${describeResolvedPolicy(resolved)}`
+        : `NOT APPLIED: ${refusals.join('; ')}`;
+    };
+    const describeKinds = (observation: Level2ArmObservation | undefined): string => {
+      const policy = observation?.modelPolicy;
+      if (policy === undefined) return 'no policy evidence';
+      const kinds = Object.entries(policy.requests.kinds)
+        .map(([kind, count]) => `${kind}=${count}`)
+        .join(' ');
+      return `${kinds || 'no requests'} via ${policy.requests.source}`;
+    };
+    const describeRequestModels = (observation: Level2ArmObservation | undefined): string => {
+      const requests = observation?.wire.requests ?? [];
+      if (requests.length === 0) return 'no request observed at the endpoint';
+      const models = [...new Set(requests.map((request) => request.model ?? 'unread'))];
+      const withTools = requests.filter((request) => request.hasTools === true).length;
+      return `${String(requests.length)} request(s), models [${models.join(', ')}], ${String(withTools)} with a tool registry`;
+    };
+    // The endpoint names a model without its provider — measured, not assumed: the runtime's own
+    // body carries `mimo-v2.6-flash-free` while the configuration, the hook payload and the
+    // runtime's resolved policy all carry `opencode/mimo-v2.6-flash-free`. The acceptable
+    // spellings come from the policy so this check and the policy cannot disagree, and the set
+    // stays closed: the *primary* only, because every request at the endpoint must be the agent
+    // loop and the resolved policy pins that loop to the primary.
+    const endpointPrimaryIds = endpointModelIds([FREE_ONLY_PRIMARY_MODEL]);
+    // `modelsNamed` is normalized by its source: the hook hands over a provider-qualified reference
+    // (`{providerID, model}`), while the endpoint's own capture can only see the body, which has no
+    // provider in it. Each reading is therefore compared against the set its own shape can name —
+    // and a source that is neither is given no allowance at all, so an unrecognized reading fails
+    // rather than passing by default.
+    const approvedNamedIds = (observation: Level2ArmObservation | undefined): readonly string[] => {
+      const source = observation?.modelPolicy?.requests.source;
+      if (source === 'model-request-hooks') return FREE_ONLY_APPROVED_MODELS;
+      if (source === 'loopback-endpoint') return endpointPrimaryIds;
+      return [];
+    };
 
     const checks: readonly (readonly [string, boolean, string])[] = [
       [
@@ -599,9 +636,67 @@ async function runRehearse(options: CliOptions): Promise<number> {
         'a rehearsal is a plumbing check, not a coding result',
       ],
       [
+        `the pass fired in the treatment arm on the task\u2019s own repeated read (${rehearsalReadPath})`,
+        // The free-only configuration (title suppressed, compaction off, one provider, an auxiliary
+        // model that is never used) must not disturb the measurement it was added to protect: the
+        // treatment arm elides the duplicate read, the marker reaches the wire, and the control arm
+        // carries none. This is also what keeps the read-path choice honest — a rehearsal that read
+        // a file the task does not contain would report `no-opportunity` here and fail.
+        treatment?.mechanism === 'fired' &&
+          (treatment?.apply?.requestsApplied ?? 0) > 0 &&
+          (treatment?.apply?.elidedBytes ?? 0) > 0 &&
+          (treatment?.wire.requests.reduce((total, request) => total + request.markerCount, 0) ?? 0) > 0 &&
+          control?.mechanism === 'not-applicable' &&
+          (control?.wire.requests ?? []).every((request) => request.markerCount === 0),
+        `control: mechanism=${control?.mechanism ?? 'none'}, ${String(control?.wire.requests.reduce((total, request) => total + request.markerCount, 0) ?? 0)} marker(s); treatment: mechanism=${treatment?.mechanism ?? 'none'}, ${String(treatment?.apply?.elidedBytes ?? 0)} byte(s) elided, ${String(treatment?.wire.requests.reduce((total, request) => total + request.markerCount, 0) ?? 0)} marker(s) on the wire`,
+      ],
+      [
         'both arms registered the containment guard',
         control?.containment?.guard === 'loaded' && treatment?.containment?.guard === 'loaded',
         `control=${control?.containment?.guard ?? 'none'} treatment=${treatment?.containment?.guard ?? 'none'}`,
+      ],
+      [
+        'both arms registered the pre-transmission model guard (the hook that refuses a request before it is sent)',
+        [control, treatment].every(
+          (observation) =>
+            observation?.modelGuard?.guard === 'loaded' &&
+            observation.modelGuard.hookRegistered === true &&
+            observation.modelGuard.misconfigured === false &&
+            observation.modelGuard.hook === MODEL_REQUEST_HOOK,
+        ),
+        `control: guard=${control?.modelGuard?.guard ?? 'none'}${control?.modelGuard?.hookRegistered === true ? ' (hook registered)' : ''}; treatment: guard=${treatment?.modelGuard?.guard ?? 'none'}${treatment?.modelGuard?.hookRegistered === true ? ' (hook registered)' : ''} — the layer that acts before a provider request is dispatched, on the one hook the runtime dispatches every request to`,
+      ],
+      [
+        'neither arm attempted a model request outside the approved envelope',
+        [control, treatment].every((observation) => observation?.modelGuard?.refused === 0),
+        `control=${String(control?.modelGuard?.refused ?? 'none')} refusal(s) over ${String(control?.modelGuard?.invocations ?? 0)} request(s); treatment=${String(treatment?.modelGuard?.refused ?? 'none')} refusal(s) over ${String(treatment?.modelGuard?.invocations ?? 0)} request(s)`,
+      ],
+      [
+        'the guard bounded each arm against that arm\u2019s own configuration digest',
+        // The envelope is not a list the guard chose: it carries the digest of the configuration the
+        // repository received, so an enforcement of a different policy than the one configured is
+        // visible here rather than being assumed away.
+        [control, treatment].every(
+          (observation) =>
+            observation?.modelGuard?.policyDigest !== undefined &&
+            observation.modelGuard.policyDigest.length > 0 &&
+            observation.modelGuard.policyDigest === observation.modelPolicy?.configDigest,
+        ) &&
+          control?.modelGuard?.policyDigest === treatment?.modelGuard?.policyDigest,
+        `control=${control?.modelGuard?.policyDigest?.slice(0, 16) ?? 'none'} treatment=${treatment?.modelGuard?.policyDigest?.slice(0, 16) ?? 'none'} vs configuration ${control?.modelPolicy?.configDigest?.slice(0, 16) ?? 'none'}/${treatment?.modelPolicy?.configDigest?.slice(0, 16) ?? 'none'}`,
+      ],
+      [
+        'the guard saw every model request the runtime dispatched in each arm',
+        // Two independent registrations of the same hook: the guard's, and the driver's own counting
+        // probe. Equal counts are what make the guard's "nothing was refused" a statement about the
+        // requests this session made rather than about a hook that fired for none of them.
+        [control, treatment].every(
+          (observation) =>
+            observation?.modelGuard?.invocations !== undefined &&
+            observation.modelGuard.invocations ===
+              (observation.modelPolicy?.requests.kinds[PRIMARY_REQUEST_KIND] ?? 0),
+        ),
+        `control: ${String(control?.modelGuard?.invocations ?? 'none')} guarded / ${String(control?.modelPolicy?.requests.kinds[PRIMARY_REQUEST_KIND] ?? 0)} counted; treatment: ${String(treatment?.modelGuard?.invocations ?? 'none')} guarded / ${String(treatment?.modelPolicy?.requests.kinds[PRIMARY_REQUEST_KIND] ?? 0)} counted`,
       ],
       [
         'both arms armed the in-session spending governor (the live initialisation path)',
@@ -614,18 +709,159 @@ async function runRehearse(options: CliOptions): Promise<number> {
         `control=${armAccepted.get('control') === true ? 'accepted' : 'refused'} treatment=${armAccepted.get('treatment') === true ? 'accepted' : 'refused'}`,
       ],
       [
-        'an in-workspace read reaches the provider, so the containment probe is not vacuous',
-        insideMarkerFound,
-        insideMarkerFound
-          ? `the catalogue text appeared in the control arm's provider capture`
-          : `the catalogue text did not appear in the control arm's provider capture${probeError === undefined ? '' : ` (${probeError})`}`,
+        'both arms received the byte-identical free-only model configuration',
+        control?.modelPolicy !== undefined &&
+          treatment?.modelPolicy !== undefined &&
+          control.modelPolicy.configDigest === treatment.modelPolicy.configDigest &&
+          control.modelPolicy.configDigest === freeOnlyModelConfigDigest(freeOnlyModelConfig()) &&
+          control.modelPolicy.configAccepted === true &&
+          treatment.modelPolicy.configAccepted === true,
+        `control=${control?.modelPolicy?.configDigest?.slice(0, 16) ?? 'none'} treatment=${treatment?.modelPolicy?.configDigest?.slice(0, 16) ?? 'none'} expected=${freeOnlyModelConfigDigest(freeOnlyModelConfig()).slice(0, 16)} (primary ${control?.modelPolicy?.primaryModel ?? 'none'}, auxiliary ${control?.modelPolicy?.auxiliaryModel ?? 'none'})`,
       ],
       [
-        'a read outside the session workspace never reaches the provider',
-        outsideAttempted && !outsideTokenFound,
-        outsideAttempted
-          ? `the provider capture ${outsideTokenFound ? 'contains' : 'does not contain'} the canary token; the guard recorded ${String(outsideGuardBlocks)} refusal(s)`
-          : `the scripted out-of-workspace read was never attempted${probeError === undefined ? '' : `: ${probeError}`}`,
+        'the runtime resolved the free-only configuration in both arms (a dropped key would show here)',
+        [control, treatment].every((observation) => {
+          const resolved = resolvedPolicyRefusals(readResolvedModelPolicy(observation?.modelPolicy?.resolved) ?? unresolvedPolicy);
+          return observation?.modelPolicy?.configAccepted === true && resolved.length === 0;
+        }),
+        `control: ${describeResolvedFor(control)}; treatment: ${describeResolvedFor(treatment)}`,
+      ],
+      [
+        'the runtime\u2019s own model-request hook fired, so a kind count of zero is an observation and not a silence',
+        [control, treatment].every((observation) => {
+          const requests = observation?.modelPolicy?.requests;
+          return (
+            requests?.source === 'model-request-hooks' &&
+            requests.kindsRegistered.includes(MODEL_REQUEST_HOOK) &&
+            requests.registrationFailures.length === 0 &&
+            // The positive control: this hook counted the requests the session really made. A
+            // registration alone proves nothing — the runtime accepts any name and then never
+            // calls one it does not dispatch.
+            (requests.kinds[PRIMARY_REQUEST_KIND] ?? 0) > 0 &&
+            requests.payloadKeys.length > 0
+          );
+        }),
+        [control, treatment]
+          .map((observation) => {
+            const requests = observation?.modelPolicy?.requests;
+            return `${observation?.identity.arm ?? 'arm'}: ${describeKinds(observation)} (hook ${requests?.kindsRegistered.join(',') || 'none'}, payload keys ${requests?.payloadKeys.join(',') || 'none'})`;
+          })
+          .join('; '),
+      ],
+      [
+        'no automatic title generation, and no other auxiliary request, happened in either arm',
+        [control, treatment].every((observation) => {
+          const requests = observation?.modelPolicy?.requests;
+          if (requests === undefined) return false;
+          const extra = auxiliaryRequestKinds(requests.kinds);
+          return extra.length === 0 && requests.auxiliaryRequests === 0;
+        }),
+        `control: ${describeKinds(control)}; treatment: ${describeKinds(treatment)} — the session title is supplied on the command line, so the runtime composes no title (or compaction, or generate) request at all`,
+      ],
+      [
+        'the loopback endpoint\u2019s own record agrees: every request it received carried the agent-loop tool registry',
+        [control, treatment].every((observation) => {
+          const endpoint = observation?.modelPolicy?.requests.endpointKinds;
+          const requests = observation?.modelPolicy?.requests;
+          if (endpoint === undefined || requests === undefined) return false;
+          return (
+            endpoint.requests > 0 &&
+            endpoint.withoutToolRegistry === 0 &&
+            // The two readings are independent (the runtime's hook and the endpoint it was pointed
+            // at), so agreement is the evidence; a disagreement is a finding, not a rounding error.
+            endpoint.withToolRegistry === (requests.kinds[PRIMARY_REQUEST_KIND] ?? 0)
+          );
+        }),
+        [control, treatment]
+          .map((observation) => {
+            const endpoint = observation?.modelPolicy?.requests.endpointKinds;
+            return `${observation?.identity.arm ?? 'arm'}: ${endpoint === undefined ? 'no endpoint capture' : `${String(endpoint.requests)} request(s), ${String(endpoint.withToolRegistry)} with a tool registry, ${String(endpoint.withoutToolRegistry)} without`}`;
+          })
+          .join('; '),
+      ],
+      [
+        'every request the endpoint received named the approved primary model and carried the agent-loop tool registry',
+        [control, treatment].every(
+          (observation) =>
+            (observation?.wire.requests.length ?? 0) > 0 &&
+            (observation?.wire.requests ?? []).every(
+              (request) =>
+                isApprovedEndpointModel(request.model, [FREE_ONLY_PRIMARY_MODEL]) &&
+                request.hasTools === true,
+            ),
+        ),
+        `control: ${describeRequestModels(control)}; treatment: ${describeRequestModels(treatment)} — expected [${endpointPrimaryIds.join(' or ')}], an auxiliary request would appear here without a tool registry, and any substitution as a different identifier`,
+      ],
+      [
+        'no paid auxiliary model was configured or requested, and the approved pair is the only model set',
+        [control, treatment].every(
+          (observation) =>
+            observation?.modelPolicy !== undefined &&
+            observation.modelPolicy.auxiliaryModel === FREE_ONLY_AUXILIARY_MODEL &&
+            observation.modelPolicy.approvedModels.length === FREE_ONLY_APPROVED_MODELS.length &&
+            observation.modelPolicy.primaryModel === FREE_ONLY_PRIMARY_MODEL &&
+            Object.keys(observation.modelPolicy.requests.modelsNamed).every((id) =>
+              approvedNamedIds(observation).includes(id),
+            ),
+        ),
+        `approved=[${FREE_ONLY_APPROVED_MODELS.join(', ')}]; models actually named: control: ${Object.keys(control?.modelPolicy?.requests.modelsNamed ?? {}).join(',') || 'none'}; treatment: ${Object.keys(treatment?.modelPolicy?.requests.modelsNamed ?? {}).join(',') || 'none'}`,
+      ],
+      [
+        'each arm\u2019s containment probe ran a real session and produced its own whole artifact',
+        probeControl?.provenanceOk === true && probeTreatment?.provenanceOk === true,
+        `${describeProbe(probeControl)} | ${describeProbe(probeTreatment)}`,
+      ],
+      [
+        'the guard registered its tool hook with a known workspace in both probe sessions',
+        probeControl?.guard === 'loaded' &&
+          probeTreatment?.guard === 'loaded' &&
+          probeControl?.rootKnown === true &&
+          probeTreatment?.rootKnown === true,
+        `control=${probeControl?.guard ?? 'none'}/rootKnown=${String(probeControl?.rootKnown ?? false)} treatment=${probeTreatment?.guard ?? 'none'}/rootKnown=${String(probeTreatment?.rootKnown ?? false)}`,
+      ],
+      [
+        'permitted in-workspace work still happened in both arms, so the prohibited half is not vacuous',
+        stepOf(probeControl, 'read-inside')?.allowedTextReachedProvider === true &&
+          probeControl?.allowedWriteCreated === true &&
+          stepOf(probeTreatment, 'read-inside')?.allowedTextReachedProvider === true &&
+          probeTreatment?.allowedWriteCreated === true,
+        `control: read reached the provider=${String(stepOf(probeControl, 'read-inside')?.allowedTextReachedProvider ?? false)}, in-workspace write present=${String(probeControl?.allowedWriteCreated ?? false)}; treatment: read=${String(stepOf(probeTreatment, 'read-inside')?.allowedTextReachedProvider ?? false)}, write=${String(probeTreatment?.allowedWriteCreated ?? false)}`,
+      ],
+      [
+        'every prohibited call was refused, with no content in its result, in both arms',
+        refusedWithNoContent(probeControl) && refusedWithNoContent(probeTreatment),
+        `control: ${String(refusedStepsOf(probeControl).length)} refused call(s), unexpected=[${describeUnexpected(probeControl)}]; treatment: ${String(refusedStepsOf(probeTreatment).length)} refused call(s), unexpected=[${describeUnexpected(probeTreatment)}]`,
+      ],
+      [
+        'no prohibited call left a trace outside the workspace in either arm',
+        refusedWithNoTrace(probeControl) && refusedWithNoTrace(probeTreatment),
+        `control: ${describeTraces(probeControl)}; treatment: ${describeTraces(probeTreatment)} (the shell marker, the write and the patch targets checked on disk)`,
+      ],
+      [
+        'the fetch tool never reached the probe\u2019s own loopback target in either arm',
+        (probeControl?.fetchTargetsReceived.length ?? -1) === 0 &&
+          (probeTreatment?.fetchTargetsReceived.length ?? -1) === 0,
+        `control=${probeControl?.fetchTargetsReceived.length ?? 'no probe'} treatment=${probeTreatment?.fetchTargetsReceived.length ?? 'no probe'} request(s) reached the fetch target`,
+      ],
+      [
+        'the guard recorded the refusals it made, by tool and reason',
+        probeControl !== undefined &&
+          probeControl.blockedCalls > 0 &&
+          Object.keys(probeControl.blockedByTool).length > 0 &&
+          probeControl.guardBlockReasons.length > 0,
+        `control: ${describeRefusals(probeControl)}; treatment: ${describeRefusals(probeTreatment)}`,
+      ],
+      [
+        'both arms showed the runtime\u2019s native permission denies (the second containment layer)',
+        control?.nativePermissions?.allRequiredPresent === true &&
+          treatment?.nativePermissions?.allRequiredPresent === true,
+        `control=${control?.nativePermissions === undefined ? 'no evidence' : `${String(control.nativePermissions.rules.length)} rule(s), missing [${control.nativePermissions.missingRequiredDenies.join(',') || 'none'}]`} treatment=${treatment?.nativePermissions === undefined ? 'no evidence' : `${String(treatment.nativePermissions.rules.length)} rule(s), missing [${treatment.nativePermissions.missingRequiredDenies.join(',') || 'none'}]`}`,
+      ],
+      [
+        'both arms enforced identically (same refused calls, reasons and tools)',
+        enforcementSignature(probeControl) === enforcementSignature(probeTreatment) &&
+          probeControl !== undefined,
+        `control: ${enforcementSignature(probeControl)}; treatment: ${enforcementSignature(probeTreatment)}`,
       ],
     ];
     for (const [name, passed, detail] of checks) {
@@ -684,6 +920,24 @@ async function preflightReport(
   lines.push(
     'containment: every repository receives the same native permission policy (external_directory, bash, task and webfetch denied) plus a guard plugin that refuses any file path outside the session workspace and any shell-like call. The session reports its own guard evidence, and a session whose guard did not register is refused as a measurement rather than compared.',
   );
+  lines.push(
+    'model requests: every repository also receives a pre-transmission model guard, which refuses a request naming a model outside the approved free pair *before* it is dispatched — the provider policy admits every model the provider offers, so this is the layer that stops a same-provider paid model rather than discarding the measurement afterwards. A session whose guard did not register its hook, or in which any request was refused, is refused as a measurement.',
+  );
+  // Reported here as well as enforced at the live gate, so the operator sees it *before*
+  // authorizing rather than discovering it in the refusal. Gitignored artifacts do not count.
+  const checkedTree = readWorkingTree(process.cwd());
+  lines.push(
+    `working tree:       ${
+      checkedTree.error !== undefined
+        ? `UNREADABLE (${checkedTree.error}) — a live run would be REFUSED`
+        : checkedTree.clean
+          ? 'clean — a live run may be attributed to a revision'
+          : `DIRTY (${String(checkedTree.entries.length)} uncommitted change(s)) — a live run would be REFUSED; commit or stash them first`
+    }`,
+  );
+  lines.push(
+    'failure rule: the first fatal arm outcome (no measurement, a refused model, a disengaged harness, a cap) ends the plan; the remaining planned runs are published as `not-run` and are never launched.',
+  );
   lines.push('');
   lines.push(`selected runtime:   ${options.runtime}`);
   lines.push('Runtime catalogues (read-only, asked through the runtime\u2019s own model.list):');
@@ -726,6 +980,18 @@ async function preflightReport(
     );
     const verdict = probeCanRunModel(facts, options.runtime);
     lines.push(`  verdict:           ${verdict.ok ? 'OK' : 'BLOCKED'} [${verdict.reason}] — ${verdict.detail}`);
+    // The free-only verdict, on the runtime the caller selected: the same question the driver asks
+    // before it spawns a session, so a model that cannot be shown free is visible before an
+    // authorization is spent on it rather than in a refusal afterwards.
+    lines.push(
+      facts.freeOnly === undefined
+        ? '  free-only policy:  NOT REPORTED — this driver build does not report the free-only verdict, so a live run would be refused'
+        : `  free-only policy:  ${facts.freeOnly.verdict === 'free' ? 'FREE' : 'REFUSED'}${
+            facts.freeOnly.verdict === 'free'
+              ? ` — \`${facts.freeOnly.primaryModel}\` is approved and every price tier (${facts.freeOnly.priceFields.join(', ')}) is zero on the ${options.runtime} runtime; auxiliary calls use \`${facts.freeOnly.auxiliaryModel}\``
+              : ` — ${facts.freeOnly.refusals.join('; ')}`
+          }`,
+    );
     lines.push(
       verdict.ok
         ? '                     a live run may be authorized on this runtime'
@@ -775,12 +1041,17 @@ async function runLive(options: CliOptions): Promise<number> {
   // Every refusal that stands between this authorization and a model call, evaluated before anything
   // is spawned or created. The caps are part of it: a live run with no per-session bound or no total
   // bound is refused rather than started, because nothing about it could be stopped.
+  // The checkout this run would be attributed to. Read, never repaired: a dirty tree is refused
+  // here rather than annotated in the report, because a report that cannot name the revision it
+  // ran against is not reproducible. Gitignored artifacts are not changes.
+  const workingTree = readWorkingTree(process.cwd());
   const guard = {
     approveLive: options.approveLive,
     model: options.model,
     runtime: options.runtime,
     cliPath: options.cliPath,
     cliPresent: existsSync(options.cliPath),
+    workingTree,
     maxRuns: options.maxRuns,
     planArmRuns: plan.armRunsTotal,
     maxUnitsPerRun: options.maxUnitsPerRun,
@@ -832,6 +1103,25 @@ async function runLive(options: CliOptions): Promise<number> {
     return 2;
   }
   process.stdout.write(`${usable.detail}.\n`);
+  // Free-only enforcement before anything is spawned. Two independent refusals: the model must be
+  // one of the approved free models, and the selected runtime's own catalogue must report a row
+  // that is zero in every applicable tier. A model whose identifier merely contains `free` is not
+  // evidence of anything, which is why the price row is what decides.
+  if (probed.probe.freeOnly === undefined) {
+    process.stderr.write(
+      'level2: refusing to start: the arm driver did not report a free-only verdict, so the model\u2019s price cannot be shown to be zero in every tier and the run is not verifiably free.\n',
+    );
+    return 2;
+  }
+  if (probed.probe.freeOnly.verdict !== 'free') {
+    process.stderr.write(
+      `level2: refusing to start: ${probed.probe.freeOnly.refusals.join('; ')}. Run --preflight to see both catalogues and the free-only verdict.\n`,
+    );
+    return 2;
+  }
+  process.stdout.write(
+    `Free-only policy: \`${probed.probe.freeOnly.primaryModel}\` is approved and priced at zero in every tier (${probed.probe.freeOnly.priceFields.join(', ')}) on the ${options.runtime} runtime; auxiliary calls are pinned to \`${probed.probe.freeOnly.auxiliaryModel}\`.\n`,
+  );
   if (probed.probe.pricing !== undefined) {
     process.stdout.write(
       `The runtime reports this model at $${probed.probe.pricing.input ?? '?'} per million input token(s), $${probed.probe.pricing.output ?? '?'} per million output token(s), $${probed.probe.pricing.cacheRead ?? '?'} per million cached read token(s).\n`,
@@ -855,157 +1145,65 @@ async function runLive(options: CliOptions): Promise<number> {
     );
   }
 
-  const observations: Level2ArmObservation[] = [];
-  // Every planned run gets a disposition, including the ones refused or never started, so
-  // nothing that was authorized can disappear from the report.
-  const dispositions: Level2RunDisposition[] = [];
-  let runsStarted = 0;
-  let failures = 0;
-  let stoppedByBudget: string | undefined;
-  let stoppedByModel = false;
-  let stoppedByEngagement: string | undefined;
-
+  // Every planned run's task is resolved before the first session, so a plan naming an unknown
+  // task fails without spending anything.
+  const taskById = new Map<string, Level2Task>();
   for (const run of plan.runs) {
-    if (stoppedByBudget !== undefined || stoppedByModel || stoppedByEngagement !== undefined) {
-      break;
-    }
-    runsStarted += 1;
     const task = findTask(run.taskId);
     if (task === undefined) {
       process.stderr.write(`level2: no task named "${run.taskId}"\n`);
       return 2;
     }
-    const outcome = await runArm({
-      task,
-      arm: run.arm,
-      pairIndex: run.pairIndex,
-      workspaceRoot: options.workspaceRoot,
-      mode: 'live',
-      runtime: options.runtime,
-      model,
-      cliPath: options.cliPath,
-      ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
-      // The same number the post-session cap uses, so there is one spending bound and
-      // it is enforced both while the session runs and after it ends.
-      ...(options.maxCostUsdPerRun === undefined
-        ? {}
-        : { inSessionCostCapUsd: options.maxCostUsdPerRun }),
-      onProgress: (line) => {
-        process.stdout.write(`      ${line}\n`);
-      },
-    });
-    for (const problem of outcome.problems) {
-      process.stdout.write(`NOTE  ${problem}\n`);
-    }
-    if (outcome.modelUnavailable) {
-      // Repeating this would spend authorization without producing a measurement.
-      stoppedByModel = true;
-      failures += 1;
-      dispositions.push({
-        taskId: run.taskId,
-        pairIndex: run.pairIndex,
-        arm: run.arm,
-        disposition: 'invalid-measurement',
-        detail: 'the runtime refused the model, so this session never composed a request',
-      });
-      process.stdout.write(
-        `STOP  the runtime refused the model \`${model}\` for ${run.taskId} pair ${run.pairIndex} ${run.arm}; stopping the plan rather than repeating it.\n`,
-      );
-      continue;
-    }
-    if (outcome.observation === undefined) {
-      failures += 1;
-      dispositions.push({
-        taskId: run.taskId,
-        pairIndex: run.pairIndex,
-        arm: run.arm,
-        disposition: 'invalid-measurement',
-        detail: `refused as a measurement (${outcome.invalidReason ?? 'no observation'})`,
-      });
-      process.stdout.write(
-        `FAIL  ${run.taskId} pair ${run.pairIndex} ${run.arm} produced no measurement (${outcome.invalidReason ?? 'no observation'})\n`,
-      );
-      continue;
-    }
-    process.stdout.write(`      ${describeObservation(outcome.observation)}\n`);
-    const governor = outcome.observation.inSessionGovernor;
-    if (governor !== undefined) {
-      process.stdout.write(
-        `      in-session spending bound: ${
-          governor.armed
-            ? `armed at $${governor.capUsd ?? '?'} (polls ${governor.polls}, reported cost ${governor.reportedCostUsd ?? 'none'}${governor.interrupted ? ', interrupt confirmed' : ''})`
-            : `not armed (${governor.reason ?? 'no reason recorded'})`
-        }\n`,
-      );
-    }
+    taskById.set(run.taskId, task);
+  }
 
-    // A session whose plugin never reached the runtime is not a datapoint, and it is not a
-    // transient to retry: the same environment would produce the same nothing. Stage 1U's
-    // pilot is the reason this is checked rather than assumed — it produced well-formed
-    // observations of sessions that could not have measured anything.
-    // The governor requirement is stated here as well as enforced in the driver: a live capped
-    // service session that reports an unarmed governor is refused rather than compared.
-    const engagement = checkLiveEngagement(outcome.observation, {
+  // The runs are launched by `runArmSequence`, whose rule is that the first fatal outcome ends
+  // the plan: no observation, a refused model, a disengaged harness, or a cap. Until 2026-10-12
+  // this loop lived here and *continued* after a refused run, which is how the control session's
+  // failure was followed by launching the treatment arm. Every planned run still gets a
+  // disposition, so nothing authorized can disappear from the report.
+  const sequence = await runArmSequence({
+    plan,
+    model,
+    budget,
+    requirements: {
+      // The governor requirement is stated here as well as enforced in the driver: a live capped
+      // service session that reports an unarmed governor is refused rather than compared.
       requireInSessionGovernor:
         options.runtime === 'service' && options.maxCostUsdPerRun !== undefined,
-    });
-    process.stdout.write(`      ${engagement.detail}\n`);
-    if (!engagement.measurable) {
-      failures += 1;
-      stoppedByEngagement = engagement.detail;
-      dispositions.push({
-        taskId: run.taskId,
-        pairIndex: run.pairIndex,
+      // Both layers of containment must be evidenced: the plugin guard's enforcement is proven
+      // against the installed runtime, and the native permission rules are what the runtime
+      // itself resolved for this repository before the session started.
+      requireNativePermissions: true,
+    },
+    report: (line) => {
+      process.stdout.write(`${line}\n`);
+    },
+    execute: (run) =>
+      runArm({
+        task: taskById.get(run.taskId) as Level2Task,
         arm: run.arm,
-        disposition: 'invalid-measurement',
-        detail: `the session did not engage the harness: ${engagement.detail}`,
-      });
-      process.stdout.write(`STOP  ${engagement.detail}\n`);
-      process.stdout.write(`      the arm artifact is at ${outcome.artifactPath}\n`);
-      continue;
-    }
-    observations.push(outcome.observation);
-
-    // A measured run, classified in the report's own vocabulary: the coding outcome first
-    // (it is the gate), then whether the host reported anything to compare.
-    const solved = outcome.observation.grading.passed;
-    if (hasNoReportedUsage(outcome.observation)) {
-      dispositions.push({
-        taskId: run.taskId,
         pairIndex: run.pairIndex,
-        arm: run.arm,
-        disposition: 'unavailable-evidence',
-        detail: `the task ${solved ? 'passed' : 'FAILED'} its own tests, and the host reported no token field, so no token comparison can be made`,
-      });
-    } else {
-      dispositions.push({
-        taskId: run.taskId,
-        pairIndex: run.pairIndex,
-        arm: run.arm,
-        disposition: solved ? 'solved' : 'task-failed',
-        detail: `the task ${solved ? 'passed' : 'FAILED'} its own tests (graded outside the session, against pristine tests)`,
-      });
-    }
-
-    const decision = budget.observe(outcome.observation);
-    if (!decision.allowed) {
-      stoppedByBudget = decision.detail;
-      failures += 1;
-      process.stdout.write(`STOP  usage cap reached: ${decision.detail}\n`);
-    }
-  }
-
-  // Runs the plan stopped before are still planned runs: they are published as `not-run`
-  // rather than omitted, so the report accounts for every authorized session.
-  for (const run of plan.runs.slice(runsStarted)) {
-    dispositions.push({
-      taskId: run.taskId,
-      pairIndex: run.pairIndex,
-      arm: run.arm,
-      disposition: 'not-run',
-      detail: 'the plan stopped before this run started',
-    });
-  }
+        workspaceRoot: options.workspaceRoot,
+        mode: 'live',
+        runtime: options.runtime,
+        model,
+        cliPath: options.cliPath,
+        ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+        // The same number the post-session cap uses, so there is one spending bound and
+        // it is enforced both while the session runs and after it ends.
+        ...(options.maxCostUsdPerRun === undefined
+          ? {}
+          : { inSessionCostCapUsd: options.maxCostUsdPerRun }),
+        onProgress: (line) => {
+          process.stdout.write(`      ${line}\n`);
+        },
+      }),
+  });
+  const { observations, dispositions, stop } = sequence;
+  // The sequence counts its own fatal outcomes; the report adds the coding-regression failure
+  // below, so the exit code reflects both.
+  let failures = sequence.failures;
 
   const experiment = buildExperiment(
     observations,
@@ -1045,18 +1243,22 @@ async function runLive(options: CliOptions): Promise<number> {
   process.stdout.write(
     `Spending accounting: $${spent.spentCostUsd.toFixed(4)} reported over ${spent.runs} session(s)${spent.runsWithoutReportedCost > 0 ? `, of which ${spent.runsWithoutReportedCost} reported no cost (the provider's own figure, not an estimate)` : ''}.\n`,
   );
-  if (stoppedByBudget !== undefined) {
-    process.stdout.write(`The run stopped early: ${stoppedByBudget}.\n`);
-  }
-  if (stoppedByModel) {
-    process.stdout.write(
-      'The run stopped early because the runtime refused the requested model; nothing was sent for those sessions.\n',
-    );
-  }
-  if (stoppedByEngagement !== undefined) {
-    process.stdout.write(
-      'The run stopped early because a session did not engage the harness, so the live path is broken rather than the model being slow or wrong.\n',
-    );
+  if (stop !== undefined) {
+    if (stop.code === 'budget') {
+      process.stdout.write(`The run stopped early: ${stop.detail}.\n`);
+    } else if (stop.code === 'model-refused') {
+      process.stdout.write(
+        'The run stopped early because the runtime refused the requested model; nothing was sent for those sessions.\n',
+      );
+    } else if (stop.code === 'not-engaged') {
+      process.stdout.write(
+        'The run stopped early because a session did not engage the harness, so the live path is broken rather than the model being slow or wrong.\n',
+      );
+    } else {
+      process.stdout.write(
+        `The run stopped early because a session produced no measurement (${stop.detail}); the remaining planned runs were not launched.\n`,
+      );
+    }
   }
 
   // A coding regression is a failure regardless of any token difference.

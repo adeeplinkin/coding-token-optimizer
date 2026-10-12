@@ -12,7 +12,95 @@
  * Both currencies may be configured at once — the unit bound is what still works when the provider
  * reports no cost, and the spending bound is what the report is actually about.
  */
+import { spawnSync } from 'node:child_process';
 import type { ArmRuntimeMode } from './runner.js';
+
+/** One path `git status` reported as changed, split into its code and its path. */
+export interface WorkingTreeEntry {
+  /** The two-character porcelain status, e.g. ` M`, `??`, `A `. */
+  readonly code: string;
+  readonly path: string;
+}
+
+/**
+ * A repository's working tree, as git describes it.
+ *
+ * Only files git *tracks* or reports as **untracked** count. Ignored files are absent from
+ * `git status --porcelain` by construction, which is what makes this check usable on a checkout
+ * where this harness writes reports into an ignored directory.
+ *
+ * `error` is set when the state could not be read at all (not a repository, git absent, git
+ * failed). That is not "clean": an unreadable tree is refused exactly like a dirty one, because
+ * a live run must be attributable to a revision someone can find again.
+ */
+export interface WorkingTreeState {
+  readonly clean: boolean;
+  readonly entries: readonly WorkingTreeEntry[];
+  readonly error: string | undefined;
+}
+
+/** A `git` invocation, injectable so the check can be tested without a repository. */
+export type GitRunner = (args: readonly string[]) => {
+  readonly stdout: string;
+  readonly error: string | undefined;
+};
+
+/** Parse `git status --porcelain` output into the paths it reports. */
+export function parseWorkingTree(porcelain: string): WorkingTreeState {
+  const entries = porcelain
+    .split(/\r?\n/)
+    .flatMap((line) => {
+      if (line.trim().length === 0) return [];
+      const code = line.slice(0, 2);
+      const path = line.slice(3).trim();
+      return path.length === 0 ? [] : [{ code, path }];
+    })
+    .sort((left, right) => left.path.localeCompare(right.path));
+  return { clean: entries.length === 0, entries, error: undefined };
+}
+
+/**
+ * Read the working tree of the repository containing `root`.
+ *
+ * Read-only: `git status` writes nothing, and this function never stages, commits, stashes or
+ * deletes — a dirty tree is reported, not repaired. The repository root is resolved with
+ * `rev-parse --show-toplevel` so the check is about the checkout that contains the harness rather
+ * than whatever directory the process happened to start in.
+ */
+export function readWorkingTree(root: string, run: GitRunner = defaultGitRunner): WorkingTreeState {
+  const top = run(['-C', root, 'rev-parse', '--show-toplevel']);
+  if (top.error !== undefined || top.stdout.trim().length === 0) {
+    return {
+      clean: false,
+      entries: [],
+      error: top.error ?? 'git did not report the repository root',
+    };
+  }
+  const status = run(['-C', top.stdout.trim(), 'status', '--porcelain']);
+  if (status.error !== undefined) {
+    return { clean: false, entries: [], error: status.error };
+  }
+  return parseWorkingTree(status.stdout);
+}
+
+/** The real `git`, capturing both streams and never throwing. */
+function defaultGitRunner(args: readonly string[]): { stdout: string; error: string | undefined } {
+  try {
+    const result = spawnSync('git', [...args], { encoding: 'utf8', windowsHide: true, timeout: 30_000 });
+    if (result.error !== undefined && result.error !== null) {
+      return { stdout: '', error: result.error.message };
+    }
+    if (typeof result.status === 'number' && result.status !== 0) {
+      return {
+        stdout: result.stdout ?? '',
+        error: `git ${args.join(' ')} exited with code ${String(result.status)}: ${(result.stderr ?? '').trim().slice(0, 200)}`,
+      };
+    }
+    return { stdout: result.stdout ?? '', error: undefined };
+  } catch (error) {
+    return { stdout: '', error: error instanceof Error ? error.message : String(error) };
+  }
+}
 
 /** Everything the guards need to know, so they can be evaluated without touching a runtime. */
 export interface LiveGuardInput {
@@ -21,6 +109,11 @@ export interface LiveGuardInput {
   readonly runtime: ArmRuntimeMode;
   readonly cliPath: string;
   readonly cliPresent: boolean;
+  /**
+   * The checkout the run would be attributed to. Required, not optional: a guard input that could
+   * silently omit it would make the check skippable, which is how it went unnoticed on 2026-10-12.
+   */
+  readonly workingTree: WorkingTreeState;
   readonly maxRuns: number | undefined;
   /** Number of arm runs the plan would execute. */
   readonly planArmRuns: number;
@@ -50,6 +143,21 @@ export function liveRunRefusals(input: LiveGuardInput): readonly string[] {
   }
   if (!input.cliPresent) {
     problems.push(`the OpenCode CLI was not found at ${input.cliPath}`);
+  }
+  // A live run is an experiment against a *revision*. If the tree carries uncommitted work, the
+  // report cannot name what was run, and a reader cannot reproduce it — so the run is refused
+  // rather than annotated. Gitignored artifacts (this harness's own reports, temp homes) do not
+  // count: `git status --porcelain` omits them by construction.
+  if (input.workingTree.error !== undefined) {
+    problems.push(
+      `refusing to start: the working tree could not be read (${input.workingTree.error}), so the revision this run would be attributed to is unknown; commit or stash the work and re-run.`,
+    );
+  } else if (!input.workingTree.clean) {
+    const shown = input.workingTree.entries.slice(0, 5).map((entry) => `${entry.code.trim() || '??'} ${entry.path}`);
+    const more = input.workingTree.entries.length - shown.length;
+    problems.push(
+      `refusing to start: the working tree has ${String(input.workingTree.entries.length)} uncommitted change(s) (${shown.join(', ')}${more > 0 ? `, and ${String(more)} more` : ''}), so a live run could not be attributed to a revision; commit or stash them first (this check changes nothing).`,
+    );
   }
   if (input.maxRuns === undefined || input.planArmRuns > input.maxRuns) {
     problems.push(

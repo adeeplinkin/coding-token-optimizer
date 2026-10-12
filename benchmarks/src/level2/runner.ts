@@ -229,6 +229,29 @@ export interface ArmModelPrice {
   readonly cacheWrite: number | undefined;
 }
 
+/**
+ * The free-only model policy as the arm driver's own preflight reports it.
+ *
+ * Reported by the driver because it is the process that holds the policy module and asks the
+ * runtime for its price row; the benchmark side reads the verdict here so an operator sees the
+ * answer *before* authorizing, and the live path refuses a runtime whose catalogue cannot show the
+ * model free in every tier.
+ */
+export interface ArmFreeOnlyProbe {
+  readonly primaryModel: string;
+  readonly auxiliaryModel: string;
+  readonly approvedModels: readonly string[];
+  /** The usage categories that must each be zero. */
+  readonly priceFields: readonly string[];
+  /** True only when every applicable tier was explicitly zero. */
+  readonly priceVerifiedFree: boolean;
+  /** Every reason the model may not be used; empty means it may. */
+  readonly refusals: readonly string[];
+  readonly verdict: 'free' | 'refused';
+  /** SHA-256 of the configuration both arms receive. */
+  readonly configDigest: string;
+}
+
 export interface ArmEnvironmentProbe {
   readonly cli: string;
   readonly runtimeVersion: string | undefined;
@@ -262,6 +285,8 @@ export interface ArmEnvironmentProbe {
   readonly pricing: ArmModelPrice | undefined;
   readonly modelStatus: string | undefined;
   readonly contextLimit: number | undefined;
+  /** The free-only verdict, or `undefined` when this driver build does not report one. */
+  readonly freeOnly: ArmFreeOnlyProbe | undefined;
   readonly notes: readonly string[];
 }
 
@@ -351,6 +376,32 @@ export async function probeArmEnvironment(options: {
   const runtime = text('requestedRuntime');
   const stringList = (value: unknown): readonly string[] =>
     Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
+  const freeOnlyRecord =
+    typeof record['freeOnly'] === 'object' && record['freeOnly'] !== null
+      ? (record['freeOnly'] as Record<string, unknown>)
+      : undefined;
+  const freeOnly: ArmFreeOnlyProbe | undefined =
+    freeOnlyRecord === undefined
+      ? undefined
+      : {
+          primaryModel:
+            typeof freeOnlyRecord['primaryModel'] === 'string'
+              ? (freeOnlyRecord['primaryModel'] as string)
+              : '',
+          auxiliaryModel:
+            typeof freeOnlyRecord['auxiliaryModel'] === 'string'
+              ? (freeOnlyRecord['auxiliaryModel'] as string)
+              : '',
+          approvedModels: stringList(freeOnlyRecord['approvedModels']),
+          priceFields: stringList(freeOnlyRecord['priceFields']),
+          priceVerifiedFree: freeOnlyRecord['priceVerifiedFree'] === true,
+          refusals: stringList(freeOnlyRecord['refusals']),
+          verdict: freeOnlyRecord['verdict'] === 'free' ? 'free' : 'refused',
+          configDigest:
+            typeof freeOnlyRecord['configDigest'] === 'string'
+              ? (freeOnlyRecord['configDigest'] as string)
+              : '',
+        };
   const paths = (key: string): ArmObservedPaths => {
     const value = record[key];
     const entry =
@@ -392,6 +443,7 @@ export async function probeArmEnvironment(options: {
             },
       modelStatus: text('modelStatus'),
       contextLimit: optionalNumber('contextLimit'),
+      freeOnly,
       notes: Array.isArray(record['notes'])
         ? record['notes'].filter((entry): entry is string => typeof entry === 'string')
         : [],
@@ -566,6 +618,9 @@ export async function runArm(options: ArmRunOptions): Promise<ArmRunOutcome> {
     artifactPreexisting,
     artifactText,
     expectedRunNonce: runNonce,
+    // A rehearsal and a live run use the same driver, plugins and artifact shape; the declared
+    // mode is what keeps a rehearsal's scripted counts out of a live measurement.
+    expectedMode: options.mode,
   });
   problems.push(...provenance.problems);
   if (!provenance.ok || provenance.parsed === undefined) {

@@ -310,16 +310,42 @@ export interface OpenCodeV2SessionContext {
 }
 
 /**
- * The session hook names this adapter can register.
+ * The `model.request` payload of `ctx.session.hook` — a defensive mirror of the published
+ * `SessionModelRequest`.
  *
- * Only `context` is declared: it is the one request-assembly hook M1 uses, it is
- * observation-only by contract (its callback returns `Promise<void> | void`,
- * with no return-value channel), and none of the other session hooks
- * (`prompt`, `compaction`, `title`, `model.request`, ...) is registered by this
- * adapter.
+ * This is the one request hook that carries the request's own **kind** *and* the model it is about
+ * to use, which is why the model guard registers it: the kind-less `context` payload can describe
+ * a request but cannot say which model class it belongs to. The payload keys here are the ones
+ * measured live on the pinned runtime (`agent, baseURL, headers, kind, model, sessionID`).
+ *
+ * Every member is optional for the same reason as {@link OpenCodeV2SessionContext}: a host that
+ * exposes less must degrade to "the guard cannot classify this" (a refusal) rather than to a
+ * crash or to an assumption. `headers`, `baseURL` and `sessionID` are not read by the guard — it
+ * records only which model and kind it decided about.
+ */
+export interface OpenCodeV2SessionModelRequest {
+  readonly sessionID?: string;
+  readonly agent?: string;
+  /** `SessionRequestKind`: `primary` | `compaction` | `title` | `generate`. */
+  readonly kind?: string;
+  readonly model?: unknown;
+  readonly baseURL?: string;
+  readonly headers?: unknown;
+}
+
+/**
+ * The session hook names this package registers.
+ *
+ * `context` is the request-assembly hook M1 uses, and it is observation-only by contract (its
+ * callback returns `Promise<void> | void`, with no return-value channel). `model.request` is
+ * registered by the **model guard** — a separate plugin whose whole purpose is to refuse a request
+ * whose model is not approved — and it is the only hook name here that may throw deliberately.
+ * Neither the observer nor the adapter registers it; declaring it keeps the mirror of the
+ * published `SessionHooks` complete for the code that does.
  */
 export interface OpenCodeV2SessionHookSpec {
   readonly context: OpenCodeV2SessionContext;
+  readonly 'model.request': OpenCodeV2SessionModelRequest;
 }
 
 /**

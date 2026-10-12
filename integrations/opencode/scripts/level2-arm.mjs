@@ -63,6 +63,80 @@ import { pathToFileURL } from 'node:url';
 const MARKER_PREFIX = '[dr-token/safe-mode/v1:';
 const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
 
+/**
+ * The session title this driver supplies on the command line, for every arm.
+ *
+ * Passing `--title` is what stops the runtime from generating one: measured offline against the
+ * pinned runtime, a session started without it composed **two** auxiliary requests (a
+title request on the configured auxiliary model, and a second one on the session model),
+ * while the same session with `--title` composed none (2 requests instead of 4, all primary).
+ *
+ * One constant for both arms, deliberately: the title never reaches a model, so it can carry no
+ * measurement, and identical bytes keep the two arms' command lines comparable.
+ */
+const SESSION_TITLE = 'dr-token-level2';
+
+/**
+ * The hook name the runtime dispatches every model request to, and the kinds it reports.
+ *
+ * Read from the policy module rather than written here, because both sides of the harness depend
+ * on the *same* name: the driver registers it, and the benchmark checks require the counts to have
+ * come from it. `MODEL_REQUEST_HOOK` documents the measurement behind the name — including the
+ * negative result (a synthetic per-kind name registers without error and is never called) that
+ * makes a count taken any other way worthless.
+ */
+function requireRequestKindVocabulary() {
+  const policy = requirePolicy();
+  if (
+    typeof policy.MODEL_REQUEST_HOOK !== 'string' ||
+    !Array.isArray(policy.REQUEST_KINDS) ||
+    policy.REQUEST_KINDS.length < 2
+  ) {
+    fail(
+      'the free-only model policy does not export the request-kind vocabulary (MODEL_REQUEST_HOOK, REQUEST_KINDS), so the driver cannot register the one hook that makes an absent request measurable. Refusing to run.',
+    );
+  }
+  return { hook: policy.MODEL_REQUEST_HOOK, kinds: [...policy.REQUEST_KINDS] };
+}
+
+/**
+ * The free-only model policy, imported from the benchmark package's built output.
+ *
+ * The policy lives in `benchmarks/src/level2/free-model-policy.ts` — one implementation, used by
+ * both sides of the harness: the driver applies it to the repository it is about to run, and the
+ * benchmark side re-derives the same verdict from the artifact. Duplicating it here would let the
+ * two drift, which is exactly how a paid model starts a session that everyone believes is free.
+ *
+ * The import is **required**: if it fails, every mode fails closed rather than running a session
+ * whose envelope it cannot state.
+ */
+const policyModulePath =
+  process.env.DR_TOKEN_FREE_POLICY_MODULE ??
+  join(import.meta.dirname, '..', '..', '..', 'benchmarks', 'dist', 'level2', 'free-model-policy.js');
+let policy;
+let policyImportError;
+try {
+  policy = await import(pathToFileURL(policyModulePath).href);
+} catch (error) {
+  policy = undefined;
+  policyImportError = error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The policy module, or a refusal to run at all.
+ *
+ * A missing build is a configuration error, not a reason to proceed without the policy: the
+ * checks that matter (approval list, price row, resolved configuration) all live in that module.
+ */
+function requirePolicy() {
+  if (policy === undefined || typeof policy.freeOnlyModelConfig !== 'function') {
+    fail(
+      `the free-only model policy could not be imported from ${policyModulePath} (${String(policyImportError ?? 'the module does not export freeOnlyModelConfig')}); build the workspaces first (npm run build) or point DR_TOKEN_FREE_POLICY_MODULE at the built module. Refusing to run without the policy that decides whether a model may be used.`,
+    );
+  }
+  return policy;
+}
+
 function parseArgs(argv) {
   const args = {
     repo: undefined,
@@ -191,6 +265,7 @@ function isolationEnvironment(configHome, dataHome, projectDirectory) {
  * every live session failed. A live run is now refused on the facts below.
  */
 function environmentProbe() {
+  const P = requirePolicy();
   const root =
     args.out === undefined
       ? join(tmpdir(), `dr-token-level2-preflight-${process.pid}`)
@@ -344,6 +419,19 @@ function environmentProbe() {
     .filter((line) => /stored/i.test(line)).length;
   const versionMatch = /(\d+\.\d+\.\d+)/.exec(`${version.stdout}${version.stderr}`);
 
+  // The free-only verdict, decided on the catalogue of the runtime the caller selected — the
+  // same question the live guard asks before it spawns anything, reported here so an operator
+  // sees the answer before authorizing rather than in a refusal afterwards.
+  const selected = args.runtime === 'service' ? service : isolated;
+  const priceFacts = {
+    model: args.model ?? undefined,
+    runtime: args.runtime,
+    catalogueSize: selected.models,
+    listed: selected.modelListed === null ? undefined : selected.modelListed,
+    priceRow: selected.price ?? undefined,
+  };
+  const policyRefusals = P.freeOnlyRefusals(priceFacts);
+
   const report = {
     schemaVersion: 2,
     mode: 'preflight',
@@ -373,6 +461,18 @@ function environmentProbe() {
     modelStatus: service.modelStatus ?? isolated.modelStatus,
     modelEnabled: service.modelEnabled ?? isolated.modelEnabled,
     contextLimit: service.contextLimit ?? isolated.contextLimit,
+    freeOnly: {
+      primaryModel: P.FREE_ONLY_PRIMARY_MODEL,
+      auxiliaryModel: P.FREE_ONLY_AUXILIARY_MODEL,
+      approvedModels: [...P.FREE_ONLY_APPROVED_MODELS],
+      priceFields: [...P.FREE_ONLY_PRICE_FIELDS],
+      priceVerifiedFree: P.isZeroPriceRow(priceFacts.priceRow),
+      refusals: [...policyRefusals],
+      verdict: policyRefusals.length === 0 ? 'free' : 'refused',
+      config: P.freeOnlyModelConfig(),
+      configDigest: P.freeOnlyModelConfigDigest(P.freeOnlyModelConfig()),
+      resolvedConfigText: P.freeOnlyModelConfigText(P.freeOnlyModelConfig()),
+    },
     notes: [
       'Both catalogues were asked read-only through model.list: one with --standalone under the isolated config and data homes, one without so the running background service answers.',
       'The runtime was asked for its own directories with the overrides and without them: the isolated answer is only meaningful if the unisolated answer differs from it. The isolated data home is also checked for the runtime store the private server writes there.',
@@ -389,6 +489,10 @@ function environmentProbe() {
       service.price === null
         ? 'No price row was reported for the requested model, so no cost estimate can be derived from the runtime.'
         : 'The price row is the runtime\u2019s own, in USD per million tokens, and it is what the reported session cost is derived from.',
+      policyRefusals.length === 0
+        ? `The free-only policy holds: \`${args.model ?? 'no model'}\` is approved and every applicable price tier (${P.FREE_ONLY_PRICE_FIELDS.join(', ')}) is explicitly zero on the ${args.runtime} runtime.`
+        : `The free-only policy REFUSES this model: ${policyRefusals.join('; ')}.`,
+      'The free-only configuration a session receives is recorded in freeOnly.config; the live guard refuses to spawn a session unless the runtime\u2019s own resolved configuration matches it.',
     ],
   };
   process.stdout.write(`${JSON.stringify(report)}\n`);
@@ -413,6 +517,37 @@ for (const required of ['taskId', 'runId', 'runNonce', 'repositoryRevision', 'pr
 }
 if (!Number.isInteger(args.pairIndex) || !Number.isInteger(args.attempt)) {
   fail('--pair-index and --attempt must be whole numbers');
+}
+
+// The free-only policy, resolved before anything is written or spawned: it decides which model
+// a session may use and what configuration the repository receives. `requirePolicy()` fails
+// closed, so nothing below can run with an unstated envelope.
+const P = requirePolicy();
+const modelConfig = P.freeOnlyModelConfig();
+const modelConfigDigest = P.freeOnlyModelConfigDigest(modelConfig);
+
+/**
+ * The envelope the **pre-transmission model guard** enforces inside the session.
+ *
+ * Derived here from the same policy module the price gate and the benchmark's checks read, and
+ * passed to the generated guard plugin as a literal, so the guard's evidence names the digest of
+ * the configuration it was given rather than a list the guard chose for itself. `undefined` means
+ * the policy module cannot state an envelope at all, which is a refusal to run (see
+ * `modelGuardRefusals` below) rather than a session with an unstated bound.
+ */
+const modelGuardEnvelope =
+  typeof P.modelGuardPolicy === 'function'
+    ? P.modelGuardPolicy(modelConfig.model, modelConfig.small_model)
+    : undefined;
+// The request-kind vocabulary the probe registers and the artifact reports, from the same module
+// the benchmark checks read it from.
+const requestKindVocabulary = requireRequestKindVocabulary();
+// The primary the run was asked for and the primary the configuration pins must be the same
+// model, or one of them is silently a different experiment. Checked before any file is written.
+if (args.model !== modelConfig.model) {
+  fail(
+    `--model is \`${args.model}\` while the free-only policy pins the primary to \`${modelConfig.model}\`; a run whose command line and repository configuration name different models is not attributable to either. Refusing to start.`,
+  );
 }
 
 const pluginPath = args.pluginModule ?? join(import.meta.dirname, '..', 'dist', 'index.js');
@@ -445,6 +580,11 @@ try {
     latestSessionCostUsd: pick('latestSessionCostUsd'),
     planGovernorArming: pick('planGovernorArming'),
     summarizeContainmentEvidence: pick('summarizeContainmentEvidence'),
+    // The model guard: the factory the generated plugin loads and the summarizer the artifact
+    // records. Picked here rather than looked up at the call site, so a build without them is a
+    // refusal to run instead of a session that was silently started unbounded.
+    createModelGuardPluginV2: pick('createModelGuardPluginV2'),
+    summarizeModelGuardEvidence: pick('summarizeModelGuardEvidence'),
     deniedTools: Array.isArray(importModule.CONTAINMENT_DENIED_TOOLS)
       ? importModule.CONTAINMENT_DENIED_TOOLS.filter((entry) => typeof entry === 'string')
       : undefined,
@@ -457,10 +597,15 @@ const out = args.out;
 mkdirSync(out, { recursive: true });
 const wirePath = join(out, 'wire.jsonl');
 const summaryPath = join(out, 'session-summary.jsonl');
+// The request kinds the runtime composed, as its own model-request hooks reported them. This is
+// the channel that works in every mode, including a live run against a real provider where no
+// endpoint record exists.
+const kindsPath = join(out, 'wire-kinds.jsonl');
 const cliLogPath = join(out, 'arm-cli.log');
 const artifactPath = join(out, 'arm-observation.json');
 writeFileSync(wirePath, '');
 writeFileSync(summaryPath, '');
+writeFileSync(kindsPath, '');
 
 const prompt = readFileSync(args.promptFile, 'utf8');
 
@@ -501,7 +646,12 @@ writeFileSync(
 import { Buffer } from 'node:buffer';
 
 const outPath = process.env.DR_TOKEN_LEVEL2_WIRE ?? ${JSON.stringify(wirePath)};
+const kindsPath = process.env.DR_TOKEN_LEVEL2_KINDS ?? ${JSON.stringify(kindsPath)};
+const requestHook = ${JSON.stringify(requestKindVocabulary.hook)};
+const requestKinds = ${JSON.stringify(requestKindVocabulary.kinds)};
 const prefix = ${JSON.stringify(MARKER_PREFIX)};
+// Written explicitly so this generated file carries no escape-sequence ambiguity.
+const NL = String.fromCharCode(10);
 
 /**
  * A structural description of the body object.
@@ -538,6 +688,10 @@ export default {
           const body = typeof rawBody === 'string' ? rawBody : undefined;
           const entry = {
             seq: seq,
+            // The runtime labels its own request: read here rather than inferred from the body, so
+            // the endpoint-side view of the session carries the same kind vocabulary the model
+            // hook reports.
+            kind: typeof payload.kind === 'string' ? payload.kind : 'unclassified',
             bodyType: rawBody === undefined || rawBody === null ? 'absent' : typeof rawBody,
             bodyShape: describeShape(rawBody),
             bodyChars: body === undefined ? null : body.length,
@@ -552,6 +706,50 @@ export default {
       });
     } catch {
       // A host without the hook is recorded as "no wire evidence", not as a failure.
+    }
+
+    // The request-kind probe.
+    //
+    // **One** registration, on the single hook name the runtime dispatches every model request
+    // to, with the request's own kind read out of the payload. This is measured, and the negative
+    // result is why it is written this way: registering a synthetic name per kind
+    // ('model.request:title' and friends) is accepted by the runtime without error and **never
+    // called**, so a per-kind count taken that way reads as a zero while real requests go out.
+    // Hook registration proves nothing; only an invocation does.
+    //
+    // A payload whose kind is not one the runtime declares is recorded as "unclassified" rather
+    // than dropped: an unrecognized request is exactly the case where guessing would hide work the
+    // free-only policy does not allow. The payload's key names are recorded too, so the artifact
+    // shows the reading came from a real payload.
+    //
+    // The model reference is recorded exactly as the runtime hands it over (an object or a
+    // string); the driver normalizes it with the one policy implementation, so the probe and the
+    // benchmark cannot disagree about what a model identifier is.
+    const registered = [];
+    const failures = [];
+    try {
+      await context.session.hook(requestHook, (payload) => {
+        try {
+          const detail = payload && typeof payload === 'object' ? payload : {};
+          const reported = typeof detail.kind === 'string' ? detail.kind : undefined;
+          const entry = {
+            kind: reported !== undefined && requestKinds.indexOf(reported) >= 0 ? reported : 'unclassified',
+            model: detail.model,
+            payloadKeys: Object.keys(detail).slice(0, 12).sort(),
+          };
+          if (kindsPath) appendFileSync(kindsPath, JSON.stringify(entry) + NL);
+        } catch {
+          // A probe failure must never disturb the session it measures.
+        }
+      });
+      registered.push(requestHook);
+    } catch {
+      failures.push(requestHook);
+    }
+    try {
+      if (kindsPath) appendFileSync(kindsPath, JSON.stringify({ registered, failures }) + NL);
+    } catch {
+      // The absence is visible in the artifact rather than thrown into the session.
     }
     return () => {};
   },
@@ -581,10 +779,170 @@ const containmentConfig = {
     general: { steps: 20 },
   },
 };
+
+/**
+ * The native permission actions the canary policy requires, in the runtime's own vocabulary.
+ *
+ * The repository config declares `bash`/`task`; the runtime canonicalises those to `shell` and
+ * `subagent` (observed 2026-10-11 through `api config.get`), so the requirement is stated in the
+ * runtime's names, not in ours.
+ */
+const REQUIRED_NATIVE_DENIES = ['external_directory', 'shell', 'subagent', 'webfetch'];
+
+/**
+ * Ask the runtime what permission rules it resolved for this repository.
+ *
+ * Read-only, no session and no model: `api config.get --standalone` starts a private server in
+ * the arm's own isolated environment and reports the resolved configuration, including the
+ * canonical permission list. This is what makes the *second* containment layer evidenced rather
+ * than assumed — the plugin event stream does not carry the session's permission rules in this
+ * runtime shape (`permissionRules: null` in the guard's evidence is a gap in what the runtime
+ * reports to a plugin, not a missing rule; a controlled run showed the same session leaking an
+ * out-of-workspace read once this config was removed).
+ *
+ * Only the action, the effect and a resource *class* are recorded: never a path.
+ */
+function configurationProbe() {
+  const policySource = 'api config.get --standalone (this repository\u2019s own document)';
+  const unreadable = (error) => ({
+    permissions: {
+      observed: false,
+      source: 'api config.get --standalone',
+      rules: [],
+      error,
+    },
+    policy: {
+      source: policySource,
+      found: false,
+      model: undefined,
+      titleModel: undefined,
+      compactionAuto: undefined,
+      providersAllowed: [],
+      providersDeniedAll: false,
+      update: undefined,
+      share: undefined,
+      error,
+    },
+  });
+
+  let result;
+  try {
+    result = spawnSync(args.cli, ['api', 'config.get', '--standalone'], {
+      cwd: args.repo,
+      env,
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 60_000,
+    });
+  } catch (error) {
+    return unreadable(error instanceof Error ? error.message : String(error));
+  }
+  const text = `${result.stdout ?? ''}\n${result.stderr ?? ''}`.trim();
+  const lastLine = text.split(/\r?\n/).filter(Boolean).pop();
+  let parsed;
+  try {
+    parsed = JSON.parse(lastLine ?? 'null');
+  } catch {
+    parsed = undefined;
+  }
+  if (!Array.isArray(parsed)) {
+    return unreadable('the runtime did not report a readable configuration');
+  }
+
+  const foldedRepo = args.repo.replace(/\\/g, '/').toLowerCase();
+  const rules = [];
+  for (const entry of parsed) {
+    const info = entry !== null && typeof entry === 'object' ? entry.info : undefined;
+    if (info === undefined || info === null || !Array.isArray(info.permissions)) continue;
+    for (const rule of info.permissions) {
+      if (rule === null || typeof rule !== 'object') continue;
+      if (typeof rule.action !== 'string' || typeof rule.effect !== 'string') continue;
+      const resource =
+        rule.resource === '*'
+          ? 'any'
+          : typeof rule.resource === 'string'
+            ? rule.resource.replace(/\\/g, '/').toLowerCase().startsWith(foldedRepo)
+              ? 'workspace'
+              : 'other'
+            : 'unclassified';
+      rules.push({ action: rule.action, effect: rule.effect, resource });
+    }
+  }
+
+  /**
+   * The document the runtime resolved for *this repository's own config file*.
+   *
+   * Matching on the path is what makes the reading about the file the driver wrote rather than
+   * about the merged configuration: a key the runtime does not recognize is omitted from the
+   * document it reports, so its absence here is the signal that the setting did not take
+   * effect. The suffix comparison is only for path spelling (the runtime may canonicalize
+   * case or separators on this platform); it is still the project document and nothing else.
+   */
+  const normalized = (value) =>
+    typeof value === 'string' ? value.replace(/\\/g, '/').replace(/\/+$/g, '').toLowerCase() : '';
+  const wanted = normalized(containmentConfigPath);
+  const projectDocument = parsed.find((entry) => {
+    const path = normalized(entry?.path);
+    return path.length > 0 && (path === wanted || path.endsWith('/.opencode/opencode.json'));
+  });
+  const info =
+    projectDocument !== null && typeof projectDocument === 'object'
+      ? projectDocument.info
+      : undefined;
+
+  const modelRef = (value) => {
+    if (typeof value === 'string') return value;
+    if (value === null || typeof value !== 'object') return undefined;
+    const provider = typeof value.providerID === 'string' ? value.providerID : undefined;
+    const model =
+      typeof value.model === 'string' ? value.model : typeof value.modelID === 'string' ? value.modelID : undefined;
+    return provider === undefined || model === undefined ? undefined : `${provider}/${model}`;
+  };
+  const policies = Array.isArray(info?.experimental?.policies) ? info.experimental.policies : [];
+  const providerUse = policies.filter(
+    (rule) => rule !== null && typeof rule === 'object' && rule.action === 'provider.use',
+  );
+  const policy = {
+    source: policySource,
+    found: info !== undefined && info !== null,
+    model: modelRef(info?.model),
+    titleModel: modelRef(info?.agents?.title?.model),
+    compactionAuto:
+      info?.compaction !== undefined && typeof info.compaction.auto === 'boolean'
+        ? info.compaction.auto
+        : undefined,
+    providersAllowed: providerUse
+      .filter((rule) => rule.effect === 'allow' && typeof rule.resource === 'string')
+      .map((rule) => rule.resource),
+    providersDeniedAll: providerUse.some(
+      (rule) => rule.effect === 'deny' && (rule.resource === '*' || rule.resource === 'any'),
+    ),
+    update: typeof info?.update === 'string' ? info.update : undefined,
+    share: typeof info?.share === 'string' ? info.share : undefined,
+    error: info === undefined || info === null ? 'the runtime reported no document for this repository configuration' : null,
+  };
+
+  return {
+    permissions: {
+      observed: rules.length > 0,
+      source: 'api config.get --standalone',
+      rules,
+      error: rules.length > 0 ? null : 'the runtime resolved no permission rule for this repository',
+    },
+    policy,
+  };
+}
 const containmentConfigText = `${JSON.stringify(containmentConfig, null, 2)}\n`;
 const containmentConfigPath = join(args.repo, '.opencode', 'opencode.json');
-writeFileSync(containmentConfigPath, containmentConfigText, 'utf8');
+// One repository configuration, two fragments: the free-only model policy (primary model,
+// auxiliary model, provider restriction, disabled compaction) and the containment policy. The
+// file's bytes are a function of these two fragments alone — no arm-specific value is in
+// either — so the control and treatment repositories are byte-identical and their digests are
+// the evidence for it.
+const projectConfigText = `${JSON.stringify({ ...modelConfig, ...containmentConfig }, null, 2)}\n`;
+writeFileSync(containmentConfigPath, projectConfigText, 'utf8');
 const containmentConfigDigest = createHash('sha256').update(containmentConfigText, 'utf8').digest('hex');
+const projectConfigDigest = createHash('sha256').update(projectConfigText, 'utf8').digest('hex');
 
 // Layer 2 — the containment guard plugin, byte-identical in both arms like the
 // observer: it loads the shipped factory, and the only per-arm content is the
@@ -595,6 +953,18 @@ writeFileSync(guardEvidencePath, '');
 writeFileSync(
   join(pluginsDir, 'zz-level2-guard.ts'),
   `import { appendFileSync } from 'node:fs';\nimport { createContainmentGuardPluginV2 } from ${JSON.stringify(pluginModule)};\n\nconst evidencePath = ${JSON.stringify(guardEvidencePath)};\n\nexport default createContainmentGuardPluginV2({\n  onEvidence: (line) => {\n    appendFileSync(evidencePath, JSON.stringify(line) + '\\n', 'utf8');\n  },\n});\n`,
+  'utf8',
+);
+
+// Layer 3 — the pre-transmission **model guard**, byte-identical in both arms for the same reason
+// as the other two: it loads the shipped factory and the only per-arm content is the evidence file
+// path. It is the one layer that acts *before* a provider request is dispatched, so a request the
+// free-only envelope does not cover is refused instead of being measured and discarded afterwards.
+const modelGuardEvidencePath = join(out, 'model-guard.jsonl');
+writeFileSync(modelGuardEvidencePath, '');
+writeFileSync(
+  join(pluginsDir, 'zz-level2-model-guard.ts'),
+  `import { appendFileSync } from 'node:fs';\nimport { createModelGuardPluginV2 } from ${JSON.stringify(pluginModule)};\n\nconst evidencePath = ${JSON.stringify(modelGuardEvidencePath)};\nconst policy = ${JSON.stringify(modelGuardEnvelope ?? null)};\n\nexport default createModelGuardPluginV2({\n  ...(policy === null ? {} : { policy }),\n  onEvidence: (line) => {\n    appendFileSync(evidencePath, JSON.stringify(line) + '\\n', 'utf8');\n  },\n});\n`,
   'utf8',
 );
 
@@ -690,12 +1060,237 @@ if (armingPlan.required === true && governor.armed !== true) {
   );
 }
 
+/* -------------------------------------------------------------------------- */
+/* Native permission policy — read from the runtime, before any session        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The second containment layer, asked of the runtime rather than assumed.
+ *
+ * This runs **before** the CLI is spawned: a live session whose runtime did not resolve the
+ * required denies would run with only the plugin layer in force, and the plugin layer is the one
+ * this harness proved; the native layer must be shown to be configured, or the run is refused
+ * rather than started with half of containment unobserved.
+ */
+const configuration = configurationProbe();
+const nativePermissions = configuration.permissions;
+const resolvedPolicy = configuration.policy;
+const missingNativeDenies = REQUIRED_NATIVE_DENIES.filter(
+  (action) =>
+    !nativePermissions.rules.some((rule) => rule.action === action && rule.effect === 'deny'),
+);
+
+const containmentRefusal =
+  nativePermissions.observed !== true
+    ? `the runtime did not resolve the required containment denies for this repository (${String(nativePermissions.error ?? 'no permission rule was reported')}); refusing to start a live session with the native permission layer unobserved`
+    : missingNativeDenies.length > 0
+      ? `the runtime did not resolve the required containment denies for this repository (missing: ${missingNativeDenies.join(', ')}); refusing to start a live session with the native permission layer unobserved`
+      : undefined;
+
+/**
+ * The runtime's own answer about the free-only configuration, applied in **every** mode.
+ *
+ * A written configuration file is not evidence that a setting took effect: the runtime
+ * validates and normalizes what it loads, and a key it does not recognize is *omitted* from what
+ * it reports rather than rejected. So the question this asks is not "did the driver write the
+ * keys" but "did the runtime resolve them", and a session is refused when the answer is no —
+ * in a rehearsal as much as in a live run, because a rehearsal's whole purpose here is to prove
+ * that this configuration is the one a session actually receives.
+ */
+const resolvedPolicyRefusals = P.resolvedPolicyRefusals(resolvedPolicy, modelConfig);
+if (resolvedPolicyRefusals.length > 0) {
+  fail(
+    `the runtime did not apply the free-only model configuration to this repository: ${resolvedPolicyRefusals.join('; ')}. Refusing to start a session whose requests are not bounded to approved free models.`,
+  );
+}
+const modelConfigAccepted = resolvedPolicy.found === true && resolvedPolicyRefusals.length === 0;
+
+/**
+ * The pre-spawn half of the model guard: can this run's requests be bounded **before** they are
+ * sent?
+ *
+ * Every other refusal above is about whether a run may *start*; this one is about whether a request
+ * assembled *during* the session can be stopped, which is the case neither the price gate nor the
+ * resolved-configuration check can see. Two things have to hold, and both are checked here, before
+ * anything is spawned:
+ *
+ * 1. the shipped plugin module actually exports the guard factory and the evidence summarizer — a
+ *    build without them would start a session whose requests nothing refuses, and the artifact
+ *    would carry a guard block that silently reported nothing;
+ * 2. the policy module states an envelope, and it is *this* run's envelope: the same approved pair,
+ *    the same configuration digest, and every request kind the runtime declares. An envelope that
+ *    disagreed with the configuration would let the guard bound a different experiment than the
+ *    one being configured.
+ */
+const modelGuardRefusals = [];
+if (modelGuardEnvelope === undefined) {
+  modelGuardRefusals.push(
+    'the free-only model policy does not export `modelGuardPolicy()`, so no approved model envelope can be stated for the pre-transmission guard',
+  );
+} else {
+  if (modelGuardEnvelope.primary !== modelConfig.model) {
+    modelGuardRefusals.push(
+      `the guard envelope pins the primary to \`${String(modelGuardEnvelope.primary)}\` while the configuration pins \`${modelConfig.model}\``,
+    );
+  }
+  const approved = Array.isArray(modelGuardEnvelope.approved) ? modelGuardEnvelope.approved : [];
+  const missingApproved = [modelConfig.model, modelConfig.small_model].filter(
+    (id) => !approved.includes(id),
+  );
+  if (missingApproved.length > 0) {
+    modelGuardRefusals.push(
+      `the guard envelope does not approve ${missingApproved.map((id) => `\`${id}\``).join(', ')}`, 
+    );
+  }
+  const extraApproved = approved.filter((id) => id !== modelConfig.model && id !== modelConfig.small_model);
+  if (extraApproved.length > 0) {
+    modelGuardRefusals.push(
+      `the guard envelope approves ${extraApproved.map((id) => `\`${id}\``).join(', ')}, which this run's configuration does not`, 
+    );
+  }
+  const allowedKinds = Array.isArray(modelGuardEnvelope.allowedKinds)
+    ? modelGuardEnvelope.allowedKinds
+    : [];
+  const missingKinds = requestKindVocabulary.kinds.filter((kind) => !allowedKinds.includes(kind));
+  if (missingKinds.length > 0) {
+    modelGuardRefusals.push(
+      `the guard envelope does not allow the request kind(s) ${missingKinds.join(', ')}, which the runtime declares and this run therefore expects to be able to classify`,
+    );
+  }
+  if (modelGuardEnvelope.policyDigest !== modelConfigDigest) {
+    modelGuardRefusals.push(
+      `the guard envelope records policy digest \`${String(modelGuardEnvelope.policyDigest)}\` while this run's configuration digests to \`${modelConfigDigest}\`; the guard would bound a different policy than the one configured`,
+    );
+  }
+}
+if (typeof helperBundle.createModelGuardPluginV2 !== 'function') {
+  modelGuardRefusals.push(
+    `the plugin module at ${pluginPath} does not export \`createModelGuardPluginV2\`, so the session it starts would carry no pre-transmission model guard`,
+  );
+}
+if (typeof helperBundle.summarizeModelGuardEvidence !== 'function') {
+  modelGuardRefusals.push(
+    `the plugin module at ${pluginPath} does not export \`summarizeModelGuardEvidence\`, so this driver could not read back what the guard enforced`,
+  );
+}
+if (modelGuardRefusals.length > 0) {
+  fail(
+    `the pre-transmission model guard cannot be shown to be in force for this run: ${modelGuardRefusals.join('; ')}. Refusing to start a session whose model requests are not bounded before they are sent. Nothing was spawned, so this refusal costs nothing.`,
+  );
+}
+
+// The free-only verdict was asked first, above; the containment verdict follows. Both are
+// pre-spawn refusals, and the one an operator can act on when a run is refused is "this model is
+// not verifiably free" rather than "this repository's container is not in force".
+if (args.mode === 'live' && containmentRefusal !== undefined) {
+  fail(containmentRefusal);
+}
+
+/**
+ * The price the runtime reports for the model this run would use.
+ *
+ * Asked read-only through the runtime's own `model.list`, and asked of the runtime the session
+ * will use: the isolated private server and the running service can answer with different
+ * catalogues, and the price that matters is the one behind the requests this run will make.
+ *
+ * Only a live run asks. A rehearsal spends nothing, holds no account in its isolated home, and
+ * therefore cannot consult a price list at all; it records that reason rather than a verdict it
+ * did not earn.
+ */
+function cataloguePriceProbe() {
+  let models = [];
+  let error;
+  try {
+    const response = spawnSync(
+      args.cli,
+      args.runtime === 'service' ? ['api', 'model.list'] : ['api', 'model.list', '--standalone'],
+      { cwd: args.repo, env, encoding: 'utf8', windowsHide: true, timeout: 240_000 },
+    );
+    const line = String(response.stdout ?? '')
+      .split(/\r?\n/)
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .reverse()
+      .find((entry) => entry.startsWith('{'));
+    const parsed = JSON.parse(line ?? 'null');
+    if (Array.isArray(parsed?.data)) models = parsed.data;
+  } catch (caught) {
+    error = caught instanceof Error ? caught.message : String(caught);
+  }
+  const requested = models.find(
+    (model) => `${model?.providerID ?? 'unknown'}/${model?.modelID ?? ''}` === args.model,
+  );
+  const tier =
+    requested !== undefined && Array.isArray(requested.cost)
+      ? (requested.cost.find((entry) => entry !== null && typeof entry === 'object') ?? null)
+      : null;
+  const number = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : undefined);
+  return {
+    facts: {
+      model: args.model,
+      runtime: args.runtime,
+      catalogueSize: models.length,
+      listed: requested !== undefined,
+      priceRow:
+        tier === null
+          ? undefined
+          : {
+              input: number(tier.input),
+              output: number(tier.output),
+              cacheRead: number(tier.cache?.read),
+              cacheWrite: number(tier.cache?.write),
+            },
+    },
+    error,
+  };
+}
+
+const priceProbe = args.mode === 'live' ? cataloguePriceProbe() : undefined;
+const priceFacts = priceProbe?.facts ?? {
+  model: args.model,
+  runtime: args.runtime,
+  catalogueSize: 0,
+  listed: undefined,
+  priceRow: undefined,
+};
+const priceRefusals =
+  priceProbe === undefined ? [] : P.freeOnlyRefusals(priceProbe.facts);
+if (args.mode === 'live' && priceRefusals.length > 0) {
+  fail(
+    `refusing to start a live session: ${priceRefusals.join('; ')}. Nothing was spawned, so this refusal costs nothing.`,
+  );
+}
+const priceVerification =
+  priceProbe === undefined
+    ? {
+        catalogueSource: 'not-checked',
+        verified: false,
+        skippedReason:
+          'a rehearsal spends nothing and its isolated environment holds no account catalogue, so no price row exists to verify; only the configuration, the resolved policy and the composed requests are checked here',
+      }
+    : {
+        catalogueSource: args.runtime,
+        verified: P.isZeroPriceRow(priceFacts.priceRow),
+        skippedReason: undefined,
+      };
+
+if (args.mode === 'live' && priceVerification.verified !== true) {
+  fail(
+    `refusing to start a live session: the runtime reported no price row that is zero in every applicable tier for \`${args.model}\`, so this model is not verified free.`,
+  );
+}
+
+// `--title` is what removes the auxiliary requests, measured: the pinned runtime composes a
+// title request (and, when the title call does not settle, a second one on the session model)
+// when no title is supplied, and none when one is. The same literal is used in both arms.
 const cliArgs = [
   'run',
   ...(args.runtime === 'service' ? [] : ['--standalone']),
   '--auto',
   '--model',
   args.model,
+  '--title',
+  SESSION_TITLE,
   prompt,
 ];
 const startedAt = new Date();
@@ -903,14 +1498,118 @@ function wireFromProviderCapture(path) {
   return readJsonLines(path).flatMap((entry, index) => {
     const body = typeof entry.body === 'string' ? entry.body : undefined;
     if (body === undefined) return [];
+    // Two identifiers are read out of the captured body, and neither is content: the model the
+    // request named, and whether it carried a tool registry. The runtime's agent-loop request
+    // carries one and its title request does not, so the endpoint's own record is what shows an
+    // auxiliary request did or did not happen, and which model each request went to.
+    let model;
+    let hasTools;
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed !== null && typeof parsed === 'object') {
+        hasTools = Array.isArray(parsed.tools) && parsed.tools.length > 0;
+        if (typeof parsed.model === 'string') model = parsed.model;
+      }
+    } catch {
+      // An unreadable body still contributes its length and marker count.
+    }
     return [
       {
         seq: typeof entry.seq === 'number' ? entry.seq : index,
         bodyBytes: Buffer.byteLength(body, 'utf8'),
         markerCount: body.split(MARKER_PREFIX).length - 1,
+        ...(model === undefined ? {} : { model }),
+        ...(hasTools === undefined ? {} : { hasTools }),
       },
     ];
   });
+}
+
+/**
+ * What the loopback endpoint itself received, independent of the hook.
+ *
+ * The runtime's agent-loop request declares a tool registry and an auxiliary one does not, so the
+ * endpoint's own body capture is a second, independent reading of "how many requests were
+ * composed, and did any of them lack the agent loop". It cannot name the kind (a compaction
+ * request looks like a title request), which is exactly why it is recorded *beside* the hook
+ * counts instead of replacing them: agreement between the two is the evidence, and a disagreement
+ * is a finding rather than something to average away.
+ */
+function endpointKindCounts(requests) {
+  let withToolRegistry = 0;
+  let withoutToolRegistry = 0;
+  for (const request of requests) {
+    if (request.hasTools === true) withToolRegistry += 1;
+    else withoutToolRegistry += 1;
+  }
+  return { requests: requests.length, withToolRegistry, withoutToolRegistry };
+}
+
+/**
+ * What kinds of model request the runtime composed, and which models it named.
+ *
+ * The counts come from the runtime's own hook invocations — the only channel that names a request
+ * kind — and what the loopback endpoint received is recorded beside them as an independent
+ * reading. `kindsRegistered` keeps the hook *name*, because the registration is what has to be the
+ * measured one: a count of zero from a hook that never fires is a silence, not an absence.
+ *
+ * A source of `none` is an absence of evidence, not a zero, and the caller must treat it as such.
+ */
+function requestKindEvidence() {
+  const lines = readJsonLines(kindsPath);
+  const registration = lines.find((line) => Array.isArray(line?.registered));
+  const kinds = {};
+  const modelsNamed = {};
+  const payloadKeys = new Set();
+  const bump = (target, key) => {
+    target[key] = (target[key] ?? 0) + 1;
+  };
+  if (registration !== undefined) {
+    for (const line of lines) {
+      if (typeof line?.kind !== 'string') continue;
+      bump(kinds, line.kind);
+      const id = P.modelRefToId(line.model);
+      bump(modelsNamed, id ?? 'unidentified');
+      if (Array.isArray(line.payloadKeys)) {
+        for (const key of line.payloadKeys) {
+          if (typeof key === 'string') payloadKeys.add(key);
+        }
+      }
+    }
+    return {
+      source: 'model-request-hooks',
+      kindsRegistered: registration.registered.filter((kind) => typeof kind === 'string'),
+      kinds,
+      modelsNamed,
+      registrationFailures: registration.failures.filter((kind) => typeof kind === 'string'),
+      payloadKeys: [...payloadKeys].sort(),
+      endpointKinds: endpointKindCounts(providerRequests),
+    };
+  }
+  if (providerRequests.length > 0) {
+    for (const request of providerRequests) {
+      bump(kinds, request.hasTools === true ? 'primary' : 'auxiliary');
+      bump(modelsNamed, request.model ?? 'unidentified');
+    }
+    return {
+      source: 'loopback-endpoint',
+      kindsRegistered: [],
+      kinds,
+      modelsNamed,
+      registrationFailures: [],
+      payloadKeys: [],
+      endpointKinds: endpointKindCounts(providerRequests),
+    };
+  }
+  return {
+    source: 'none',
+    kindsRegistered: [],
+    kinds,
+    modelsNamed,
+    registrationFailures: [],
+    payloadKeys: [],
+    endpointKinds: undefined,
+  };
 }
 
 const providerRequests =
@@ -1097,6 +1796,54 @@ const containment = {
   evidenceLines: guardEvidenceLines.length,
 };
 
+/**
+ * What the **pre-transmission model guard** recorded, reduced to counters.
+ *
+ * The block is what makes "no unapproved model was requested" a checked fact rather than an
+ * assumption: `hookRegistered` says the runtime accepted the one hook that refuses a request, and
+ * `refused` is the count of requests that were stopped *before* being sent. A session whose guard
+ * did not register, or that refused a request at all, is refused as a measurement rather than
+ * compared — a refused request means the session left the declared envelope, whatever the endpoint
+ * saw afterwards.
+ */
+const modelGuardEvidenceLines = readJsonLines(modelGuardEvidencePath);
+const modelGuardSummary =
+  typeof helperBundle.summarizeModelGuardEvidence === 'function'
+    ? helperBundle.summarizeModelGuardEvidence(modelGuardEvidenceLines)
+    : {
+        loaded: false,
+        hookRegistered: false,
+        capabilityMissing: true,
+        invocations: 0,
+        allowed: 0,
+        refused: 0,
+        refusals: [],
+        policyDigest: '',
+        misconfigured: true,
+      };
+
+const modelGuard = {
+  // `loaded` and `hookRegistered` are separate facts: the plugin ran, and the runtime accepted the
+  // hook that refuses a request. Only the second one bounds anything.
+  guard:
+    modelGuardSummary.loaded === true && modelGuardSummary.hookRegistered === true
+      ? 'loaded'
+      : modelGuardSummary.capabilityMissing === true
+        ? 'capability-missing'
+        : 'missing',
+  hook: requestKindVocabulary.hook,
+  loaded: modelGuardSummary.loaded === true,
+  hookRegistered: modelGuardSummary.hookRegistered === true,
+  invocations: modelGuardSummary.invocations ?? 0,
+  allowed: modelGuardSummary.allowed ?? 0,
+  refused: modelGuardSummary.refused ?? 0,
+  refusals: Array.isArray(modelGuardSummary.refusals) ? modelGuardSummary.refusals : [],
+  misconfigured: modelGuardSummary.misconfigured === true,
+  policyDigest: modelGuardSummary.policyDigest ?? '',
+  envelope: modelGuardEnvelope ?? null,
+  evidenceLines: modelGuardEvidenceLines.length,
+};
+
 const inSessionGovernor = {
   armed: governor.armed,
   reason: governor.reason,
@@ -1112,6 +1859,19 @@ const observerInternalErrors = summaries.reduce(
   (total, summary) => total + (summary?.adapter?.internalErrors ?? 0),
   0,
 );
+
+/** What the runtime was observed to compose, from its own hooks or from the endpoint. */
+const requestKinds = requestKindEvidence();
+// Every kind that is not the primary loop is auxiliary, including a kind the runtime reports and
+// this harness has never heard of: an unrecognized request is the case where guessing would hide
+// work the free-only policy does not allow. The rule lives in the policy module so both sides use
+// the same one.
+const auxiliaryKinds = P.auxiliaryRequestKinds(requestKinds.kinds);
+const auxiliaryRequests = auxiliaryKinds.reduce(
+  (total, kind) => total + (requestKinds.kinds[kind] ?? 0),
+  0,
+);
+const endpointKinds = requestKinds.endpointKinds;
 
 const artifact = {
   schemaVersion: 1,
@@ -1185,7 +1945,38 @@ const artifact = {
   },
   apply,
   containment,
+  modelGuard,
+  nativePermissions: {
+    observed: nativePermissions.observed === true,
+    source: nativePermissions.source,
+    rules: nativePermissions.rules,
+    requiredDenies: REQUIRED_NATIVE_DENIES,
+    missingRequiredDenies: missingNativeDenies,
+    allRequiredPresent: nativePermissions.observed === true && missingNativeDenies.length === 0,
+    error: nativePermissions.error ?? null,
+  },
   inSessionGovernor,
+  // The free-only envelope this run was supposed to stay inside, as *this run* exercised it:
+  // the exact configuration written into the repository, the runtime's own resolved reading of
+  // it, the price row behind the model, and the request kinds the runtime then composed. The
+  // intake re-derives its verdict from these fields, so a run that drifted out of the policy is
+  // refused as a measurement rather than compared.
+  modelPolicy: {
+    primaryModel: P.FREE_ONLY_PRIMARY_MODEL,
+    auxiliaryModel: P.FREE_ONLY_AUXILIARY_MODEL,
+    approvedModels: [...P.FREE_ONLY_APPROVED_MODELS],
+    config: modelConfig,
+    configDigest: modelConfigDigest,
+    configAccepted: modelConfigAccepted,
+    catalogueSource: priceVerification.catalogueSource,
+    priceVerifiedFree: priceVerification.verified,
+    priceRow: priceFacts.priceRow ?? null,
+    priceCheckSkippedReason: priceVerification.skippedReason ?? null,
+    refusals: [...priceRefusals],
+    resolved: resolvedPolicy,
+    requests: requestKinds,
+    titleGenerationSuppressed: cliArgs.includes('--title'),
+  },
   wire: {
     source: wireSource,
     requests: wireRecords,
@@ -1203,7 +1994,7 @@ const artifact = {
     wireSource === 'loopback-endpoint'
       ? 'Request lengths and marker counts come from the loopback endpoint the run was pointed at, so they describe the bytes the runtime actually sent in this arm.'
       : wireSource === 'hook-unmeasurable'
-        ? `${unmeasurableRequests} outbound request(s) were seen by the http.request hook, whose body arrived as a ReadableStream; no wire length or marker count is claimed for this mode.`
+        ? `${unmeasurableRequests} outbound request callback(s) reached the http.request hook, each one a request the runtime composed and was about to send (the body arrived as a ReadableStream, so no wire length or marker count is claimed for this mode). What this count is not: it is not a count of provider attempts and not a count of completed requests — this hook cannot see a retry the runtime may make internally, nor whether the provider accepted the request, and the harness does not infer either. A session that received no response reports no usage for that reason, not because the request count was zero.`
         : 'No outbound request was observed, so the artifact states no wire evidence at all rather than a zero.',
     ...(modelUnavailable
       ? [
@@ -1213,9 +2004,26 @@ const artifact = {
     containment.guard === 'loaded'
       ? `Containment: the guard plugin registered its tool hook and enforced the policy for this session (${containment.blockedCalls} call(s) refused, ${containment.allowedCalls} path-checked call(s) allowed). The native permission policy written into the repository is byte-identical in both arms; its digest is ${containmentConfigDigest}.`
       : `Containment: the guard plugin did not register its tool hook (${containment.guard}), so this session did not carry the enforcement layer and must not be treated as a valid measurement.`,
+    modelGuard.guard === 'loaded'
+      ? `Pre-transmission model guard: the hook that refuses a model request was registered before the session dispatched anything, and bounded ${modelGuard.invocations} request(s) against the approved envelope (${modelGuard.allowed} allowed, ${modelGuard.refused} refused)${modelGuard.refused > 0 ? ` — refusals: ${modelGuard.refusals.map((entry) => `${entry.reason}${entry.requestKind === undefined ? '' : `@${entry.requestKind}`}${entry.model === undefined ? '' : `[${entry.model}]`}`).join(', ')}` : ''}. The envelope is ${String(modelGuard.policyDigest)} — the digest of the same configuration both arms receive — and it approves only \`${P.FREE_ONLY_PRIMARY_MODEL}\` and \`${P.FREE_ONLY_AUXILIARY_MODEL}\`. Every request the runtime dispatches for any provider passes this hook; there is no provider filter, because a filter would let a request from an unnamed provider skip the guard.`
+      : `Pre-transmission model guard: the hook that refuses an unapproved model request did NOT register for this session (${modelGuard.guard}${modelGuard.misconfigured ? ', and the guard was constructed without a usable envelope' : ''}), so nothing shows an unapproved model was stopped before it was sent, and this session must not be treated as a valid measurement.`,
+    modelGuard.refused > 0
+      ? `An unapproved model request was refused before transmission during this session (${modelGuard.refusals.map((entry) => `${entry.reason}${entry.requestKind === undefined ? '' : `@${entry.requestKind}`}${entry.model === undefined ? '' : `[${entry.model}]`}`).join(', ')}). The request was never sent, and this run is refused as a measurement: a session that tried to step outside the approved envelope is not the free-only session the experiment declares.`
+      : `No unapproved model request was attempted during this session: none of the ${modelGuard.invocations} request(s) the guard saw named a model outside the approved pair. This is a count of refusals from the hook that would have made them, not an inference from the absence of an error.`,
+    nativePermissions.observed === true
+      ? `Native permission layer: the runtime resolved ${nativePermissions.rules.length} rule(s) for this repository (${nativePermissions.rules.map((rule) => `${rule.action}=${rule.effect}`).join(', ')})${missingNativeDenies.length === 0 ? ', including every deny the canary policy requires' : `, MISSING the required denies: ${missingNativeDenies.join(', ')}`}.`
+      : `Native permission layer: the runtime did not report its resolved permission rules (${String(nativePermissions.error ?? 'no reason reported')}), so only the plugin layer is evidenced for this session and it must not be treated as a fully contained run.`,
     inSessionGovernor.armed
       ? `In-session spending governor: armed at $${String(inSessionGovernor.capUsd)} per session, polled ${inSessionGovernor.polls} time(s) and saw ${inSessionGovernor.reportedCostUsd === null ? 'no reported cost' : `$${Number(inSessionGovernor.reportedCostUsd).toFixed(4)}`}${inSessionGovernor.interrupted ? '; the runtime confirmed the interrupt' : ''}${inSessionGovernor.killedAfterFailedInterrupt ? '; the native stop never confirmed, so the client process was killed instead' : ''}. The overshoot this bound allows is limited to the steps that complete between a poll and the interrupt landing; the post-session caps remain the sequence bound.`
       : `In-session spending governor: not armed (${String(inSessionGovernor.reason)}).`,
+    `Free-only model policy: primary \`${P.FREE_ONLY_PRIMARY_MODEL}\`, auxiliary \`${P.FREE_ONLY_AUXILIARY_MODEL}\` (${P.FREE_ONLY_APPROVED_MODELS.length} approved model(s)); the repository received the same configuration in both arms (model fragment digest ${modelConfigDigest}, containment fragment digest ${containmentConfigDigest}, written document digest ${projectConfigDigest}).`,
+    priceProbe === undefined
+      ? `Model price: not checked in this mode (${String(priceVerification.skippedReason)}).`
+      : priceVerification.verified
+        ? `Model price: the ${priceFacts.runtime} runtime prices \`${args.model}\` at zero in every applicable tier (${P.FREE_ONLY_PRICE_FIELDS.map((field) => `${field}=0`).join(', ')}), read before any session was spawned.`
+        : `Model price: NOT VERIFIED FREE (${priceRefusals.join('; ')}).`,
+    `Resolved configuration: ${P.describeResolvedPolicy(resolvedPolicy)} — read from the runtime\u2019s own \`config.get\` for this repository before the session started, so a key the runtime dropped would be visible here rather than assumed.`,
+    `Request kinds: ${requestKinds.source === 'none' ? 'none observed (this is an absence of evidence, not a zero)' : `${Object.entries(requestKinds.kinds).map(([kind, count]) => `${kind}=${count}`).join(', ') || 'no request counted'} via ${requestKinds.source}${requestKinds.kindsRegistered.length > 0 ? `, hook ${requestKinds.kindsRegistered.join(', ')} with payload keys [${requestKinds.payloadKeys.join(',') || 'none recorded'}]` : ''}${requestKinds.registrationFailures.length > 0 ? `; the runtime refused the registration: ${requestKinds.registrationFailures.join(', ')}` : ''}`}. Models named on the wire: ${Object.entries(requestKinds.modelsNamed).map(([id, count]) => `${id}×${count}`).join(', ') || 'none recorded'}. The endpoint\u2019s own record: ${endpointKinds === undefined ? 'no endpoint capture for this mode' : `${endpointKinds.requests} request(s), ${endpointKinds.withToolRegistry} carrying the agent-loop tool registry and ${endpointKinds.withoutToolRegistry} without`}. ${auxiliaryRequests === 0 ? 'No auxiliary (title, compaction or generate) request was composed, and the session title was supplied on the command line so none was needed.' : `${auxiliaryRequests} auxiliary request(s) were composed (${auxiliaryKinds.join(', ')}), which the free-only policy does not permit.`}`,
   ],
 };
 

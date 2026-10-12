@@ -12,7 +12,7 @@
  *
  * Usage:
  *   node stage1r-capture-server.mjs --capture <file.jsonl> [--port 0] [--mode probe|scripted]
- *                                   [--read-path <abs path>] [--tool-calls 1]
+ *                                   [--read-path <abs path>] [--tool-calls 1] [--tool-plan <file.json>]
  *
  * `--mode probe` records the request and answers `500`, which is enough to learn the exact path and
  * body shape. `--mode scripted` answers with `--tool-calls` `read` tool calls (all for `--read-path`,
@@ -21,11 +21,20 @@
  * recorded invocation and its results are unchanged) to place two byte-identical read results in one
  * request.
  *
+ * `--tool-plan` is the Stage 1U addition the containment probe needed: a JSON array of
+ * `{ "name": <tool id>, "args": { ... } }`. When it is given it replaces the fixed `read` script —
+ * the Nth request that carries a completed tool call is answered with the Nth plan entry, and the
+ * plan is exhausted into the final text answer. That is what lets one real session be asked for a
+ * tool call the policy must refuse (`bash`, `webfetch`, `apply_patch`, a path outside the
+ * workspace) and a tool call it must allow, with the provider's own capture as the record of what
+ * the runtime actually did with each one. The plan is validated up front and a malformed one ends
+ * the server rather than being silently skipped.
+ *
  * It prints `LISTENING <port>` once it is ready, so a caller can wait for readiness instead of
  * sleeping. It is not part of the product and is never loaded by a plugin.
  */
 import { createServer } from 'node:http';
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 
 function parseArgs(argv) {
   const args = {
@@ -35,6 +44,7 @@ function parseArgs(argv) {
     readPath: '',
     toolTurns: 1,
     toolCalls: 1,
+    toolPlan: undefined,
   };
   for (let index = 2; index < argv.length; index += 1) {
     const key = argv[index];
@@ -45,6 +55,7 @@ function parseArgs(argv) {
     else if (key === '--read-path') args.readPath = value;
     else if (key === '--tool-turns') args.toolTurns = Number(value);
     else if (key === '--tool-calls') args.toolCalls = Number(value);
+    else if (key === '--tool-plan') args.toolPlan = value;
   }
   if (args.capture === undefined) {
     throw new Error('--capture <file.jsonl> is required');
@@ -54,6 +65,31 @@ function parseArgs(argv) {
 
 const args = parseArgs(process.argv);
 writeFileSync(args.capture, '');
+
+/**
+ * The scripted tool plan, read and validated before the server answers anything.
+ *
+ * An unusable plan must stop the run: a server that quietly fell back to its own script would
+ * make a probe of the refused tools pass without ever asking for one.
+ */
+function readToolPlan(path) {
+  const raw = JSON.parse(readFileSync(path, 'utf8'));
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new Error('--tool-plan must be a non-empty JSON array');
+  }
+  return raw.map((entry, index) => {
+    if (entry === null || typeof entry !== 'object' || typeof entry.name !== 'string' || entry.name.length === 0) {
+      throw new Error(`--tool-plan entry ${index} must be an object with a non-empty "name"`);
+    }
+    const callArgs = entry.args === undefined ? {} : entry.args;
+    if (callArgs === null || typeof callArgs !== 'object' || Array.isArray(callArgs)) {
+      throw new Error(`--tool-plan entry ${index} (${entry.name}) must carry an "args" object`);
+    }
+    return { name: entry.name, args: callArgs };
+  });
+}
+
+const toolPlan = args.toolPlan === undefined ? undefined : readToolPlan(args.toolPlan);
 
 /** Number of requests seen so far, which is what selects the scripted answer. */
 let sequence = 0;
@@ -146,6 +182,33 @@ function scriptedAnswer(bodyText) {
   }
   const messages = Array.isArray(parsed?.messages) ? parsed.messages : [];
   const sawToolResult = messages.some((message) => message?.role === 'tool');
+
+  // The plan answers one tool call per turn, so the number of completed tool calls is
+  // exactly the index of the next step. A repeated request (a runtime retry) carries the
+  // same completed calls and therefore replays the same step rather than advancing it.
+  if (toolPlan !== undefined) {
+    const completed = new Set();
+    for (const message of messages) {
+      if (message?.role === 'tool' && typeof message.tool_call_id === 'string') {
+        completed.add(message.tool_call_id);
+      }
+    }
+    const step = completed.size < toolPlan.length ? toolPlan[completed.size] : undefined;
+    if (step !== undefined) {
+      const call = {
+        id: `call_plan_${completed.size}`,
+        type: 'function',
+        function: { name: step.name, arguments: JSON.stringify(step.args) },
+      };
+      return { streaming: parsed?.stream === true, includeUsage: parsed?.stream_options?.include_usage === true, content: null, toolCalls: [call] };
+    }
+    return {
+      streaming: parsed?.stream === true,
+      includeUsage: parsed?.stream_options?.include_usage === true,
+      content: 'DONE.',
+      toolCalls: undefined,
+    };
+  }
   const streaming = parsed?.stream === true;
   const includeUsage = parsed?.stream_options?.include_usage === true;
   const toolTurns = messages.filter((message) => message?.role === 'assistant').length < args.toolTurns;
